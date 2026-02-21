@@ -18,6 +18,146 @@ router = APIRouter()
 MAX_BLOCK_RETRIES = 3
 
 
+async def _find_and_click_product(browser: "BrowserAutomation", product_name: str) -> bool:
+    """
+    Прямой поиск карточки товара через Playwright без AI.
+    Стратегии: прокрутка, regex-локатор, JS-поиск по тексту, клик по карточке.
+    Возвращает True если удалось кликнуть по товару.
+    """
+    import re as _re
+
+    page = browser.page
+    if not page:
+        return False
+
+    # Ждём загрузки контента
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=10000)
+    except Exception:
+        pass
+
+    # Прокручиваем страницу вниз, чтобы все карточки загрузились
+    try:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+        await page.wait_for_timeout(1500)
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+    # Нормализуем имя товара для поиска (например "80 Gems" → r"80\s*gems?")
+    name_lower = product_name.lower().strip()
+    # Строим regex: "80 Gems" → "80\s*gems?"
+    parts = _re.split(r"\s+", name_lower)
+    regex_str = r"\s*".join(_re.escape(p) for p in parts) + r"s?"
+    logger.info(f"Прямой поиск карточки: regex=/{regex_str}/i")
+
+    # Стратегия 1: get_by_text с regex
+    try:
+        loc = page.get_by_text(_re.compile(regex_str, _re.I))
+        count = await loc.count()
+        if count > 0:
+            # Ищем кликабельный элемент (карточку/кнопку) среди найденных
+            for i in range(min(count, 5)):
+                el = loc.nth(i)
+                try:
+                    tag = await el.evaluate("e => e.tagName.toLowerCase()")
+                    bb = await el.bounding_box()
+                    if bb and bb["width"] > 30 and bb["height"] > 20:
+                        await el.scroll_into_view_if_needed()
+                        await page.wait_for_timeout(400)
+                        await el.click(timeout=5000)
+                        logger.info(f"Клик по элементу (get_by_text regex, стратегия 1): tag={tag}, text='{product_name}'")
+                        return True
+                except Exception:
+                    continue
+    except Exception as e:
+        logger.debug(f"Стратегия 1 (get_by_text regex): {e}")
+
+    # Стратегия 2: :has-text через CSS-подобный локатор Playwright
+    css_candidates = [
+        f'[class*="product"]:has-text("{product_name}")',
+        f'[class*="card"]:has-text("{product_name}")',
+        f'[class*="item"]:has-text("{product_name}")',
+        f'div:has-text("{product_name}")',
+        f'button:has-text("{product_name}")',
+        f'a:has-text("{product_name}")',
+    ]
+    for css in css_candidates:
+        try:
+            loc = page.locator(css)
+            count = await loc.count()
+            if count > 0:
+                el = loc.first
+                bb = await el.bounding_box()
+                if bb and bb["width"] > 30 and bb["height"] > 20:
+                    await el.scroll_into_view_if_needed()
+                    await page.wait_for_timeout(400)
+                    await el.click(timeout=5000)
+                    logger.info(f"Клик по элементу (стратегия 2, CSS): {css}")
+                    return True
+        except Exception:
+            continue
+
+    # Стратегия 3: JS-поиск всех элементов, содержащих текст, клик по самому маленькому (карточка)
+    try:
+        result = await page.evaluate(
+            """(name) => {
+                const lower = name.toLowerCase();
+                const all = Array.from(document.querySelectorAll('*'));
+                const matches = all.filter(el => {
+                    const t = (el.innerText || el.textContent || '').toLowerCase().trim();
+                    return t.includes(lower) && t.length < lower.length * 6;
+                });
+                if (!matches.length) return null;
+                // Берём элемент с наименьшим текстом (ближайший к карточке)
+                matches.sort((a, b) => (a.innerText || a.textContent || '').length - (b.innerText || b.textContent || '').length);
+                const el = matches[0];
+                const r = el.getBoundingClientRect();
+                return {x: r.left + r.width/2, y: r.top + r.height/2, w: r.width, h: r.height};
+            }""",
+            product_name,
+        )
+        if result and result.get("w", 0) > 10 and result.get("h", 0) > 10:
+            x, y = result["x"], result["y"]
+            await page.mouse.click(x, y)
+            logger.info(f"Клик по элементу (стратегия 3, JS): ({x:.0f}, {y:.0f})")
+            return True
+    except Exception as e:
+        logger.debug(f"Стратегия 3 (JS): {e}")
+
+    # Стратегия 4: ищем числовую часть (например "80") рядом с "Gems"
+    try:
+        num_match = _re.search(r"\d+", product_name)
+        if num_match:
+            num = num_match.group()
+            result = await page.evaluate(
+                """([num, keyword]) => {
+                    const all = Array.from(document.querySelectorAll('*'));
+                    for (const el of all) {
+                        const t = (el.innerText || el.textContent || '').toLowerCase();
+                        if (t.includes(num) && t.includes(keyword)) {
+                            const r = el.getBoundingClientRect();
+                            if (r.width > 20 && r.height > 20 && r.width < 600) {
+                                return {x: r.left + r.width/2, y: r.top + r.height/2};
+                            }
+                        }
+                    }
+                    return null;
+                }""",
+                [num, "gem"],
+            )
+            if result:
+                await page.mouse.click(result["x"], result["y"])
+                logger.info(f"Клик по элементу (стратегия 4, num+gem): ({result['x']:.0f}, {result['y']:.0f})")
+                return True
+    except Exception as e:
+        logger.debug(f"Стратегия 4 (num+gem): {e}")
+
+    logger.warning(f"Все стратегии прямого поиска не нашли '{product_name}'")
+    return False
+
+
 class PurchaseRequest(BaseModel):
     """Запрос на покупку товара в магазине."""
 
@@ -33,20 +173,26 @@ class PurchaseRequest(BaseModel):
 async def purchase_product(request: PurchaseRequest):
     """
     Покупка товара в Supercell Store.
-    
-    Процесс:
-    1. Авторизация в Supercell Store (если не авторизован)
-    2. Переход в магазин игры (Brawl Stars / Clash Royale)
-    3. Поиск товара с помощью AI
-    4. Добавление товара в корзину
-    5. Переход на окно оформления заказа (checkout)
-    
-    Args:
-        request: Данные для покупки
-        
-    Returns:
-        Результат покупки
+
+    На Windows Patchright требует ProactorEventLoop (create_subprocess_exec).
+    Uvicorn использует SelectorEventLoop, поэтому весь flow запускается
+    в отдельном потоке со своим ProactorEventLoop.
     """
+    import sys as _sys
+    if _sys.platform == "win32":
+        def _run_in_proactor():
+            loop = asyncio.ProactorEventLoop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(_purchase_flow(request))
+            finally:
+                loop.close()
+        return await asyncio.get_event_loop().run_in_executor(None, _run_in_proactor)
+    return await _purchase_flow(request)
+
+
+async def _purchase_flow(request: PurchaseRequest):
+    """Вся логика покупки. На Windows вызывается из потока с ProactorEventLoop."""
     browser = BrowserAutomation()
     ai_search = AIProductSearch()
     session_id = f"purchase_{request.email.replace('@', '_at_')}_{request.game}"
@@ -515,6 +661,43 @@ async def purchase_product(request: PurchaseRequest):
             )
         
             if not product_info or not product_info.get("found"):
+                logger.warning(
+                    f"AI не нашёл товар '{request.product_name}', пробуем прямой поиск через Playwright..."
+                )
+                product_info = None  # сбрасываем, будем искать сами
+
+            if product_info and product_info.get("found"):
+                logger.info(
+                    f"Товар найден AI: {product_info.get('description', 'N/A')} "
+                    f"(confidence: {product_info.get('confidence', 0):.2f})"
+                )
+
+            # Шаг 4: Добавление товара в корзину
+            logger.info("Шаг 4: Добавление товара в корзину...")
+
+            clicked = False
+
+            # --- Путь A: AI нашёл товар ---
+            if product_info and product_info.get("found"):
+                button_text = product_info.get("button_text", "Buy")
+                clicked = await browser.click_element_by_text(button_text, partial=True, timeout=15000)
+                if not clicked:
+                    coords = product_info.get("coordinates", {})
+                    if coords:
+                        x = coords.get("x", 0) + coords.get("width", 0) / 2
+                        y = coords.get("y", 0) + coords.get("height", 0) / 2
+                        try:
+                            await browser.page.mouse.click(x, y)
+                            clicked = True
+                            logger.info(f"Клик по координатам из AI: ({x}, {y})")
+                        except Exception as e:
+                            logger.warning(f"Не удалось кликнуть по координатам AI: {e}")
+
+            # --- Путь B: Прямой поиск карточки товара через Playwright ---
+            if not clicked:
+                clicked = await _find_and_click_product(browser, request.product_name)
+
+            if not clicked:
                 await browser.take_screenshot(f"product_not_found_{session_id}.png")
                 raise Exception(
                     f"Товар '{request.product_name}' не найден на странице магазина {request.game}. "
@@ -524,61 +707,41 @@ async def purchase_product(request: PurchaseRequest):
                     "3. Страница магазина не загрузилась полностью"
                 )
         
-            logger.info(
-                f"Товар найден: {product_info.get('description', 'N/A')} "
-                f"(confidence: {product_info.get('confidence', 0):.2f})"
-            )
-        
-            # Шаг 4: Добавление товара в корзину
-            logger.info("Шаг 4: Добавление товара в корзину...")
-        
-            # Пробуем кликнуть по кнопке покупки
-            button_text = product_info.get("button_text", "Buy")
-            clicked = await browser.click_element_by_text(button_text, partial=True, timeout=15000)
-        
-            if not clicked:
-                # Если не удалось кликнуть по тексту, пробуем по координатам
-                coords = product_info.get("coordinates", {})
-                if coords:
-                    x = coords.get("x", 0) + coords.get("width", 0) / 2
-                    y = coords.get("y", 0) + coords.get("height", 0) / 2
-                    try:
-                        await browser.page.mouse.click(x, y)
-                        clicked = True
-                        logger.info(f"Клик по координатам: ({x}, {y})")
-                    except Exception as e:
-                        logger.warning(f"Не удалось кликнуть по координатам: {e}")
-        
-            if not clicked:
-                # Пробуем найти кнопку через селекторы
-                button_selectors = [
-                    'button:has-text("Buy")',
-                    'button:has-text("Purchase")',
-                    'button:has-text("Add to Cart")',
-                    'button:has-text("Купить")',
-                    'button[class*="buy"]',
-                    'button[class*="purchase"]',
-                    'a:has-text("Buy")',
-                ]
-            
-                for selector in button_selectors:
-                    try:
-                        button = await browser.page.query_selector(selector)
-                        if button and await button.is_visible():
-                            await button.click()
-                            clicked = True
-                            logger.info(f"Кнопка найдена и нажата: {selector}")
-                            break
-                    except Exception:
-                        continue
-        
-            if not clicked:
-                await browser.take_screenshot(f"button_not_found_{session_id}.png")
-                raise Exception(
-                    f"Не удалось найти или нажать кнопку покупки для товара '{request.product_name}'. "
-                    "Проверьте скриншот для диагностики."
-                )
-        
+            # После клика по карточке — ждём модального окна и нажимаем "Add to Cart" / "Buy"
+            await browser.human_like_delay(1500, 2500)
+            await browser.take_screenshot(f"after_card_click_{session_id}.png")
+
+            # Пробуем нажать кнопку "Add to Cart" / "Buy" в модальном окне
+            add_to_cart_selectors = [
+                'button:has-text("Add to Cart")',
+                'button:has-text("Add To Cart")',
+                'button:has-text("add to cart")',
+                'button:has-text("Buy")',
+                'button:has-text("Purchase")',
+                'button:has-text("Купить")',
+                '[class*="add-to-cart"]',
+                '[class*="addToCart"]',
+                '[class*="buy-button"]',
+                '[data-testid*="add-to-cart"]',
+                '[data-testid*="buy"]',
+            ]
+            cart_btn_clicked = False
+            for sel in add_to_cart_selectors:
+                try:
+                    btn = await browser.page.query_selector(sel)
+                    if btn and await btn.is_visible():
+                        await btn.scroll_into_view_if_needed()
+                        await browser.page.wait_for_timeout(300)
+                        await btn.click()
+                        cart_btn_clicked = True
+                        logger.info(f"Нажата кнопка добавления в корзину: {sel}")
+                        break
+                except Exception:
+                    continue
+
+            if not cart_btn_clicked:
+                logger.info("Кнопка 'Add to Cart' не найдена — возможно, товар уже добавлен или открылась форма оплаты")
+
             # Ждём открытия формы оплаты или корзины
             await browser.human_like_delay(2000, 4000)
             await browser.take_screenshot(f"after_add_to_cart_{session_id}.png")
@@ -674,9 +837,9 @@ async def purchase_product(request: PurchaseRequest):
                 "product_name": request.product_name,
                 "product_info": {
                     "found": True,
-                    "price": product_info.get("price"),
-                    "confidence": product_info.get("confidence"),
-                    "description": product_info.get("description"),
+                    "price": product_info.get("price") if product_info else None,
+                    "confidence": product_info.get("confidence") if product_info else None,
+                    "description": product_info.get("description") if product_info else request.product_name,
                 },
                 "added_to_cart": added,
                 "checkout_opened": checkout_opened,
