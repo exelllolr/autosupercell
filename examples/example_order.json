@@ -1,0 +1,16 @@
+{
+  "order_id": "example_12345",
+  "product_name": "500 Gems",
+  "product_type": "gems",
+  "game": "clash-royale",
+  "amount": 4.99,
+  "currency": "USD",
+  "user_account": "user@example.com",
+  "payment_method": "google_pay",
+  "card_info": {
+    "last4": "1234",
+    "card_id": "card_example123",
+    "exp_month": 12,
+    "exp_year": 2025
+  }
+}

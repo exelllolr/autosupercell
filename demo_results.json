@@ -1,0 +1,19 @@
+{
+  "login": {
+    "success": true,
+    "session_id": "session_sheskinles_at_gmail.com",
+    "email": "sheskinles@gmail.com",
+    "authenticated": true,
+    "screenshot": "screenshots/google_login_result_session_sheskinles_at_gmail.com.png",
+    "url": "https://accounts.google.com/v3/signin/rejected?dsh=S386834491:1771333623485862&epd=AVxC5FcaE_UM8V4leCDPIkdQ5vGBfgTO_STUvCIMOMrzG2KtokJRJUW6FQ&flowEntry=ServiceLogin&flowName=WebLiteSignIn&idnf=sheskinles@gmail.com&ifkv=ASfE1-r1uR3a9XbEI6hEZ_qg4TSPaPJzjX99eLfKeRMNlj3pAuaqcEpva0E4e4E2OQhhSDIVFKRd7w&rhlk=le&rrk=46",
+    "message": "Авторизация успешна",
+    "requires_verification": false
+  },
+  "card": null,
+  "order": {
+    "success": true,
+    "order_id": "demo_order_1771333772",
+    "job_id": "order_demo_order_1771333772",
+    "status": "queued"
+  }
+}

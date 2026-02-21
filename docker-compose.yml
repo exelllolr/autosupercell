@@ -1,0 +1,79 @@
+services:
+  app:
+    build: .
+    container_name: autosupercell-app
+    ports:
+      - "8000:8000"
+      - "9090:9090"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - DEBUG=false
+    volumes:
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+      - ./videos:/app/videos
+      - ./proofs:/app/proofs
+      - ./.env:/app/.env
+      - ./proxies.txt:/app/proxies.txt
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - autosupercell-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: autosupercell-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - autosupercell-network
+    command: redis-server --appendonly yes
+
+  worker:
+    build: .
+    container_name: autosupercell-worker
+    command: arq app.workers.arq_worker.WorkerSettings
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+      - ./videos:/app/videos
+      - ./proofs:/app/proofs
+      - ./.env:/app/.env
+      - ./proxies.txt:/app/proxies.txt
+    depends_on:
+      - redis
+      - app
+    restart: unless-stopped
+    networks:
+      - autosupercell-network
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: autosupercell-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: unless-stopped
+    networks:
+      - autosupercell-network
+
+volumes:
+  redis-data:
+  prometheus-data:
+
+networks:
+  autosupercell-network:
+    driver: bridge

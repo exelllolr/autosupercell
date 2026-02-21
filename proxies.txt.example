@@ -1,0 +1,18 @@
+# Пример файла прокси (скопируйте в proxies.txt)
+# Поддерживаемые форматы (один прокси на строку):
+#
+# 1) host:port:user:password  (Webshare, Novada и др.)
+#    31.59.20.176:6754:username:password
+#
+# 2) user:password@host:port
+#    username:password@31.59.20.176:6754
+#
+# 3) host:port (без авторизации)
+#    127.0.0.1:8080
+#
+# Если у вас один рабочий прокси — поставьте его ПЕРВОЙ строкой и в .env добавьте:
+#   PROXY_USE_FIRST_ONLY=true
+# Тогда приложение всегда будет использовать только этот прокси.
+#
+# Для Docker: файл proxies.txt монтируется в контейнер (docker-compose).
+# Прокси используются при запуске браузера (в т.ч. при вызове supercell_full_auth_demo.py → API).
