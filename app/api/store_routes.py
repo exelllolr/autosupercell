@@ -20,8 +20,8 @@ MAX_BLOCK_RETRIES = 3
 
 async def _find_and_click_product(browser: "BrowserAutomation", product_name: str) -> bool:
     """
-    Прямой поиск карточки товара через Playwright без AI.
-    Стратегии: прокрутка, regex-локатор, JS-поиск по тексту, клик по карточке.
+    Поиск и клик по карточке товара через Playwright (без AI).
+    Использует scrollIntoView перед кликом — работает с длинными страницами.
     Возвращает True если удалось кликнуть по товару.
     """
     import re as _re
@@ -30,131 +30,123 @@ async def _find_and_click_product(browser: "BrowserAutomation", product_name: st
     if not page:
         return False
 
-    # Ждём загрузки контента
+    # Ждём полной загрузки страницы
     try:
-        await page.wait_for_load_state("domcontentloaded", timeout=10000)
+        await page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
-        pass
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
 
-    # Прокручиваем страницу вниз, чтобы все карточки загрузились
-    try:
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-        await page.wait_for_timeout(1500)
-        await page.evaluate("window.scrollTo(0, 0)")
-        await page.wait_for_timeout(800)
-    except Exception:
-        pass
-
-    # Нормализуем имя товара для поиска (например "80 Gems" → r"80\s*gems?")
     name_lower = product_name.lower().strip()
-    # Строим regex: "80 Gems" → "80\s*gems?"
-    parts = _re.split(r"\s+", name_lower)
-    regex_str = r"\s*".join(_re.escape(p) for p in parts) + r"s?"
-    logger.info(f"Прямой поиск карточки: regex=/{regex_str}/i")
+    # Числовая часть (например "80" из "80 Gems")
+    num_match = _re.search(r"\d+", product_name)
+    num_str = num_match.group() if num_match else ""
+    # Ключевое слово (например "gems")
+    keyword = _re.sub(r"\d+\s*", "", name_lower).strip().rstrip("s")  # "gems" → "gem"
 
-    # Стратегия 1: get_by_text с regex
+    logger.info(f"Поиск товара '{product_name}' (num={num_str}, keyword={keyword})")
+
+    # ── Стратегия 1: Playwright locator с точным текстом ──────────────────────
+    exact_selectors = [
+        f'text="{product_name}"',
+        f'text={product_name}',
+    ]
+    for sel in exact_selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0:
+                await loc.scroll_into_view_if_needed()
+                await page.wait_for_timeout(500)
+                bb = await loc.bounding_box()
+                if bb:
+                    logger.info(f"Стратегия 1 (exact text): '{sel}' at ({bb['x']:.0f},{bb['y']:.0f})")
+                    await loc.click(timeout=5000)
+                    return True
+        except Exception:
+            pass
+
+    # ── Стратегия 2: get_by_text regex ────────────────────────────────────────
     try:
-        loc = page.get_by_text(_re.compile(regex_str, _re.I))
+        pattern = _re.compile(rf"\b{_re.escape(num_str)}\s*{_re.escape(keyword)}s?\b", _re.I) if num_str else _re.compile(_re.escape(name_lower), _re.I)
+        loc = page.get_by_text(pattern)
         count = await loc.count()
-        if count > 0:
-            # Ищем кликабельный элемент (карточку/кнопку) среди найденных
-            for i in range(min(count, 5)):
-                el = loc.nth(i)
-                try:
-                    tag = await el.evaluate("e => e.tagName.toLowerCase()")
-                    bb = await el.bounding_box()
-                    if bb and bb["width"] > 30 and bb["height"] > 20:
-                        await el.scroll_into_view_if_needed()
-                        await page.wait_for_timeout(400)
-                        await el.click(timeout=5000)
-                        logger.info(f"Клик по элементу (get_by_text regex, стратегия 1): tag={tag}, text='{product_name}'")
-                        return True
-                except Exception:
-                    continue
+        logger.debug(f"Стратегия 2 (get_by_text regex): найдено {count} элементов")
+        for i in range(min(count, 8)):
+            el = loc.nth(i)
+            try:
+                await el.scroll_into_view_if_needed()
+                await page.wait_for_timeout(300)
+                bb = await el.bounding_box()
+                if bb and bb["width"] > 20 and bb["height"] > 10:
+                    logger.info(f"Стратегия 2 (get_by_text regex) #{i}: ({bb['x']:.0f},{bb['y']:.0f}) size={bb['width']:.0f}x{bb['height']:.0f}")
+                    await el.click(timeout=5000)
+                    return True
+            except Exception:
+                continue
     except Exception as e:
-        logger.debug(f"Стратегия 1 (get_by_text regex): {e}")
+        logger.debug(f"Стратегия 2: {e}")
 
-    # Стратегия 2: :has-text через CSS-подобный локатор Playwright
+    # ── Стратегия 3: JS — найти элемент, прокрутить, кликнуть ────────────────
+    # Ищем самый компактный элемент содержащий "80" + "gem"
+    try:
+        handle = await page.evaluate_handle(
+            """([num, kw, fullName]) => {
+                const lower = fullName.toLowerCase();
+                let best = null, bestLen = Infinity;
+                for (const el of document.querySelectorAll('*')) {
+                    const t = (el.innerText || el.textContent || '').toLowerCase().trim();
+                    const hasNum = num ? t.includes(num) : true;
+                    const hasKw  = kw  ? t.includes(kw)  : true;
+                    if (hasNum && hasKw && t.length < bestLen && t.length < lower.length * 8) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 20 && r.height > 10) {
+                            best = el;
+                            bestLen = t.length;
+                        }
+                    }
+                }
+                return best;
+            }""",
+            [num_str, keyword, name_lower],
+        )
+        el = handle.as_element()
+        if el:
+            await el.scroll_into_view_if_needed()
+            await page.wait_for_timeout(500)
+            bb = await el.bounding_box()
+            if bb:
+                logger.info(f"Стратегия 3 (JS scrollIntoView): ({bb['x']:.0f},{bb['y']:.0f}) size={bb['width']:.0f}x{bb['height']:.0f}")
+                await el.click(timeout=5000)
+                return True
+    except Exception as e:
+        logger.debug(f"Стратегия 3: {e}")
+
+    # ── Стратегия 4: CSS :has-text локаторы ──────────────────────────────────
     css_candidates = [
         f'[class*="product"]:has-text("{product_name}")',
         f'[class*="card"]:has-text("{product_name}")',
         f'[class*="item"]:has-text("{product_name}")',
-        f'div:has-text("{product_name}")',
-        f'button:has-text("{product_name}")',
-        f'a:has-text("{product_name}")',
+        f'[class*="shop"]:has-text("{product_name}")',
+        f'li:has-text("{product_name}")',
+        f'article:has-text("{product_name}")',
     ]
     for css in css_candidates:
         try:
-            loc = page.locator(css)
-            count = await loc.count()
-            if count > 0:
-                el = loc.first
-                bb = await el.bounding_box()
-                if bb and bb["width"] > 30 and bb["height"] > 20:
-                    await el.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(400)
-                    await el.click(timeout=5000)
-                    logger.info(f"Клик по элементу (стратегия 2, CSS): {css}")
+            loc = page.locator(css).first
+            if await loc.count() > 0:
+                await loc.scroll_into_view_if_needed()
+                await page.wait_for_timeout(400)
+                bb = await loc.bounding_box()
+                if bb:
+                    logger.info(f"Стратегия 4 (CSS has-text): '{css}' at ({bb['x']:.0f},{bb['y']:.0f})")
+                    await loc.click(timeout=5000)
                     return True
         except Exception:
             continue
 
-    # Стратегия 3: JS-поиск всех элементов, содержащих текст, клик по самому маленькому (карточка)
-    try:
-        result = await page.evaluate(
-            """(name) => {
-                const lower = name.toLowerCase();
-                const all = Array.from(document.querySelectorAll('*'));
-                const matches = all.filter(el => {
-                    const t = (el.innerText || el.textContent || '').toLowerCase().trim();
-                    return t.includes(lower) && t.length < lower.length * 6;
-                });
-                if (!matches.length) return null;
-                // Берём элемент с наименьшим текстом (ближайший к карточке)
-                matches.sort((a, b) => (a.innerText || a.textContent || '').length - (b.innerText || b.textContent || '').length);
-                const el = matches[0];
-                const r = el.getBoundingClientRect();
-                return {x: r.left + r.width/2, y: r.top + r.height/2, w: r.width, h: r.height};
-            }""",
-            product_name,
-        )
-        if result and result.get("w", 0) > 10 and result.get("h", 0) > 10:
-            x, y = result["x"], result["y"]
-            await page.mouse.click(x, y)
-            logger.info(f"Клик по элементу (стратегия 3, JS): ({x:.0f}, {y:.0f})")
-            return True
-    except Exception as e:
-        logger.debug(f"Стратегия 3 (JS): {e}")
-
-    # Стратегия 4: ищем числовую часть (например "80") рядом с "Gems"
-    try:
-        num_match = _re.search(r"\d+", product_name)
-        if num_match:
-            num = num_match.group()
-            result = await page.evaluate(
-                """([num, keyword]) => {
-                    const all = Array.from(document.querySelectorAll('*'));
-                    for (const el of all) {
-                        const t = (el.innerText || el.textContent || '').toLowerCase();
-                        if (t.includes(num) && t.includes(keyword)) {
-                            const r = el.getBoundingClientRect();
-                            if (r.width > 20 && r.height > 20 && r.width < 600) {
-                                return {x: r.left + r.width/2, y: r.top + r.height/2};
-                            }
-                        }
-                    }
-                    return null;
-                }""",
-                [num, "gem"],
-            )
-            if result:
-                await page.mouse.click(result["x"], result["y"])
-                logger.info(f"Клик по элементу (стратегия 4, num+gem): ({result['x']:.0f}, {result['y']:.0f})")
-                return True
-    except Exception as e:
-        logger.debug(f"Стратегия 4 (num+gem): {e}")
-
-    logger.warning(f"Все стратегии прямого поиска не нашли '{product_name}'")
+    logger.warning(f"Все стратегии не нашли карточку '{product_name}'")
     return False
 
 
@@ -194,7 +186,6 @@ async def purchase_product(request: PurchaseRequest):
 async def _purchase_flow(request: PurchaseRequest):
     """Вся логика покупки. На Windows вызывается из потока с ProactorEventLoop."""
     browser = BrowserAutomation()
-    ai_search = AIProductSearch()
     session_id = f"purchase_{request.email.replace('@', '_at_')}_{request.game}"
     last_error = None
 
@@ -647,55 +638,16 @@ async def _purchase_flow(request: PurchaseRequest):
             await browser.navigate_to_store(request.game)
             await browser.human_like_delay(3000, 5000)
         
-            # Скриншот страницы магазина игры для AI (Claude ищет 80 Gems)
+            # Скриншот страницы магазина
             await browser.take_screenshot(f"store_{request.game}_{session_id}.png")
-        
-            # Шаг 3: Поиск товара (80 Gems) с помощью AI — смотрим и нажимаем через Claude
-            logger.info(f"Шаг 3: Поиск товара '{request.product_name}' с помощью AI...")
-            page_content = await browser.get_page_content()
-        
-            product_info = await ai_search.find_product(
-                page_content,
-                request.product_name,
-                request.product_type
-            )
-        
-            if not product_info or not product_info.get("found"):
-                logger.warning(
-                    f"AI не нашёл товар '{request.product_name}', пробуем прямой поиск через Playwright..."
-                )
-                product_info = None  # сбрасываем, будем искать сами
 
-            if product_info and product_info.get("found"):
-                logger.info(
-                    f"Товар найден AI: {product_info.get('description', 'N/A')} "
-                    f"(confidence: {product_info.get('confidence', 0):.2f})"
-                )
+            # Шаг 3: Поиск товара через Playwright (без AI)
+            logger.info(f"Шаг 3: Поиск товара '{request.product_name}' через Playwright...")
+            product_info = None  # AI отключён
 
-            # Шаг 4: Добавление товара в корзину
+            # Шаг 4: Клик по карточке товара
             logger.info("Шаг 4: Добавление товара в корзину...")
-
-            clicked = False
-
-            # --- Путь A: AI нашёл товар ---
-            if product_info and product_info.get("found"):
-                button_text = product_info.get("button_text", "Buy")
-                clicked = await browser.click_element_by_text(button_text, partial=True, timeout=15000)
-                if not clicked:
-                    coords = product_info.get("coordinates", {})
-                    if coords:
-                        x = coords.get("x", 0) + coords.get("width", 0) / 2
-                        y = coords.get("y", 0) + coords.get("height", 0) / 2
-                        try:
-                            await browser.page.mouse.click(x, y)
-                            clicked = True
-                            logger.info(f"Клик по координатам из AI: ({x}, {y})")
-                        except Exception as e:
-                            logger.warning(f"Не удалось кликнуть по координатам AI: {e}")
-
-            # --- Путь B: Прямой поиск карточки товара через Playwright ---
-            if not clicked:
-                clicked = await _find_and_click_product(browser, request.product_name)
+            clicked = await _find_and_click_product(browser, request.product_name)
 
             if not clicked:
                 await browser.take_screenshot(f"product_not_found_{session_id}.png")
@@ -707,82 +659,80 @@ async def _purchase_flow(request: PurchaseRequest):
                     "3. Страница магазина не загрузилась полностью"
                 )
         
-            # После клика по карточке — ждём модального окна и нажимаем "Add to Cart" / "Buy"
+            # После клика по карточке — ждём появления кнопки "Buy" / "Add to Cart"
             await browser.human_like_delay(1500, 2500)
             await browser.take_screenshot(f"after_card_click_{session_id}.png")
 
-            # Пробуем нажать кнопку "Add to Cart" / "Buy" в модальном окне
-            add_to_cart_selectors = [
+            # Кнопки покупки в модальном окне (в порядке приоритета)
+            buy_btn_selectors = [
+                'button:has-text("Buy")',
                 'button:has-text("Add to Cart")',
                 'button:has-text("Add To Cart")',
-                'button:has-text("add to cart")',
-                'button:has-text("Buy")',
                 'button:has-text("Purchase")',
                 'button:has-text("Купить")',
-                '[class*="add-to-cart"]',
-                '[class*="addToCart"]',
-                '[class*="buy-button"]',
-                '[data-testid*="add-to-cart"]',
-                '[data-testid*="buy"]',
+                '[class*="buy-button"]:visible',
+                '[class*="buyButton"]:visible',
+                '[class*="add-to-cart"]:visible',
+                '[class*="addToCart"]:visible',
+                '[data-testid*="buy"]:visible',
+                '[data-testid*="add-to-cart"]:visible',
             ]
             cart_btn_clicked = False
-            for sel in add_to_cart_selectors:
+            for sel in buy_btn_selectors:
                 try:
-                    btn = await browser.page.query_selector(sel)
-                    if btn and await btn.is_visible():
-                        await btn.scroll_into_view_if_needed()
+                    loc = browser.page.locator(sel).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        await loc.scroll_into_view_if_needed()
                         await browser.page.wait_for_timeout(300)
-                        await btn.click()
+                        await loc.click(timeout=5000)
                         cart_btn_clicked = True
-                        logger.info(f"Нажата кнопка добавления в корзину: {sel}")
+                        logger.info(f"Нажата кнопка покупки: {sel}")
                         break
                 except Exception:
                     continue
 
             if not cart_btn_clicked:
-                logger.info("Кнопка 'Add to Cart' не найдена — возможно, товар уже добавлен или открылась форма оплаты")
+                logger.info("Отдельная кнопка 'Buy' не найдена — клик по карточке мог сразу открыть форму оплаты")
 
-            # Ждём открытия формы оплаты или корзины
-            await browser.human_like_delay(2000, 4000)
+            # Ждём реакции страницы
+            await browser.human_like_delay(2000, 3500)
             await browser.take_screenshot(f"after_add_to_cart_{session_id}.png")
-        
-            # Проверяем, что товар добавлен в корзину или открыта форма оплаты
+
+            # Проверяем результат: URL или текст страницы
             current_url = browser.page.url
             page_text = await browser.page.evaluate("() => document.body.innerText.toLowerCase()")
-        
+
             in_cart = (
-                "cart" in current_url.lower() or
-                "checkout" in current_url.lower() or
-                "payment" in current_url.lower() or
-                "cart" in page_text or
-                "checkout" in page_text or
-                "payment" in page_text
+                "cart" in current_url.lower()
+                or "checkout" in current_url.lower()
+                or "payment" in current_url.lower()
+                or "order" in current_url.lower()
+                or "cart" in page_text
+                or "checkout" in page_text
+                or "payment" in page_text
+                or "order summary" in page_text
+                or "your order" in page_text
             )
-        
-            if not in_cart:
-                # Возможно, открылось модальное окно или форма оплаты
-                payment_selectors = [
-                    'input[type="email"]',
-                    'input[type="card"]',
-                    'button:has-text("Pay")',
-                    'button:has-text("Continue")',
-                    '[class*="payment"]',
-                    '[class*="checkout"]',
-                ]
-                has_payment_form = False
-                for selector in payment_selectors:
-                    try:
-                        elem = await browser.page.query_selector(selector)
-                        if elem and await elem.is_visible():
-                            has_payment_form = True
-                            logger.info(f"Обнаружена форма оплаты: {selector}")
-                            break
-                    except Exception:
-                        continue
-                if not has_payment_form:
-                    logger.warning("Не удалось подтвердить добавление товара в корзину")
-        
-            added = in_cart or ('has_payment_form' in locals() and has_payment_form)
+
+            # Также считаем успехом: кнопка "Buy" была нажата
+            added = in_cart or cart_btn_clicked
+            if cart_btn_clicked and not in_cart:
+                logger.info("Кнопка 'Buy' нажата, ожидаем подтверждения корзины...")
+                await browser.human_like_delay(2000, 3000)
+                current_url = browser.page.url
+                page_text = await browser.page.evaluate("() => document.body.innerText.toLowerCase()")
+                in_cart = (
+                    "cart" in current_url.lower()
+                    or "checkout" in current_url.lower()
+                    or "payment" in current_url.lower()
+                    or "cart" in page_text
+                    or "checkout" in page_text
+                    or "payment" in page_text
+                )
+                added = in_cart or cart_btn_clicked
+
+            if not added:
+                logger.warning("Не удалось подтвердить добавление товара в корзину")
         
             # Шаг 5: Переход на окно оформления заказа (checkout), если ещё не там
             checkout_opened = False

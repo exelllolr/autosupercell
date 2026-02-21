@@ -98,7 +98,8 @@ Email: {email}
                 print(f"\n   Информация о товаре:")
                 print(f"      Название: {product_name}")
                 print(f"      Цена: {product_info.get('price', 'N/A')}")
-                print(f"      Уверенность AI: {product_info.get('confidence', 0):.2%}")
+                conf = product_info.get('confidence')
+                print(f"      Уверенность AI: {conf:.2%}" if conf is not None else "      Уверенность AI: N/A")
                 print(f"      Описание: {product_info.get('description', 'N/A')}")
 
             if result.get("screenshot"):
