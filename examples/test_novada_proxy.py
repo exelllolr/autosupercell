@@ -48,16 +48,30 @@ TEST_URL_EXT = "https://api.ipify.org?format=json"
 
 
 def get_novada_proxy_url() -> str:
-    """Собрать URL прокси из переменных окружения."""
+    """Собрать URL прокси из переменных окружения (формат как в proxy_manager: region, state, city, session, sessTime)."""
+    import secrets
     user = os.environ.get("NOVADA_USERNAME", "").strip()
     key = os.environ.get("NOVADA_API_KEY", "").strip()
     zone = os.environ.get("NOVADA_ZONE", "res").strip() or "res"
     region = os.environ.get("NOVADA_REGION", "").strip()
+    state = os.environ.get("NOVADA_STATE", "").strip()
+    city = os.environ.get("NOVADA_CITY", "").strip()
+    sticky_min = 8
+    try:
+        sticky_min = int(os.environ.get("NOVADA_STICKY_MINUTES", "8") or "8")
+    except ValueError:
+        pass
     if not user or not key:
         return ""
     username_part = f"{user}-zone-{zone}"
     if region:
         username_part += f"-region-{region.lower()}"
+    if state:
+        username_part += f"-st-{state.lower().replace(' ', '')}"
+    if city:
+        username_part += f"-city-{city.lower().replace(' ', '')}"
+    session_id = secrets.token_hex(4)
+    username_part += f"-session-{session_id}-sessTime-{sticky_min}"
     server = _novada_server()
     port = _novada_port()
     return f"http://{username_part}:{key}@{server}:{port}"
@@ -93,7 +107,7 @@ def main():
     NOVADA_SERVER = _novada_server()
     NOVADA_PORT = _novada_port()
     print(f"\nСервер: {NOVADA_SERVER}:{NOVADA_PORT}")
-    print(f"Username (формат): {user}-zone-res-region-us (или zone-dcp для datacenter)")
+    print(f"Username (формат): {user}-zone-{os.environ.get('NOVADA_ZONE','res')}-region-{os.environ.get('NOVADA_REGION','us') or 'us'}-st-oregon-city-portland-session-XXX-sessTime-8")
 
     # Тест 1: ipinfo.novada.pro (официальный тест Novada)
     print("\n--- Тест 1: ipinfo.novada.pro ---")

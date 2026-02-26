@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html data-theme-version="TNP-28326-clone-of-25.4.4-to-prevent-bulk-override">
+<head>
+    <script>
+        // inlining for prformance reasons. Will be centralized later as part of perf work
+        let fsErrorBuffer = [];
+        try {
+            function captureError(message, source, lineno, colno, error) {
+                try { // need another try, since callback
+                    if (!error || !(error instanceof Error)) {
+                        error = new Error(message);
+                        if (!error.stack) {
+                        error.stack = `Generated at ${source}:${lineno}:${colno}`;
+                        }
+                    }
+                    if (!error.fileName) error.fileName = source;
+                    if (!error.lineNumber) error.lineNumber = lineno;
+                    if (!error.columnNumber) error.columnNumber = colno;
+                    const signature = `${error.name}|${error.message}|${error.fileName}:${error.lineNumber}:${error.columnNumber}|${error.stack}`;
+                    if (!fsErrorBuffer.some(e => e.signature === signature)) {
+                        fsErrorBuffer.push({ signature, errorObject: error });
+                    }
+                } catch (err) {
+                    console.error("Error inside captureError:", err);
+                }
+            }
+            function fsOnErrorHandler(event) {
+                try {
+                    captureError(event.message, event.filename, event.lineno, event.colno, event.error);
+                } catch (err) {
+                    console.error("Error in fsOnErrorHandler:", err);
+                }
+            }
+            function fsOnUnhandledRejectionHandler(event) {
+                try {
+                    // Ensure event.reason is a valid error object
+                    let error = event.reason instanceof Error ? event.reason : new Error(event.reason || "Unhandled promise rejection");
+                    captureError(error.message, "", 0, 0, error);
+                } catch (err) {
+                    console.error("Error in fsOnUnhandledRejectionHandler:", err);
+                }
+            }
+            window.addEventListener("error", fsOnErrorHandler);
+            window.addEventListener("unhandledrejection", fsOnUnhandledRejectionHandler);
+        } catch (err) {
+            console.error("Error in error-handling script:", err);
+        }
+
+        var logger = {
+            info: function () {
+                logger._log('info', Array.prototype.slice.call(arguments));
+            },
+            warn: function () {
+                logger._log('warning', Array.prototype.slice.call(arguments));
+            },
+            error: function () {
+                var args = Array.prototype.slice.call(arguments);
+                var error = args[0] instanceof Error ? args[0] : new Error(args.join(' '));
+                if (window.Sentry) {
+                    Sentry.captureException(error);
+                } else {
+                    fsOnErrorHandler(error);
+                }
+            },
+            _log: function __log(type, args) {
+                var message = args.shift();
+                return
+            }
+        };
+
+        window.logger = logger;
+
+        /* in-lining needed parts from core.js for performance */
+        (function() {
+            try {
+            if (window.location.hash) {
+                var action = window.location.hash.substring(1);
+                try {
+                if (action == 'debug-on') {
+                    window.localStorage.setItem('debug', true);
+                } else if (action == 'debug-off') {
+                    window.localStorage.removeItem('debug');
+                }
+                } catch(e) {}
+            }
+            window.logMessage = window.debug = function _debug() {
+                try {
+                if (window.localStorage.getItem('debug')) {
+                    console.log.apply(console, arguments);
+                }
+                } catch(e) {}
+            };
+            } catch (ignoreErrorsWhileDebugging) { }
+        })();
+
+        // placeholders for stuff assigned from the backend and default values
+        var _variables = {"themeModeJS":"","allowSeparateBillingContactInfo":"false","integrationBehaviourGA":"doNotRun","whichLogoTitle":"store","collectingEmailCheckbox":"hide","placeLogo":"overflow","actionLinksClrHover":"#c8661a","showCouponField":"false","subscriptionTermsExpose":"disabled","subscriptionAutoRenewAfterInit":"auto","focusVisiblePrice":"false","forcePhoneNumberCollection":"false","imageMode":"light","couponFieldExpanded":"link","borderRadiusButton":"4px","responsiveCart":"false","showCompanyField":"disable","subscriptionAutoRenew":"auto","showVatLink":"false","forcePhysicalAddressCollection":"false","actionLinksClr":"#f38027","modalExpand":"false","customIdGTM":"","countrySelector":"hidden","showProducts":"false","integrationBehaviourGTM":"doNotRun","openFooterLinkInOverlay":"false","licenses":"false","customIdGA":"","requireEmail":"false","showCart":"true","font":"Helvetica-Neue"};
+        var IRcounter = 0;
+        var decorator;
+        var initiated = false;
+        var dataLayer = [];
+        var fsDataLayer = [];
+        var GTMaccount = ''; //_variables['GTMaccount'] ? _variables['GTMaccount'] : '';
+        var GAaccount = ''; //_variables['GAaccount'] ? _variables['GAaccount'] : '';
+
+        var themeVersion = document.documentElement.getAttribute('data-theme-version');  // theme version is on the top in HTML, preset by the backend
+
+        var vendor = '';
+        var storefront = '';
+        var productPath = '';
+        var theme = '';
+        var style = '';
+        var live = '';
+
+        var hookData = {"hooks":[
+]};
+
+        if (hookData.hasOwnProperty('hooks')) {
+            for (var i = 0; i < hookData.hooks.length; i++) {
+                var hook = hookData.hooks[i];
+                if (hook.hasOwnProperty('attributes') && hook.attributes != null && hook['attributes'].hasOwnProperty('googleUniversalAnalyticsPropertyId')) {
+                    GAaccount = hook['attributes']['googleUniversalAnalyticsPropertyId'];
+                }
+                if (hook.hasOwnProperty('attributes') && hook.attributes != null && hook['attributes'].hasOwnProperty('googleTagManagerContainerId')) {
+                    GTMaccount = hook['attributes']['googleTagManagerContainerId'];
+                }
+            }
+        }
+
+        //Override assigned value to the custom value
+        if ((_variables.integrationBehaviourGA === 'custom') && (_variables.customIdGA.length > 0)) {
+            GAaccount = _variables.customIdGA;
+        }
+        if (_variables.integrationBehaviourGA === 'doNotRun') {
+            GAaccount = '';
+        }
+
+        //For GTM
+        if ((_variables.integrationBehaviourGTM === 'custom') && (_variables.customIdGTM.length > 0)) {
+            GTMaccount = _variables.customIdGTM;
+        }
+        if (_variables.integrationBehaviourGTM === 'doNotRun') {
+            GTMaccount = '';
+        }
+
+        _variables = null; // reset for security before we allow and run custom tags/scripts
+
+        includeGA(); // call function to place GA script on the page, BUT do nothing yet. The approach is VERY different with GTM.
+
+        var gaTimeout = window.setTimeout(function _gaTimeout() {
+            logger.warn("Sandbox GA not loaded");
+        }, 3000);
+
+        if (window.ga) {
+            ga(function () {
+                window.clearTimeout(gaTimeout);
+                logger.info("Sandbox GA loaded");
+            });
+        }
+
+        var fstTimeout = window.setTimeout(function _fstTimeout() {
+            logger.warn("Sandbox FST not loaded");
+        }, 3000);
+
+        fst(function () {
+            window.clearTimeout(fstTimeout);
+            logger.info("Sandbox FST loaded");
+        });
+
+        function sendEventsToHooks(events) {
+            if (hookData.hasOwnProperty('hooks')) {
+                var loadJs = function (sSrc, fOnLoad) {
+                    var oHead = document.head || document.getElementsByTagName('head')[0];
+                    var oScript = document.createElement("script");
+                    oScript.type = "text/javascript";
+                    if (fOnLoad) {
+                        oScript.onload = fOnLoad;
+                    }
+                    oHead.appendChild(oScript);
+                    oScript.src = sSrc;
+                };
+
+                for (var e = 0; e < events.length; e++) {
+                    var event = events[e];
+                    for (var i = 0; i < hookData.hooks.length; i++) {
+                        var hook = hookData.hooks[i];
+                        hook.load = loadJs;
+
+                        if (event.hook == hook.id) {
+                            try {
+                                hook.publish(event);
+                            } catch (e) {
+                                (console.error || console.log)("Browser hook execution resulted in error: ", e);
+                                logger.info('Browser hook execution resulted in error', e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        function listener(event) {
+            // this is the global "listener" for postmessages from the parent page. All events posted from it arrive here and we act based on the event contents.
+            if (event.data.hasOwnProperty('_init')) {
+                // _init is a special type of event which "initializes" the sandbox. It contains information about the parent page, required variables etc.
+                vendor = event.data['_init'].vendor;
+                storefront = event.data['_init'].storefront;
+                theme = event.data['_init'].theme;
+                style = event.data['_init'].style;
+                live = event.data['_init'].live;
+
+                if (event.data['_init'].hasOwnProperty('product')) {
+                    productPath = event.data['_init'].product; // we are actually not using this anymore
+                }
+
+                if (GAaccount.length > 0) {
+                    // init client's tracker if it exists.
+                    initGA('gtag', GAaccount, 'clientTracker', event.data['_init']['fsc-url'], event.data['_init']['fsc-referrer']);
+                }
+                (window.debug || console.log)({
+                    'primary': vendor,
+                    'secondary': storefront,
+                    'action': 'Sandbox:initGA:Success',
+                    'url': window.location.href
+                });
+                return;
+            }
+
+            if (event.data.hasOwnProperty('_private')) {
+                // next, if event is _private it means that we ONLY send those tracks to the FastSpring's tracker ignoring vendor's GTM and GA.
+                runGA(event.data, true);
+                return;
+            }
+
+            if (event.data.hasOwnProperty('fsc-order-id')) {
+                // if event has fsc-order-id it means that we are on the /complete page. to avoid double-dipping (sending purchase track to ecommerce twice) we store the order id to the localstorage and check if it's there afterwards. If we see order id in the localstorage we don't continue with this event.
+                try {
+                    var mark = localStorage.getItem(event.data['fsc-order-id']);
+                    (window.debug || console.log)({
+                        'primary': vendor,
+                        'secondary': storefront,
+                        'action': 'Sandbox:GetOrderIdFromLS:Success',
+                        'orderId': event.data['fsc-order-id'],
+                        'url': window.location.href
+                    });
+                    if (!mark) {
+                        localStorage.setItem(event.data['fsc-order-id'], true);
+                        (window.debug || console.log)({
+                            'primary': vendor,
+                            'secondary': storefront,
+                            'action': 'Sandbox:SaveOrderIdToLS:Success',
+                            'orderId': event.data['fsc-order-id'],
+                            'url': window.location.href
+                        });
+                    } else {
+                        return;
+                    }
+                } catch (e) {
+                    logger.error("Failure handling 'fsc-order-id'", {
+                        'primary': vendor,
+                        'secondary': storefront,
+                        'action': 'Sandbox:SaveOrderIdToLS:Exception',
+                        'url': window.location.href,
+                        'error': e.message
+                    }, e);
+                }
+            }
+
+            if (event.data.hasOwnProperty('_browserhooks')) {
+                // run sendEventsToHooks(event) function if received browserhooks
+                sendEventsToHooks(event.data['_browserhooks']);
+                return;
+            }
+
+            // now we run GA routing function and push event to the dataLayer. You can see that dataLayer is deliberately placed BEFORE GTM code. This is how it's supposed to be.
+            try {
+                runGA(event.data, false);
+                (window.debug || console.log)({
+                    'primary': vendor,
+                    'secondary': storefront,
+                    'action': 'Sandbox:runGA:Success',
+                    'url': window.location.href
+                });
+
+                //Different DataLayer to avoid conflict between GTAG and GTM
+                dataLayer.push(event.data);
+
+                if (initiated === false && GTMaccount.length > 0) {
+                    // init GTM once
+                    initiated = true;
+                    initGTM();
+
+                    window.setTimeout(function _gtmTimeout() {
+                        if (!window.google_tag_manager) {
+                            logger.warn('GTM not loaded');
+                        } else {
+                            logger.info('GTM loaded');
+                        }
+                    }, 3000);
+
+                    (window.debug || console.log)({
+                        'primary': vendor,
+                        'secondary': storefront,
+                        'action': 'Sandbox:initiateGTM:Success',
+                        'url': window.location.href
+                    });
+                }
+            } catch (e) {
+                logger.error('Failure in GTM initializer', {
+                    'primary': vendor,
+                    'secondary': storefront,
+                    'action': 'Sandbox:runGA:initiateGTM:Exception',
+                    'url': window.location.href,
+                    'error': e.message
+                }, e);
+            }
+            // on each even we force to update the iframe's URL and pass linker to the parent frame. Sigh..
+//			decorateParents();
+
+            // decorator is running with the interval of minute and a half. Each 90 seconds the URL is updated for the iframe and parent re-saves linker parameter.
+//			clearInterval(decorator);
+//			decorator = setInterval(function(){ decorateParents(); }, 90000);
+        }
+
+        function includeGA() {
+            (function(i,s,o,g,r,a,m){i['MoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+                (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+                m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+            })(window,document,'script','https://fastspringresources.com/fst.js','fst');
+
+            var newScript = document.createElement("script");
+            newScript.type = "text/javascript";
+            newScript.setAttribute("async", "true");
+            newScript.setAttribute("src", "https://www.googletagmanager.com/gtag/js?id=" + 'UA-57518103-1' + '&l=fsDataLayer');
+            document.documentElement.firstChild.appendChild(newScript);
+
+
+            window.fsDataLayer = window.fsDataLayer || [];
+
+            function fsgtag() {
+                window.fsDataLayer.push(arguments);
+            }
+
+            window.fsgtag = fsgtag;
+            fsgtag('js', new Date());
+
+        }
+
+        function initGTM(containerID) {
+            const urlParams = new URLSearchParams(window.location.search);
+            if(urlParams.has('clientId') && urlParams.has('sessionId')){
+                window.clsid = {
+                    client_id : urlParams.get('clientId'),
+                    session_id : urlParams.get('sessionId'),
+                }
+            }
+            (function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+                new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+                j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+                'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+            })(window,document,'script','dataLayer',GTMaccount);
+        }
+
+        function initGA(tracker, ua, name, url, referrer) {
+            try {
+                var fn = window[tracker];
+                // initGA is a tricky one:
+                if(tracker === "fst"){
+                    fn('create', ua, 'auto', {'name': name, 'allowLinker': true, 'storage': 'none'});
+                    fn(name + '.require', 'ec');
+                    fn(name + '.set', {location: url, referrer: referrer});
+                }else if(name === 'clientTracker'){
+                    const urlParams = new URLSearchParams(window.location.search);
+                    if(urlParams.has('clientId') && urlParams.has('sessionId')){
+                        window.clsid = {
+                            client_id : urlParams.get('clientId'),
+                            session_id : urlParams.get('sessionId'),
+                        }
+                        fsgtag('config', GAaccount, {
+                            'send_page_view': false,
+                            'linker': {
+                                'accept_incoming': true
+                            },
+                            'cookie_flags': 'max-age='+30*24*60*60+';secure;samesite=none',
+                            'location': url,
+                            'referrer': referrer,
+                            'client_id': window.clsid.client_id,
+                            'session_id': window.clsid.session_id,
+                        });
+                    }else{
+                        fsgtag('config', GAaccount, {
+                            'send_page_view': false,
+                            'linker': {
+                                'accept_incoming': true
+                            },
+                            'cookie_flags': 'max-age='+30*24*60*60+';secure;samesite=none',
+                            'location': url,
+                            'referrer': referrer
+                        });
+                    }
+                }else if (name === 'fastspringTracker') {
+                    // for fastspring tracker ONLY we set "dimensions" which help us better understand what this traffic is. They are pretty self explanatory
+
+                    var major = 'dev';
+                    var minor = '';
+
+                    var versions = themeVersion.split('-');
+
+                    if (versions && versions.length > 1 && versions[0] === 'Version') {
+                        major = versions[1];
+                        minor = versions[2];
+                    }
+
+                }
+            } catch (e) {
+                logger.error('Failure initializing sandbox ' + (tracker || 'undefined').toUpperCase(), e);
+            }
+        }
+
+        function runGA(message, greedy) {
+            var items = [];
+            // greedy means "private" - when set to true events will only be sent to FS's tracker.
+            if (message.hasOwnProperty('fsc-exception')) {
+                // exceptions are ONLY sent to GA tracker always
+                fst('fastspringTracker.send', 'exception', message['fsc-exception']);
+                return;
+            }
+
+            var isInternalEvent = false;
+            // from here is a "router" which creates and sends GA tracks based on what kind of event/data we received.
+            if (message.hasOwnProperty('ecommerce')) {
+                fsgtag('set', {'currency': message['fsc-currency']});
+                fst('fastspringTracker.set', '&cu', message['fsc-currency']);
+
+                if (GAaccount.length > 0 && !greedy) {
+                    fsgtag('config', GAaccount, {'currency': message['fsc-currency'],
+                        send_page_view: false,
+                        'linker': {
+                            'accept_incoming': true
+                        },
+                        cookie_flags: 'max-age='+30*24*60*60+';secure;samesite=none'
+                    });
+                }
+
+                if (message.ecommerce.hasOwnProperty('impressions')) {
+                    items = [];
+                    message.ecommerce.impressions.forEach(function (productObject) {
+                        fst('fastspringTracker.ec:addImpression', productObject);
+                        items.push(productObject);
+                    });
+
+                    if (GAaccount.length > 0 && !greedy) {
+                        fsgtag('event', 'view_item_list', {'items': items, 'send_to': GAaccount});
+                    }
+                }
+
+                if (message.ecommerce.hasOwnProperty('checkout') && message.ecommerce.checkout.hasOwnProperty('products')) {
+                    var step = message.ecommerce.checkout.actionField.step;
+                    var option = message.ecommerce.checkout.actionField.option || '';
+
+                    isInternalEvent = step > 5; // Steps past 5 are events internal to FS
+
+                    items = [];
+                    message.ecommerce.checkout.products.forEach(function (productObject) {
+                        fst('fastspringTracker.ec:addProduct', productObject);
+                        items.push(productObject);
+                    });
+
+                    if (GAaccount.length > 0 && !greedy && !isInternalEvent) {
+                        fsgtag('event', 'add_to_cart', {'items': items, 'send_to': GAaccount});
+                    }
+
+                    fst('fastspringTracker.ec:setAction', 'checkout', {
+                        'step': step,
+                        'option': option
+                    });
+
+                    if (GAaccount.length > 0 && !greedy && !isInternalEvent) {
+                        fsgtag('event', 'checkout_progress', {
+                            "items": items,
+                            "send_to": GAaccount
+                        });
+
+                        fsgtag('event', 'set_checkout_option', {
+                            "checkout_step": step,
+                            "checkout_option": option,
+                            'send_to': GAaccount
+                        });
+                    }
+                }
+
+                if (message.ecommerce.hasOwnProperty('remove') && message.ecommerce.remove.hasOwnProperty('products')) {
+                    items = [];
+                    message.ecommerce.remove.products.forEach(function (productObject) {
+                        fst('fastspringTracker.ec:addProduct', productObject);
+                        items.push(productObject);
+                    });
+
+                    if (GAaccount.length > 0 && !greedy) {
+                        fsgtag('event', 'add_to_cart', {'items': items, 'send_to': GAaccount});
+                    }
+
+
+                    fst('fastspringTracker.ec:setAction', 'remove');
+
+                    if (GAaccount.length > 0 && !greedy) {
+                        fsgtag('event', 'remove_from_cart', {
+                            "items": items,
+                            "send_to": GAaccount
+                        });
+                    }
+                }
+                if (message.ecommerce.hasOwnProperty('add') && message.ecommerce.add.hasOwnProperty('products')) {
+                    items = [];
+                    message.ecommerce.add.products.forEach(function (productObject) {
+                        items.push(productObject);
+                        fst('fastspringTracker.ec:addProduct', productObject);
+                    });
+
+                    fst('fastspringTracker.ec:setAction', 'add');
+
+                    if (GAaccount.length > 0 && !greedy) {
+                        fsgtag('event', 'add_to_cart', {'items': items, 'send_to': GAaccount});
+                    }
+                    // products
+                }
+                if (message.ecommerce.hasOwnProperty('promoView')) {
+                    var promotions = [];
+                    message.ecommerce.promoView['fs-promotions'].forEach(function (FSpromoObject) {
+                        promotions.push(FSpromoObject);
+                        fst('fastspringTracker.ec:addPromo', FSpromoObject);
+                    });
+
+                    if (GAaccount.length > 0 && !greedy) {
+                        fsgtag('event', 'view_promotion', {
+                            "promotions": promotions,
+                            'send_to': GAaccount
+                        });
+                    }
+
+                    delete message.ecommerce.promoView['fs-promotions'];
+                }
+                if (message.ecommerce.hasOwnProperty('promoClick')) {
+                    fst('fastspringTracker.ec:addPromo', message.ecommerce.promoClick['fs-promotions'][0]);
+                    fst('fastspringTracker.ec:setAction', 'promo_click');
+
+                    if (GAaccount.length > 0 && !greedy) {
+                        fsgtag('event', 'view_promotion', {
+                            "promotions": [
+                                message.ecommerce.promoClick['promotions'][0]
+                            ],
+                            'send_to': GAaccount
+                        });
+
+                        fsgtag('event', 'select_content', {
+                            "promotions": [
+                                message.ecommerce.promoClick['promotions'][0]
+                            ],
+                            'send_to': GAaccount
+                        });
+                    }
+
+                    delete message.ecommerce.promoClick['fs-promotions'];
+                }
+
+                if (message.ecommerce.hasOwnProperty('detail')) {
+                    ga('fastspringTracker.ec:addProduct', message.ecommerce.detail['products'][0]);
+                    fst('fastspringTracker.ec:addProduct', message.ecommerce.detail['products'][0]);
+                    ga('fastspringTracker.ec:setAction', 'detail');
+                    fst('fastspringTracker.ec:setAction', 'detail');
+
+
+
+                    if (GAaccount.length > 0 && !greedy) {
+
+                        fsgtag('event', 'view_item', {
+                            "items": [
+                                message.ecommerce.detail['products'][0]
+                            ],
+                            'send_to': GAaccount
+                        });
+
+                        fsgtag('event', 'add_to_cart', {
+                            "items": [
+                                message.ecommerce.detail['products'][0]
+                            ],
+                            'send_to': GAaccount
+                        });
+                    }
+                }
+
+                if (message.ecommerce.hasOwnProperty('purchase') && message.ecommerce.purchase.hasOwnProperty('products')) {
+                    items = [];
+                    message.ecommerce.purchase.products.forEach(function (productObject) {
+                        fst('fastspringTracker.ec:addProduct', productObject);
+                        items.push({...productObject, quantity: +productObject.quantity});
+                    });
+
+                    if (GAaccount.length > 0 && !greedy) {
+                        fsgtag('event', 'add_to_cart', {'items': items, 'send_to': GAaccount});
+                    }
+
+                    if (GAaccount.length > 0 && !greedy) {
+                        fsgtag('event', 'purchase', {
+                            'send_to': GAaccount,
+                            'items': items,
+                            "currency": message['fsc-currency'],
+                            "value": message.ecommerce.purchase.actionField.revenue,
+                            'transaction_id': message.ecommerce.purchase.actionField.id,
+                            ...message.ecommerce.purchase.actionField
+                        });
+                    }
+                }
+            }
+
+            if (message.hasOwnProperty('fsc-paymentMethod')) {
+                fst('fastspringTracker.set', 'dimension9', message['fsc-paymentMethod']);
+            }
+
+            // here we decide if we send "event" or "pageview" to GA.
+            if (!message.hasOwnProperty('event')) {
+                var url, urlOverride;
+
+                url = message['fsc-url'];
+                urlOverride = message['fsc-url'];
+
+                if (GAaccount.length > 0 && !greedy) {
+                    fsgtag('event', 'page_view', {
+                        'page_location': urlOverride,
+                        'send_to': GAaccount,
+                    });
+                }
+            } else {
+                var eventObject = {
+                    'hitType': 'event',
+                    'eventCategory': message['fsc-eventCategory'],
+                    'eventAction': message['fsc-eventAction']
+                };
+
+                if (message.hasOwnProperty('fsc-eventValue')) {
+                    eventObject['eventValue'] = parseInt(message['fsc-eventValue'], 10);
+                }
+
+                if (message.hasOwnProperty('fsc-eventLabel')) {
+                    eventObject['eventLabel'] = message['fsc-eventLabel'];
+                }
+
+
+                if (GAaccount.length > 0 && !greedy && !isInternalEvent) {
+                    fsgtag('event', eventObject.eventAction, {
+                        'event_category': eventObject.eventCategory,
+                        'send_to': GAaccount,
+                    });
+                }
+            }
+        }
+
+        // register event listeners to hear from the parent page.
+        if (window.addEventListener) {
+            addEventListener("message", listener, false)
+        } else {
+            attachEvent("onmessage", listener)
+        }
+
+        function loadSentry() {
+            try {
+                if (!window.Sentry) {
+                    function loadScript(src, attributes = {}, callback) {
+                        try {
+                            let script = document.createElement("script");
+                            script.src = src;
+                            script.defer = true;
+                            Object.entries(attributes).forEach(([key, value]) => script.setAttribute(key, value));
+                            if (callback) {
+                                script.onload = callback; // Execute callback after script is fully loaded
+                            }
+                            document.body.appendChild(script);
+                        } catch (err) {
+                            console.error("Error loading Sentry:", err);
+                        }
+                    }
+
+                    loadScript("https://browser.sentry-cdn.com/8.52.1/bundle.tracing.min.js", { // TODO: move to dynamo config
+                        crossorigin: "anonymous",
+                        id: "fsSentryScript"
+                        },
+                        // call back to initialize Sentry and flush any errors in the buffer. 
+                        function () {
+                            try {
+                                let sentryDSN = document.querySelector("#fsSentryScriptDSN").value;
+                                if (sentryDSN.trim().length > 0) {
+                                    function flushErrorsToSentry() {
+                                        try {
+                                            fsErrorBuffer.forEach(({ errorObject }) => {
+                                                Sentry.captureException(errorObject);
+                                            });
+                                            fsErrorBuffer = [];
+                                        } catch (err) {
+                                            console.error("Error in flushErrorsToSentry:", err);
+                                        }
+                                    }
+                                    Sentry.init({
+                                        dsn: sentryDSN,
+                                        beforeSend(event) {
+                                            if (event.exception &&
+                                                event.exception.values &&
+                                                Array.isArray(event.exception.values)) {
+                                                event.exception.values.forEach((exception) => {
+                                                    if (exception.stacktrace &&
+                                                        exception.stacktrace.frames &&
+                                                        Array.isArray(exception.stacktrace.frames)) {
+                                                        exception.stacktrace.frames.forEach((frame) => {
+                                                            frame.vars = {}; // Remove local variable captures
+                                                        });
+                                                    }
+                                                });
+                                            }
+                                            // Remove data from from event (prevents any sensitive data reaching sentry)
+                                            if (event.request && event.request.data) {
+                                                event.request.data = "[Filtered]";
+                                            }
+                                            return event;
+                                        }
+                                    });
+                                    // Flush stored errors
+                                    flushErrorsToSentry();
+                                    window.removeEventListener("error", fsOnErrorHandler);
+                                    window.removeEventListener("unhandledrejection", fsOnUnhandledRejectionHandler);
+                                    try {
+                                        // Manually capture a page load transaction
+                                        if (Sentry && Sentry.startTransaction) {
+                                        const transaction = Sentry.startTransaction({ name: "page-load" });
+                                        transaction.finish();
+                                        }
+                                    } catch (err) {
+                                        console.error(err);
+                                    }
+                                }
+                                if (Sentry) {
+                                    window.addEventListener("securitypolicyviolation", (event) => {
+                                        Sentry.captureMessage(`CSP Violation: Blocked URI - ${event.blockedURI}`, "warning");
+                                    });
+                                }
+                            } catch (err) {
+                                console.error(err);
+                            }
+                        }
+                    );
+                }
+            } catch (err) {
+                console.error(err);
+            }
+        }
+    </script>
+</head>
+<body>
+    <input type="hidden" id="fsSentryScriptDSN" value="https://13ae4796676e7d1ca914f673eaa3abb3@o4508734376574976.ingest.us.sentry.io/4508734983962625">
+</body>
+<script>
+    loadSentry();
+</script>
+</html>

@@ -32,6 +32,8 @@ class ProxyManager:
         if novada_enabled and novada_user and novada_key:
             zone = getattr(settings, "NOVADA_ZONE", "res") or "res"
             region = getattr(settings, "NOVADA_REGION", "") or ""
+            state = getattr(settings, "NOVADA_STATE", "") or ""
+            city = getattr(settings, "NOVADA_CITY", "") or ""
             host = getattr(settings, "NOVADA_PROXY_HOST", "super.novada.pro") or "super.novada.pro"
             port = getattr(settings, "NOVADA_PROXY_PORT", 7777) or 7777
             sticky_min = getattr(settings, "NOVADA_STICKY_MINUTES", 0) or 0
@@ -42,6 +44,10 @@ class ProxyManager:
             username_base = f"{novada_user}-zone-{zone}"
             if region:
                 username_base += f"-region-{region.lower()}"
+            if state:
+                username_base += f"-st-{state.lower().replace(' ', '')}"
+            if city:
+                username_base += f"-city-{city.lower().replace(' ', '')}"
             self.proxies.append({
                 "server": f"http://{host}:{port}",
                 "password": novada_key,
@@ -50,8 +56,10 @@ class ProxyManager:
                 "_novada_sticky_min": sticky_min,
             })
             logger.info(
-                f"Добавлен Novada прокси (zone={zone}, region={region or 'any'}). "
-                f"Новый IP на каждый запуск браузера. Сервер: {host}:{port}"
+                f"Добавлен Novada прокси (zone={zone}, region={region or 'any'}"
+                + (f", state={state}" if state else "")
+                + (f", city={city}" if city else "")
+                + f"). Сервер: {host}:{port}"
             )
 
         proxy_file = Path(settings.PROXY_LIST_FILE)

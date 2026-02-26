@@ -88,6 +88,17 @@ Email: {email}
             print(f"   Окно оформления заказа открыто: {result.get('checkout_opened', False)}")
             print(f"   Сообщение: {result.get('message')}")
             print(f"   URL: {result.get('url')}")
+
+            # Результат оплаты Google Pay
+            payment = result.get("payment")
+            if payment:
+                print(f"\n   💳 Google Pay:")
+                print(f"      Кнопка нажата: {payment.get('google_pay_clicked')}")
+                print(f"      Оплата подтверждена: {payment.get('payment_confirmed')}")
+                print(f"      Успех верифицирован: {payment.get('payment_verified')}")
+                if payment.get("error"):
+                    print(f"      Ошибка: {payment.get('error')}")
+
             if result.get("video"):
                 print(f"   Видео сессии: {result.get('video')}")
             if result.get("checkout_screenshot"):

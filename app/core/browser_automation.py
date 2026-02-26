@@ -199,6 +199,7 @@ class BrowserAutomation:
                         "java_script_enabled": True,
                         "accept_downloads": True,
                         "ignore_https_errors": False,
+                        "bypass_csp": True,  # FastSpring/pay.fastspring.com блокирует Sentry по CSP — обход для оплаты
                     }
                     if ctx_timezone:
                         context_options["timezone_id"] = ctx_timezone
@@ -217,7 +218,7 @@ class BrowserAutomation:
                         "java_script_enabled": True,
                         "accept_downloads": True,
                         "ignore_https_errors": False,
-                        "bypass_csp": False,
+                        "bypass_csp": True,  # FastSpring блокирует connect к sentry-cdn.com по CSP — без обхода оплата ломается
                         "proxy": proxy,
                         "extra_http_headers": {
                             "Accept-Language": ",".join(
@@ -295,9 +296,9 @@ class BrowserAutomation:
                         else:
                             raise
                 else:
+                    # Прокси задаём только на уровне context (new_context), чтобы он применялся ко всем страницам и popup
                     launch_options = {
                         "headless": headless_mode,
-                        "proxy": proxy,
                     }
                     if not use_patchright:
                         launch_options["args"] = browser_args
@@ -313,9 +314,9 @@ class BrowserAutomation:
                         else:
                             raise
                     context_options.pop("args", None)
-                    context_options.pop("proxy", None)
                     context_options.pop("channel", None)
                     context_options.pop("headless", None)
+                    # proxy остаётся в context_options — применяется ко всему context (все страницы и popup)
                     if getattr(settings, "BROWSER_RECORD_VIDEO", True):
                         context_options["record_video_dir"] = str(video_dir)
                         context_options["record_video_size"] = {"width": 1280, "height": 720}

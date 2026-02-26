@@ -56,7 +56,9 @@ class Settings(BaseSettings):
     NOVADA_USERNAME: str = ""
     NOVADA_API_KEY: str = ""
     NOVADA_ZONE: str = "res"   # res | dcp
-    NOVADA_REGION: str = "us"  # us, gb, de или пусто
+    NOVADA_REGION: str = "us"  # Страна: us, gb, de и т.д. (2-letter ISO или код Novada)
+    NOVADA_STATE: str = ""     # Штат/регион: oregon, california (пусто = любой)
+    NOVADA_CITY: str = ""      # Город: portland (пусто = любой). Список: country_map_en.xlsx на novada.com
     NOVADA_PROXY_HOST: str = "super.novada.pro"
     NOVADA_PROXY_PORT: int = 7777
     NOVADA_STICKY_MINUTES: int = 0  # 0 = rotating; 5–120 = sticky session (один IP на N минут)
@@ -64,9 +66,12 @@ class Settings(BaseSettings):
     # reCAPTCHA solving (2Captcha) — опционально для обхода блокировки Supercell
     CAPTCHA_2CAPTCHA_API_KEY: str = ""
 
-    # Payment
+    # Payment — Google Pay
     GOOGLE_PAY_ENABLED: bool = True
-    PAYMENT_TIMEOUT: int = 120
+    PAYMENT_TIMEOUT: int = 300  # секунд на вход в Google и подтверждение оплаты
+    # Google аккаунт для оплаты (App Password: myaccount.google.com/apppasswords)
+    GOOGLE_EMAIL: str = ""
+    GOOGLE_APP_PASSWORD: str = ""
 
     # External Services
     PLATI_API_KEY: str = ""
