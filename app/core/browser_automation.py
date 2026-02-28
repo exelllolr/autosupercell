@@ -114,31 +114,13 @@ class BrowserAutomation:
                 logger.info(f"Используется User-Agent: {self.current_user_agent[:50]}...")
                 logger.info(f"Используется Viewport: {self.current_viewport}")
 
-                # Расширенные аргументы для обхода детекции
-                # Убраны подозрительные флаги типа --disable-web-security
                 browser_args = [
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",  # Требуется для Docker
-                "--disable-setuid-sandbox",  # Требуется для Docker
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--disable-site-isolation-trials",
-                "--disable-infobars",
-                f"--window-size={self.current_viewport['width']},{self.current_viewport['height']}",
-                "--start-maximized",
-                "--disable-extensions",
-                "--disable-plugins-discovery",
-                "--disable-default-apps",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-renderer-backgrounding",
-                "--disable-features=TranslateUI",
-                "--disable-ipc-flooding-protection",
-                "--exclude-switches=enable-automation",  # Важно: скрывает автоматизацию
-                "--enable-features=NetworkService,NetworkServiceInProcess",
-                "--disable-component-extensions-with-background-pages",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
                 ]
                 if getattr(settings, "BROWSER_INCOGNITO", False):
                     browser_args.append("--incognito")
@@ -148,19 +130,6 @@ class BrowserAutomation:
                 is_docker = os.path.exists("/.dockerenv") or os.environ.get("DOCKER_CONTAINER") == "true"
                 headless_mode = getattr(settings, "BROWSER_HEADLESS", True) if hasattr(settings, "BROWSER_HEADLESS") else (is_docker or not settings.DEBUG)
                 use_chrome = getattr(settings, "BROWSER_USE_CHROME", False)
-
-                # В headed режиме (локально) убираем Docker-специфичные флаги
-                if not headless_mode:
-                    browser_args = [a for a in browser_args if a not in (
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-extensions",
-                        "--disable-plugins-discovery",
-                        "--disable-default-apps",
-                        "--disable-component-extensions-with-background-pages",
-                    )]
-                    logger.info("Headed режим: убраны Docker-специфичные флаги для лучшей имитации")
 
                 import os
                 use_persistent = getattr(settings, "BROWSER_USE_PERSISTENT_PROFILE", True)
@@ -198,8 +167,7 @@ class BrowserAutomation:
                     ctx_geolocation = None
 
                 if use_patchright and use_persistent and not headless_mode:
-                    # Рекомендация Patchright: минимум опций, без своего UA/headers/viewport.
-                    # args для Google: отключаем детекцию автоматизации ("This browser or app may not be secure").
+                    # Patchright: минимум опций. Один args нужен для Google — иначе «This browser or app may not be secure».
                     context_options = {
                         "locale": locale,
                         "color_scheme": "light",
@@ -210,11 +178,7 @@ class BrowserAutomation:
                         "java_script_enabled": True,
                         "accept_downloads": True,
                         "ignore_https_errors": False,
-                        "bypass_csp": True,  # FastSpring/pay.fastspring.com блокирует Sentry по CSP — обход для оплаты
-                        "args": [
-                            "--disable-blink-features=AutomationControlled",
-                            "--exclude-switches=enable-automation",
-                        ],
+                        "args": ["--disable-blink-features=AutomationControlled"],
                     }
                     if ctx_timezone:
                         context_options["timezone_id"] = ctx_timezone
@@ -223,22 +187,23 @@ class BrowserAutomation:
                         context_options["geolocation"] = ctx_geolocation
                 else:
                     context_options = {
-                        "viewport": self.current_viewport,
-                        "user_agent": self.current_user_agent,
-                        "locale": locale,
-                        "color_scheme": "light",
-                        "device_scale_factor": random.choice([1, 1.25, 1.5]),
-                        "has_touch": False,
-                        "is_mobile": False,
+                        "viewport": {"width": 1920, "height": 1080},
+                        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                        "locale": "en-US",
+                        "timezone_id": "America/New_York",
+                        "permissions": ["geolocation"],
+                        "geolocation": {"latitude": 40.7128, "longitude": -74.0060},
                         "java_script_enabled": True,
                         "accept_downloads": True,
-                        "ignore_https_errors": False,
-                        "bypass_csp": True,  # FastSpring блокирует connect к sentry-cdn.com по CSP — без обхода оплата ломается
+                        "ignore_https_errors": True,
                         "proxy": proxy,
                         "extra_http_headers": {
-                            "Accept-Language": ",".join(
-                                [f"{lang};q={0.9 - i*0.1}" for i, lang in enumerate(current_languages)]
-                            ),
+                            "Accept-Language": "en-US,en;q=0.9",
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                            "Accept-Encoding": "gzip, deflate, br",
+                            "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                            "Sec-Ch-Ua-Mobile": "?0",
+                            "Sec-Ch-Ua-Platform": '"Windows"',
                         },
                     }
                     if not use_patchright:

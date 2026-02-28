@@ -671,6 +671,7 @@ async def _login_google_in_popup(
 
 async def _confirm_payment_in_popup(popup_page) -> bool:
     """Нажимает кнопку подтверждения оплаты в popup Google Pay."""
+    import re
     logger.info("Подтверждение оплаты в Google Pay popup...")
 
     try:
@@ -689,10 +690,20 @@ async def _confirm_payment_in_popup(popup_page) -> bool:
         'button:has-text("Confirm")',
         'button:has-text("Place order")',
         'button:has-text("Buy")',
+        'button:has-text("Оплатить")',
+        'button:has-text("Подтвердить")',
+        'button:has-text("Оплатить с G Pay")',
         '[class*="pay-button"]',
         '[class*="payButton"]',
         '[class*="confirm"]',
         'button[type="submit"]',
+        '[role="button"]:has-text("Pay")',
+        '[role="button"]:has-text("Confirm")',
+        '[role="button"]:has-text("Continue")',
+        '[data-testid*="pay"]',
+        '[data-testid*="confirm"]',
+        'div[role="button"]:has-text("Pay")',
+        'span[role="button"]:has-text("Pay")',
     ]
 
     for sel in confirm_selectors:
@@ -703,6 +714,19 @@ async def _confirm_payment_in_popup(popup_page) -> bool:
                 await _delay(popup_page, 800, 1500)
                 await loc.click(timeout=15000)
                 logger.info(f"Оплата подтверждена: {sel}")
+                return True
+        except Exception:
+            continue
+
+    # Fallback: get_by_role по подстроке (Pay, Confirm, Continue, Оплатить)
+    for name_pattern in [re.compile(r"pay|confirm|continue|оплатить|подтвердить", re.I)]:
+        try:
+            btn = popup_page.get_by_role("button", name=name_pattern).first
+            if await btn.count() > 0 and await btn.is_visible():
+                await btn.scroll_into_view_if_needed()
+                await _delay(popup_page, 500, 1000)
+                await btn.click(timeout=15000)
+                logger.info("Оплата подтверждена: get_by_role(button)")
                 return True
         except Exception:
             continue
