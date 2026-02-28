@@ -1,6 +1,7 @@
 """Браузерная автоматизация на Patchright (undetected Playwright)."""
 
 import asyncio
+import re
 import random
 from typing import Optional, Dict, List, Tuple
 from pathlib import Path
@@ -68,22 +69,31 @@ class BrowserAutomation:
         self.current_viewport: Optional[Dict] = None
         self.current_proxy: Optional[Dict] = None  # для mark_proxy_failed при ошибке навигации
 
-    async def start(self, retry_proxy: bool = True, max_proxy_retries: int = 3) -> None:
+    async def start(
+        self,
+        retry_proxy: bool = True,
+        max_proxy_retries: int = 3,
+        use_proxy: Optional[bool] = None,
+    ) -> None:
         """
         Запуск браузера с улучшенным stealth режимом.
-        
+
         Args:
             retry_proxy: Попробовать другой прокси при ошибке (по умолчанию True)
             max_proxy_retries: Максимальное количество попыток с разными прокси
+            use_proxy: True = использовать прокси из настроек, False = без прокси, None = по умолчанию (из PROXY_ENABLED)
         """
         proxy_attempts = 0
         last_error = None
-        
+
         while proxy_attempts < max_proxy_retries:
             try:
                 async_playwright, use_patchright = _get_playwright()
                 self.playwright = await async_playwright().start()
-                proxy = proxy_manager.get_proxy()
+                if use_proxy is False:
+                    proxy = None
+                else:
+                    proxy = proxy_manager.get_proxy()
                 self.current_proxy = proxy
 
                 if proxy:
@@ -172,7 +182,7 @@ class BrowserAutomation:
                             project_root = Path.cwd()
                         profile_dir = (project_root / raw_profile).resolve()
                     profile_dir.mkdir(parents=True, exist_ok=True)
-                    logger.debug("Профиль браузера: %s", profile_dir)
+                    logger.debug(f"Профиль браузера: {profile_dir}")
 
                 video_dir = Path("videos")
                 video_dir.mkdir(exist_ok=True)
@@ -188,7 +198,8 @@ class BrowserAutomation:
                     ctx_geolocation = None
 
                 if use_patchright and use_persistent and not headless_mode:
-                    # Рекомендация Patchright: минимум опций, без своего UA/headers/viewport
+                    # Рекомендация Patchright: минимум опций, без своего UA/headers/viewport.
+                    # args для Google: отключаем детекцию автоматизации ("This browser or app may not be secure").
                     context_options = {
                         "locale": locale,
                         "color_scheme": "light",
@@ -200,6 +211,10 @@ class BrowserAutomation:
                         "accept_downloads": True,
                         "ignore_https_errors": False,
                         "bypass_csp": True,  # FastSpring/pay.fastspring.com блокирует Sentry по CSP — обход для оплаты
+                        "args": [
+                            "--disable-blink-features=AutomationControlled",
+                            "--exclude-switches=enable-automation",
+                        ],
                     }
                     if ctx_timezone:
                         context_options["timezone_id"] = ctx_timezone
@@ -249,7 +264,7 @@ class BrowserAutomation:
                     fallback_profile = (project_root / "browser_profile").resolve()
                     fallback_profile.mkdir(parents=True, exist_ok=True)
 
-                    logger.info("Запуск с постоянным профилем: %s", profile_dir)
+                    logger.info(f"Запуск с постоянным профилем: {profile_dir}")
                     try:
                         self.context = await self.playwright.chromium.launch_persistent_context(
                             str(profile_dir), **context_options
@@ -805,19 +820,32 @@ class BrowserAutomation:
             url = url_map.get(game.lower(), settings.SUPERCELL_STORE_URL)
             logger.warning(f"Карточка магазина не найдена, переход по URL: {url}")
             try:
-                await self.page.goto(url, wait_until="networkidle", timeout=60000)
+                await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
             except Exception as e:
                 logger.error(f"Ошибка перехода на страницу: {e}")
                 raise
         else:
+            # Дождаться перехода на страницу магазина (чтобы не «висеть на одном месте»)
+            slug = game.lower().replace("_", "-").replace(" ", "-")
+            try:
+                # URL может быть /brawlstars или /brawl-stars, /clashroyale или /clash-royale
+                slug_re = slug.replace("-", "[-]?")
+                url_pattern = re.compile(rf".*{slug_re}.*", re.I)
+                await self.page.wait_for_url(url_pattern, timeout=25000)
+                logger.info(f"Переход на магазин завершён: {self.page.url}")
+            except Exception:
+                pass
             try:
                 await self.page.wait_for_load_state("domcontentloaded", timeout=30000)
                 await self.human_like_delay(2000, 4000)
             except Exception:
                 pass
 
-    async def take_screenshot(self, filename: str) -> Path:
-        """Сделать скриншот страницы."""
+    async def take_screenshot(self, filename: str, timeout_ms: int = 20000) -> Path:
+        """
+        Сделать скриншот страницы.
+        timeout_ms: ограничение ожидания (по умолчанию 20 сек), чтобы не висеть на «waiting for fonts to load».
+        """
         if not self.page:
             raise RuntimeError("Страница не инициализирована")
 
@@ -825,7 +853,22 @@ class BrowserAutomation:
         screenshot_dir.mkdir(exist_ok=True)
 
         filepath = screenshot_dir / filename
-        await self.page.screenshot(path=str(filepath), full_page=True)
+        try:
+            await self.page.screenshot(
+                path=str(filepath),
+                full_page=True,
+                timeout=timeout_ms,
+            )
+        except Exception as e:
+            # При таймауте (например из-за шрифтов) пробуем скриншот без full_page и с коротким таймаутом
+            if "timeout" in str(e).lower() or "exceeded" in str(e).lower():
+                logger.warning(f"Скриншот full_page таймаут ({timeout_ms} мс), пробуем viewport...")
+                try:
+                    await self.page.screenshot(path=str(filepath), timeout=5000)
+                except Exception:
+                    raise e
+            else:
+                raise
         logger.info(f"Скриншот сохранен: {filepath}")
         return filepath
 

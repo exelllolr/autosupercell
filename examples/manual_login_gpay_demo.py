@@ -12,6 +12,7 @@
 import argparse
 import asyncio
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -59,12 +60,44 @@ def check_proxy_status():
         print(f"   [Прокси] Ошибка: {e}")
 
 
+def run_check_proxy_script() -> bool:
+    """
+    Запуск help/check_proxy.py перед покупкой.
+    Возвращает True если проверка пройдена (или прокси отключены), False иначе.
+    """
+    if not getattr(settings, "PROXY_ENABLED", False):
+        return True
+    script = _project_root / "help" / "check_proxy.py"
+    if not script.exists():
+        logger.warning("help/check_proxy.py не найден, пропускаем проверку прокси.")
+        return True
+    print("\n[Проверка прокси для Google Pay] Запуск help/check_proxy.py ...")
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(_project_root),
+            timeout=600,
+        )
+        if proc.returncode != 0:
+            print("\n[X] Проверка прокси не пройдена. Завершение.")
+            return False
+        print("[OK] Проверка прокси пройдена.\n")
+        return True
+    except subprocess.TimeoutExpired:
+        print("\n[X] check_proxy.py превысил таймаут. Завершение.")
+        return False
+    except Exception as e:
+        logger.warning("Ошибка запуска check_proxy.py: %s", e)
+        return True
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Manual login + GPay purchase demo (без авто-авторизации)")
     p.add_argument("--game", default="brawl-stars", help="Game slug (e.g. brawl-stars, clash-royale)")
     p.add_argument("--product", default="80 Gems", help="Product name to search and buy")
     p.add_argument("--google-email", default="", help="Override Google Pay email from env")
     p.add_argument("--timeout", type=int, default=None, help="Payment timeout in seconds (default 300 for Google login)")
+    p.add_argument("--no-proxy", action="store_true", help="Запуск без прокси (если через прокси таймаут store.supercell.com)")
     return p.parse_args()
 
 
@@ -73,6 +106,7 @@ async def run_demo(
     product_name: str,
     google_email: str,
     payment_timeout: int,
+    use_proxy: bool = True,
 ) -> dict:
     """Весь процесс покупки как в purchase_demo, без автоматической авторизации."""
     browser = BrowserAutomation()
@@ -104,18 +138,65 @@ async def run_demo(
             "Запуск браузера и открытие Store",
             "Браузер запускается с прокси (headless=false). Открывается store.supercell.com.",
         )
-        logger.info("Запуск браузера с прокси (headless=false)...")
-        await browser.start()
+        logger.info(f"Запуск браузера (headless=false){' с прокси' if use_proxy else ' без прокси'}...")
+        await browser.start(use_proxy=use_proxy)
         result["proxy_used"] = browser.current_proxy is not None
         if browser.current_proxy:
             result["proxy_server"] = browser.current_proxy.get("server")
 
         logger.info("Переход на store.supercell.com...")
-        await browser.page.goto(
-            "https://store.supercell.com",
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
+        store_url = "https://store.supercell.com"
+        goto_ok = False
+        for attempt in range(1, 5):
+            try:
+                wait_until = "commit" if attempt == 4 else "domcontentloaded"
+                timeout_ms = 120000
+                await browser.page.goto(store_url, wait_until=wait_until, timeout=timeout_ms)
+                goto_ok = True
+                logger.info(f"Store загружен с попытки {attempt}")
+                break
+            except Exception as e:
+                err_str = str(e).lower()
+                logger.warning(f"Попытка {attempt}/4 перехода на store: {e}")
+                if attempt < 4:
+                    await asyncio.sleep(3)
+                else:
+                    # Автоповтор без прокси при таймауте (часто с Novada/прокси store не грузится)
+                    if use_proxy and ("err_timed_out" in err_str or "timeout" in err_str):
+                        logger.warning("Store не открылся через прокси. Перезапуск браузера без прокси...")
+                        try:
+                            await browser.close()
+                        except Exception:
+                            pass
+                        await browser.start(use_proxy=False)
+                        result["proxy_used"] = False
+                        result["proxy_server"] = None
+                        for retry in range(1, 4):
+                            try:
+                                await browser.page.goto(
+                                    store_url,
+                                    wait_until="commit" if retry == 3 else "domcontentloaded",
+                                    timeout=120000,
+                                )
+                                goto_ok = True
+                                logger.info(f"Store загружен без прокси с попытки {retry}")
+                                break
+                            except Exception as e2:
+                                logger.warning(f"Без прокси попытка {retry}/3: {e2}")
+                                if retry < 3:
+                                    await asyncio.sleep(2)
+                        if goto_ok:
+                            break
+                    hint = ""
+                    if "err_timed_out" in err_str or "timeout" in err_str:
+                        hint = " Запустите с флагом --no-proxy или отключите прокси в .env (PROXY_ENABLED=false)."
+                    elif "err_name_not_resolved" in err_str:
+                        hint = " Проверьте DNS или отключите прокси в .env (PROXY_ENABLED=false)."
+                    elif "err_connection_reset" in err_str or "connection" in err_str:
+                        hint = " Прокси может обрывать соединение. Попробуйте другой прокси или PROXY_ENABLED=false."
+                    raise RuntimeError(f"Не удалось открыть {store_url} после 4 попыток.{hint}") from e
+        if not goto_ok:
+            return result
         await browser.page.wait_for_timeout(2000)
         await _accept_cookies(browser)
         await browser.human_like_delay(1000, 2000)
@@ -204,6 +285,7 @@ async def run_demo(
         return result
 
     finally:
+        # Всегда закрываем браузер и соединение, иначе при выходе — pending tasks и ValueError в transport
         try:
             video_path = await browser.close()
             if video_path:
@@ -225,10 +307,14 @@ def main():
     print("\nПроцесс (без автоматической авторизации, путь покупки как в purchase_demo):")
     print("  1. Запуск браузера с прокси, открытие store.supercell.com")
     print("  2. Ты вручную входишь в аккаунт в браузере")
-    print("  3. Покупка: магазин игры → товар «" + args.product + "» → Buy → корзина (проверка количества) → Checkout")
+    print("  3. Покупка: магазин игры -> товар \"" + args.product + "\" -> Buy -> корзина (проверка количества) -> Checkout")
     print("  4. Оплата через Google Pay")
     check_proxy_status()
     print()
+
+    use_proxy = not getattr(args, "no_proxy", False)
+    if use_proxy and not run_check_proxy_script():
+        sys.exit(1)
 
     if sys.platform == "win32":
         def _run():
@@ -241,6 +327,7 @@ def main():
                         product_name=args.product,
                         google_email=args.google_email or "",
                         payment_timeout=payment_timeout,
+                        use_proxy=not getattr(args, "no_proxy", False),
                     )
                 )
             finally:
@@ -254,6 +341,7 @@ def main():
                 product_name=args.product,
                 google_email=args.google_email or "",
                 payment_timeout=payment_timeout,
+                use_proxy=not getattr(args, "no_proxy", False),
             )
         )
 

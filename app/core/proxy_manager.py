@@ -25,42 +25,56 @@ class ProxyManager:
             logger.info("Прокси отключены в конфигурации")
             return
 
-        # Novada: добавляем как «шаблон» — при каждом get_proxy() подставляем новый session = новый IP
+        # Novada: Rotating Session или Sticky Session
         novada_enabled = getattr(settings, "NOVADA_ENABLED", False)
         novada_user = getattr(settings, "NOVADA_USERNAME", "") or ""
         novada_key = getattr(settings, "NOVADA_API_KEY", "") or ""
         if novada_enabled and novada_user and novada_key:
-            zone = getattr(settings, "NOVADA_ZONE", "res") or "res"
-            region = getattr(settings, "NOVADA_REGION", "") or ""
-            state = getattr(settings, "NOVADA_STATE", "") or ""
-            city = getattr(settings, "NOVADA_CITY", "") or ""
             host = getattr(settings, "NOVADA_PROXY_HOST", "super.novada.pro") or "super.novada.pro"
             port = getattr(settings, "NOVADA_PROXY_PORT", 7777) or 7777
-            sticky_min = getattr(settings, "NOVADA_STICKY_MINUTES", 0) or 0
-            if sticky_min < 0:
-                sticky_min = 0
-            if sticky_min > 120:
-                sticky_min = 120
-            username_base = f"{novada_user}-zone-{zone}"
-            if region:
-                username_base += f"-region-{region.lower()}"
-            if state:
-                username_base += f"-st-{state.lower().replace(' ', '')}"
-            if city:
-                username_base += f"-city-{city.lower().replace(' ', '')}"
-            self.proxies.append({
-                "server": f"http://{host}:{port}",
-                "password": novada_key,
-                "_novada_fresh_session": True,
-                "_novada_username_base": username_base,
-                "_novada_sticky_min": sticky_min,
-            })
-            logger.info(
-                f"Добавлен Novada прокси (zone={zone}, region={region or 'any'}"
-                + (f", state={state}" if state else "")
-                + (f", city={city}" if city else "")
-                + f"). Сервер: {host}:{port}"
-            )
+            use_rotating = getattr(settings, "NOVADA_ROTATING", False)
+
+            if use_rotating:
+                # Rotating Session: один прокси с фиксированным username — gateway сам ротирует IP
+                self.proxies.append({
+                    "server": f"http://{host}:{port}",
+                    "username": novada_user,
+                    "password": novada_key,
+                })
+                logger.info(
+                    f"Добавлен Novada прокси (Rotating Session). Сервер: {host}:{port}"
+                )
+            else:
+                # Sticky Session: при каждом get_proxy() подставляем новый session = новый IP
+                zone = getattr(settings, "NOVADA_ZONE", "res") or "res"
+                region = getattr(settings, "NOVADA_REGION", "") or ""
+                state = getattr(settings, "NOVADA_STATE", "") or ""
+                city = getattr(settings, "NOVADA_CITY", "") or ""
+                sticky_min = getattr(settings, "NOVADA_STICKY_MINUTES", 0) or 0
+                if sticky_min < 0:
+                    sticky_min = 0
+                if sticky_min > 120:
+                    sticky_min = 120
+                username_base = f"{novada_user}-zone-{zone}"
+                if region:
+                    username_base += f"-region-{region.lower()}"
+                if state:
+                    username_base += f"-st-{state.lower().replace(' ', '')}"
+                if city:
+                    username_base += f"-city-{city.lower().replace(' ', '')}"
+                self.proxies.append({
+                    "server": f"http://{host}:{port}",
+                    "password": novada_key,
+                    "_novada_fresh_session": True,
+                    "_novada_username_base": username_base,
+                    "_novada_sticky_min": sticky_min,
+                })
+                logger.info(
+                    f"Добавлен Novada прокси (zone={zone}, region={region or 'any'}"
+                    + (f", state={state}" if state else "")
+                    + (f", city={city}" if city else "")
+                    + f"). Сервер: {host}:{port}"
+                )
 
         proxy_file = Path(settings.PROXY_LIST_FILE)
         if not proxy_file.exists():

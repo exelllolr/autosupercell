@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     BROWSER_WARMUP_VISIT_SUPERCELL: bool = True
     BROWSER_USE_STEALTH_PLUGIN: bool = True
     # True = использовать Patchright (undetected Playwright). Нужно: pip install patchright && patchright install chrome
+    # Для входа в Google Pay рекомендуется: BROWSER_USE_PATCHRIGHT=True, BROWSER_HEADLESS=False, BROWSER_USE_CHROME=True
     BROWSER_USE_PATCHRIGHT: bool = False
     # Записывать видео сессии (только при обычном контексте; при persistent профиле недоступно)
     BROWSER_RECORD_VIDEO: bool = True
@@ -53,6 +54,7 @@ class Settings(BaseSettings):
 
     # Novada proxy (резидентные/датацентр прокси)
     NOVADA_ENABLED: bool = False
+    NOVADA_ROTATING: bool = False  # True = Rotating Session (gateway сам ротирует IP)
     NOVADA_USERNAME: str = ""
     NOVADA_API_KEY: str = ""
     NOVADA_ZONE: str = "res"   # res | dcp
@@ -72,6 +74,8 @@ class Settings(BaseSettings):
     # Google аккаунт для оплаты (App Password: myaccount.google.com/apppasswords)
     GOOGLE_EMAIL: str = ""
     GOOGLE_APP_PASSWORD: str = ""
+    # Резервные коды Google (8-значная верификация после пароля). Один код или несколько через запятую; пробелы игнорируются. Пример: 5519 2680 или 55192680,12345678
+    GOOGLE_BACKUP_CODES: str = ""
 
     # External Services
     PLATI_API_KEY: str = ""
