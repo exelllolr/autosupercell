@@ -18,6 +18,12 @@ except ImportError:
         "Установите Patchright: pip install patchright && patchright install chrome"
     )
 
+try:
+    from gologin import GoLogin
+    GOLOGIN_AVAILABLE = True
+except ImportError:
+    GOLOGIN_AVAILABLE = False
+
 
 def _get_playwright():
     """Возвращает (async_playwright, use_patchright_recommended).
@@ -68,6 +74,103 @@ class BrowserAutomation:
         self.current_user_agent: Optional[str] = None
         self.current_viewport: Optional[Dict] = None
         self.current_proxy: Optional[Dict] = None  # для mark_proxy_failed при ошибке навигации
+        self._gl = None  # GoLogin instance
+
+    def _proxy_to_gologin_format(self, proxy: Dict) -> Optional[Dict]:
+        """
+        Конвертация прокси из proxy_manager (server, username, password) в формат GoLogin SDK.
+        server = "http://host:port" -> host, port; поддерживается только HTTP-прокси.
+        """
+        if not proxy or not proxy.get("server"):
+            return None
+        server = proxy.get("server", "").strip()
+        if not server:
+            return None
+        # "http://host:port" или "https://host:port" -> host, port
+        match = re.match(r"^https?://([^:/]+):?(\d+)?", server, re.I)
+        if not match:
+            return None
+        host = match.group(1)
+        port = match.group(2) or "80"
+        try:
+            port = str(int(port))
+        except ValueError:
+            port = "80"
+        gologin_proxy = {
+            "mode": "http",
+            "host": host,
+            "port": port,
+            "username": (proxy.get("username") or "").strip(),
+            "password": (proxy.get("password") or "").strip(),
+        }
+        return gologin_proxy
+
+    async def _start_via_gologin(self, use_proxy: Optional[bool] = None) -> bool:
+        """
+        Запуск браузера через GoLogin антидетект (только SDK GoLogin).
+        Используются только свои прокси из настроек (Novada / proxies.txt), не прокси GoLogin.
+        Возвращает True если успешно, False если GoLogin не настроен.
+        """
+        if not GOLOGIN_AVAILABLE:
+            logger.debug("GoLogin SDK не установлен (pip install gologin)")
+            return False
+
+        token = getattr(settings, "GOLOGIN_API_TOKEN", "").strip()
+        profile_id = getattr(settings, "GOLOGIN_PROFILE_ID", "").strip()
+
+        if not token or not profile_id:
+            logger.debug("GoLogin не настроен (GOLOGIN_API_TOKEN или GOLOGIN_PROFILE_ID не заданы)")
+            return False
+
+        # Свои прокси: из proxy_manager (Novada или файл), только если use_proxy не False
+        use_proxy_flag = use_proxy if use_proxy is not None else getattr(settings, "PROXY_ENABLED", False)
+        proxy = proxy_manager.get_proxy() if use_proxy_flag else None
+        self.current_proxy = proxy
+        start_options: Dict = {}
+        if proxy:
+            gologin_proxy = self._proxy_to_gologin_format(proxy)
+            if gologin_proxy:
+                start_options["proxy"] = gologin_proxy
+                logger.info(
+                    f"GoLogin с прокси: {proxy.get('server', '')} (user: {proxy.get('username', '') or '—'})"
+                )
+        else:
+            logger.info("GoLogin без прокси")
+
+        logger.info(f"Запуск браузера через GoLogin (profile: {profile_id[:8]}...)")
+
+        try:
+            self._gl = GoLogin({
+                "token": token,
+                "profile_id": profile_id,
+            })
+            debugger_address = self._gl.start(start_options) if start_options else self._gl.start()
+            logger.info(f"GoLogin запущен, debugger: {debugger_address}")
+
+            from playwright.async_api import async_playwright
+            self.playwright = await async_playwright().start()
+            self.browser = await self.playwright.chromium.connect_over_cdp(
+                f"http://{debugger_address}"
+            )
+            self.context = self.browser.contexts[0]
+            self.page = await self.context.new_page()
+
+            # Увеличенные таймауты
+            self.context.set_default_navigation_timeout(120000)
+            self.context.set_default_timeout(60000)
+
+            logger.info("Браузер GoLogin успешно подключён")
+            return True
+
+        except Exception as e:
+            logger.error(f"Ошибка запуска GoLogin: {e}")
+            if self._gl:
+                try:
+                    self._gl.stop()
+                except Exception:
+                    pass
+                self._gl = None
+            return False
 
     async def start(
         self,
@@ -83,6 +186,10 @@ class BrowserAutomation:
             max_proxy_retries: Максимальное количество попыток с разными прокси
             use_proxy: True = использовать прокси из настроек, False = без прокси, None = по умолчанию (из PROXY_ENABLED)
         """
+        # Сначала пробуем GoLogin если настроен (только SDK GoLogin, свои прокси)
+        if await self._start_via_gologin(use_proxy=use_proxy):
+            return
+
         proxy_attempts = 0
         last_error = None
 
@@ -1190,6 +1297,13 @@ class BrowserAutomation:
             if self.playwright:
                 await self.playwright.stop()
                 self.playwright = None
+            if self._gl:
+                try:
+                    self._gl.stop()
+                    logger.info("GoLogin профиль остановлен")
+                except Exception as e:
+                    logger.debug(f"Ошибка остановки GoLogin: {e}")
+                self._gl = None
             logger.info("Браузер закрыт")
         except Exception as e:
             logger.error(f"Ошибка закрытия браузера: {e}")

@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     # Режим инкогнито (может помочь при блокировках)
     BROWSER_INCOGNITO: bool = False
 
+    # GoLogin anti-detect browser (alternative to Patchright)
+    GOLOGIN_API_TOKEN: str = ""
+    GOLOGIN_PROFILE_ID: str = ""
+
     # Redis
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379
@@ -67,10 +71,14 @@ class Settings(BaseSettings):
 
     # reCAPTCHA solving (2Captcha) — опционально для обхода блокировки Supercell
     CAPTCHA_2CAPTCHA_API_KEY: str = ""
+    # Задержка (сек) перед нажатием LOG IN на accounts.supercell.com — снижает «unusual activity»
+    SUPERCELL_LOGIN_DELAY_BEFORE_SUBMIT: int = 5
+    # Задержка (сек) после нажатия LOG IN перед проверкой страницы — даёт время загрузиться форме кода или странице блокировки
+    SUPERCELL_LOGIN_DELAY_AFTER_SUBMIT: int = 8
 
     # Payment — Google Pay
     GOOGLE_PAY_ENABLED: bool = True
-    PAYMENT_TIMEOUT: int = 300  # секунд на вход в Google и подтверждение оплаты
+    PAYMENT_TIMEOUT: int = 420  # секунд на вход в Google и подтверждение оплаты (7 мин)
     # Google аккаунт для оплаты (App Password: myaccount.google.com/apppasswords)
     GOOGLE_EMAIL: str = ""
     GOOGLE_APP_PASSWORD: str = ""

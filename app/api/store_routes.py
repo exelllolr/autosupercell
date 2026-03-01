@@ -953,7 +953,10 @@ async def _purchase_flow(request: PurchaseRequest):
             await browser.human_like_delay(2000, 3000)
 
             current_url = browser.page.url
-            page_text = await browser.page.evaluate("() => document.body.innerText.toLowerCase()")
+            try:
+                page_text = (await browser.page.evaluate("() => document.body.innerText")).lower()
+            except Exception:
+                page_text = ""
             is_logged_in = (
                 "store.supercell.com" in current_url
                 and "login" not in current_url.lower()
@@ -994,7 +997,7 @@ async def _purchase_flow(request: PurchaseRequest):
                     try:
                         await browser.page.wait_for_url(
                             lambda url: "accounts.supercell.com" in url or "id.supercell.com" in url,
-                            timeout=15000,
+                            timeout=25000,
                         )
                         logger.info(f"Редирект выполнен: {browser.page.url}")
                     except Exception:
@@ -1158,117 +1161,166 @@ async def _purchase_flow(request: PurchaseRequest):
                     'button[type="submit"]', 'input[type="submit"]',
                 ]
 
-                if getattr(settings, "CAPTCHA_2CAPTCHA_API_KEY", ""):
-                    try:
-                        from app.core.recaptcha_solver import solve_recaptcha_enterprise
-                        captcha_token = await solve_recaptcha_enterprise(
-                            api_key=settings.CAPTCHA_2CAPTCHA_API_KEY,
-                            page_url=browser.page.url or "https://accounts.supercell.com/login",
-                            timeout=120,
+                for login_submit_attempt in range(2):
+                    if login_submit_attempt == 1:
+                        logger.warning("Обнаружен unusual activity. Повторная попытка входа через 10 сек...")
+                        await browser.page.goto(
+                            "https://accounts.supercell.com/login",
+                            wait_until="domcontentloaded",
+                            timeout=30000,
                         )
-                        if captcha_token:
-                            await browser.page.evaluate(
-                                """(token) => {
-                                    window.__2captchaToken = token;
-                                    var check = setInterval(function() {
-                                        if (window.grecaptcha && window.grecaptcha.enterprise) {
-                                            clearInterval(check);
-                                            var real = window.grecaptcha.enterprise.execute;
-                                            if (real && !real.__patched) {
-                                                window.grecaptcha.enterprise.execute = function() {
-                                                    return Promise.resolve(window.__2captchaToken || null);
-                                                };
-                                                window.grecaptcha.enterprise.execute.__patched = true;
-                                            }
-                                        }
-                                    }, 100);
-                                    setTimeout(function() { clearInterval(check); }, 5000);
-                                }""",
-                                captcha_token,
-                            )
-                            await browser.human_like_delay(500, 1000)
+                        await browser.page.wait_for_timeout(10000)
+                        await _accept_cookies(browser)
+                        found_email_selector = None
+                        for sel in email_selectors:
                             try:
+                                el = await browser.page.wait_for_selector(sel, timeout=5000)
+                                if el:
+                                    found_email_selector = sel
+                                    break
+                            except Exception:
+                                continue
+                        if not found_email_selector:
+                            raise Exception("Поле email не найдено при повторной попытке входа.")
+                        await browser.human_like_type(found_email_selector, request.email, delay_between_chars=130)
+                        await browser.human_like_delay(800, 1500)
+
+                    if getattr(settings, "CAPTCHA_2CAPTCHA_API_KEY", ""):
+                        try:
+                            from app.core.recaptcha_solver import solve_recaptcha_enterprise
+                            captcha_token = await solve_recaptcha_enterprise(
+                                api_key=settings.CAPTCHA_2CAPTCHA_API_KEY,
+                                page_url=browser.page.url or "https://accounts.supercell.com/login",
+                                timeout=120,
+                            )
+                            if captcha_token:
                                 await browser.page.evaluate(
                                     """(token) => {
-                                        var form = document.querySelector('form');
-                                        if (form && !form.querySelector('input[name="g-recaptcha-response"]')) {
-                                            var inp = document.createElement('input');
-                                            inp.type = 'hidden';
-                                            inp.name = 'g-recaptcha-response';
-                                            inp.value = token;
-                                            form.appendChild(inp);
-                                        }
+                                        window.__2captchaToken = token;
+                                        var check = setInterval(function() {
+                                            if (window.grecaptcha && window.grecaptcha.enterprise) {
+                                                clearInterval(check);
+                                                var real = window.grecaptcha.enterprise.execute;
+                                                if (real && !real.__patched) {
+                                                    window.grecaptcha.enterprise.execute = function() {
+                                                        return Promise.resolve(window.__2captchaToken || null);
+                                                    };
+                                                    window.grecaptcha.enterprise.execute.__patched = true;
+                                                }
+                                            }
+                                        }, 100);
+                                        setTimeout(function() { clearInterval(check); }, 5000);
                                     }""",
                                     captcha_token,
                                 )
-                            except Exception:
-                                pass
-                            logger.info("2Captcha: токен reCAPTCHA подставлен перед LOG IN")
-                        else:
-                            logger.warning("2Captcha не вернул токен — продолжаем без него")
-                    except Exception as e:
-                        logger.debug(f"2Captcha при покупке: {e}")
-
-                await browser.human_like_delay(1000, 2000)
-
-                continue_clicked = False
-                for selector in continue_selectors:
-                    try:
-                        element = await browser.page.wait_for_selector(selector, timeout=3000)
-                        if not element or not await element.is_visible():
-                            continue
-                        box = await element.bounding_box()
-                        if not box:
-                            continue
-                        target_x = box["x"] + box["width"] * random.uniform(0.35, 0.65)
-                        target_y = box["y"] + box["height"] * random.uniform(0.35, 0.65)
-                        try:
-                            email_box = await browser.page.query_selector(found_email_selector)
-                            if email_box:
-                                eb = await email_box.bounding_box()
-                                start_x = eb["x"] + eb["width"] * 0.5 if eb else target_x - 50
-                                start_y = eb["y"] + eb["height"] * 0.5 if eb else target_y - 80
+                                await browser.human_like_delay(500, 1000)
+                                try:
+                                    await browser.page.evaluate(
+                                        """(token) => {
+                                            var form = document.querySelector('form');
+                                            if (form && !form.querySelector('input[name="g-recaptcha-response"]')) {
+                                                var inp = document.createElement('input');
+                                                inp.type = 'hidden';
+                                                inp.name = 'g-recaptcha-response';
+                                                inp.value = token;
+                                                form.appendChild(inp);
+                                            }
+                                        }""",
+                                        captcha_token,
+                                    )
+                                except Exception:
+                                    pass
+                                logger.info("2Captcha: токен reCAPTCHA подставлен перед LOG IN")
                             else:
+                                logger.warning("2Captcha не вернул токен — продолжаем без него")
+                        except Exception as e:
+                            logger.debug(f"2Captcha при покупке: {e}")
+
+                    await browser.human_like_delay(1000, 2000)
+                    delay_before_submit = max(0, getattr(settings, "SUPERCELL_LOGIN_DELAY_BEFORE_SUBMIT", 5))
+                    if delay_before_submit > 0:
+                        logger.info(f"Ожидание {delay_before_submit} сек перед LOG IN (снижение «unusual activity»)...")
+                        await browser.page.wait_for_timeout(delay_before_submit * 1000)
+
+                    continue_clicked = False
+                    for selector in continue_selectors:
+                        try:
+                            element = await browser.page.wait_for_selector(selector, timeout=3000)
+                            if not element or not await element.is_visible():
+                                continue
+                            box = await element.bounding_box()
+                            if not box:
+                                continue
+                            target_x = box["x"] + box["width"] * random.uniform(0.35, 0.65)
+                            target_y = box["y"] + box["height"] * random.uniform(0.35, 0.65)
+                            try:
+                                email_box = await browser.page.query_selector(found_email_selector)
+                                if email_box:
+                                    eb = await email_box.bounding_box()
+                                    start_x = eb["x"] + eb["width"] * 0.5 if eb else target_x - 50
+                                    start_y = eb["y"] + eb["height"] * 0.5 if eb else target_y - 80
+                                else:
+                                    start_x, start_y = target_x - 50, target_y - 80
+                            except Exception:
                                 start_x, start_y = target_x - 50, target_y - 80
+                            mid_x = (start_x + target_x) / 2 + random.uniform(-20, 20)
+                            mid_y = (start_y + target_y) / 2 + random.uniform(-15, 15)
+                            steps = random.randint(12, 20)
+                            for i in range(steps):
+                                t = (i + 1) / steps
+                                bx = (1 - t) ** 2 * start_x + 2 * (1 - t) * t * mid_x + t ** 2 * target_x
+                                by = (1 - t) ** 2 * start_y + 2 * (1 - t) * t * mid_y + t ** 2 * target_y
+                                await browser.page.mouse.move(bx + random.uniform(-1, 1), by + random.uniform(-1, 1))
+                                await browser.page.wait_for_timeout(random.randint(8, 20))
+                            await browser.page.wait_for_timeout(random.randint(80, 180))
+                            await browser.page.mouse.click(target_x, target_y, delay=random.randint(60, 130))
+                            continue_clicked = True
+                            logger.info(f"Кнопка LOG IN нажата (mouse, Безье): {selector}")
+                            break
+                        except Exception as e:
+                            logger.debug(f"Селектор LOG IN {selector}: {e}")
+                            continue
+
+                    if not continue_clicked:
+                        try:
+                            await browser.page.keyboard.press("Tab")
+                            await browser.page.wait_for_timeout(random.randint(150, 300))
+                            await browser.page.keyboard.press("Enter")
+                            continue_clicked = True
+                            logger.info("Кнопка LOG IN нажата через Tab+Enter")
                         except Exception:
-                            start_x, start_y = target_x - 50, target_y - 80
-                        mid_x = (start_x + target_x) / 2 + random.uniform(-20, 20)
-                        mid_y = (start_y + target_y) / 2 + random.uniform(-15, 15)
-                        steps = random.randint(12, 20)
-                        for i in range(steps):
-                            t = (i + 1) / steps
-                            bx = (1 - t) ** 2 * start_x + 2 * (1 - t) * t * mid_x + t ** 2 * target_x
-                            by = (1 - t) ** 2 * start_y + 2 * (1 - t) * t * mid_y + t ** 2 * target_y
-                            await browser.page.mouse.move(bx + random.uniform(-1, 1), by + random.uniform(-1, 1))
-                            await browser.page.wait_for_timeout(random.randint(8, 20))
-                        await browser.page.wait_for_timeout(random.randint(80, 180))
-                        await browser.page.mouse.click(target_x, target_y, delay=random.randint(60, 130))
-                        continue_clicked = True
-                        logger.info(f"Кнопка LOG IN нажата (mouse, Безье): {selector}")
-                        break
-                    except Exception as e:
-                        logger.debug(f"Селектор LOG IN {selector}: {e}")
-                        continue
+                            pass
 
-                if not continue_clicked:
+                    await browser.human_like_delay(1000, 2000)
+                    await _accept_cookies(browser)
+                    delay_after_submit = max(6, getattr(settings, "SUPERCELL_LOGIN_DELAY_AFTER_SUBMIT", 8))
+                    logger.info(f"Ожидание {delay_after_submit} сек после LOG IN перед проверкой страницы...")
+                    await browser.page.wait_for_timeout(delay_after_submit * 1000)
                     try:
-                        await browser.page.keyboard.press("Tab")
-                        await browser.page.wait_for_timeout(random.randint(150, 300))
-                        await browser.page.keyboard.press("Enter")
-                        continue_clicked = True
-                        logger.info("Кнопка LOG IN нажата через Tab+Enter")
-                    except Exception:
-                        pass
-
-                await browser.human_like_delay(1000, 2000)
-                await _accept_cookies(browser)
-                await browser.human_like_delay(1500, 2500)
-                page_text_after = (await browser.page.evaluate("() => document.body.innerText")).lower()
-                if "blocked your login request" in page_text_after or "unusual activity" in page_text_after:
-                    raise Exception(
-                        "Supercell заблокировал вход после отправки email (unusual activity). "
-                        "Попробуйте: PROXY_ENABLED=false, 2Captcha (CAPTCHA_2CAPTCHA_API_KEY), резидентный прокси или BROWSER_USE_PATCHRIGHT=true."
+                        page_text_after = (await browser.page.evaluate("() => document.body.innerText")).lower()
+                    except Exception as nav_err:
+                        logger.debug("evaluate после LOG IN (навигация?): %s", nav_err)
+                        await browser.page.wait_for_timeout(3000)
+                        try:
+                            page_text_after = (await browser.page.evaluate("() => document.body.innerText")).lower()
+                        except Exception:
+                            page_text_after = ""
+                    is_code_page = (
+                        "verification" in page_text_after or "we sent" in page_text_after
+                        or "check your email" in page_text_after or "enter the code" in page_text_after
+                        or "enter the verification" in page_text_after or "code to sign in" in page_text_after
                     )
+                    is_block = "blocked your login request" in page_text_after or (
+                        "unusual activity" in page_text_after and not is_code_page
+                    )
+                    if is_block:
+                        if login_submit_attempt == 0:
+                            continue
+                        raise Exception(
+                            "Supercell заблокировал вход после отправки email (unusual activity). "
+                            "Попробуйте: PROXY_ENABLED=false, 2Captcha (CAPTCHA_2CAPTCHA_API_KEY), резидентный прокси (Novada Sticky), увеличьте SUPERCELL_LOGIN_DELAY_BEFORE_SUBMIT и SUPERCELL_LOGIN_DELAY_AFTER_SUBMIT."
+                        )
+                    break
 
                 verification_code = request.verification_code
                 code_entered_manually = False
