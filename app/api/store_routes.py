@@ -1237,10 +1237,13 @@ async def _purchase_flow(request: PurchaseRequest):
                             logger.debug(f"2Captcha при покупке: {e}")
 
                     await browser.human_like_delay(1000, 2000)
-                    delay_before_submit = max(0, getattr(settings, "SUPERCELL_LOGIN_DELAY_BEFORE_SUBMIT", 5))
-                    if delay_before_submit > 0:
-                        logger.info(f"Ожидание {delay_before_submit} сек перед LOG IN (снижение «unusual activity»)...")
-                        await browser.page.wait_for_timeout(delay_before_submit * 1000)
+                    base_delay_before = getattr(settings, "SUPERCELL_LOGIN_DELAY_BEFORE_SUBMIT", 15)
+                    delay_before_submit_sec = base_delay_before * random.uniform(0.7, 1.3)
+                    if delay_before_submit_sec > 0:
+                        logger.info(
+                            f"Ожидание {delay_before_submit_sec:.1f} сек перед LOG IN (база {base_delay_before} ±30%)..."
+                        )
+                        await browser.page.wait_for_timeout(int(delay_before_submit_sec * 1000))
 
                     continue_clicked = False
                     for selector in continue_selectors:
@@ -1265,14 +1268,15 @@ async def _purchase_flow(request: PurchaseRequest):
                                 start_x, start_y = target_x - 50, target_y - 80
                             mid_x = (start_x + target_x) / 2 + random.uniform(-20, 20)
                             mid_y = (start_y + target_y) / 2 + random.uniform(-15, 15)
-                            steps = random.randint(12, 20)
+                            steps = random.randint(25, 40)
                             for i in range(steps):
                                 t = (i + 1) / steps
                                 bx = (1 - t) ** 2 * start_x + 2 * (1 - t) * t * mid_x + t ** 2 * target_x
                                 by = (1 - t) ** 2 * start_y + 2 * (1 - t) * t * mid_y + t ** 2 * target_y
-                                await browser.page.mouse.move(bx + random.uniform(-1, 1), by + random.uniform(-1, 1))
+                                jitter_x, jitter_y = random.uniform(-2, 2), random.uniform(-2, 2)
+                                await browser.page.mouse.move(bx + jitter_x, by + jitter_y)
                                 await browser.page.wait_for_timeout(random.randint(8, 20))
-                            await browser.page.wait_for_timeout(random.randint(80, 180))
+                            await browser.page.wait_for_timeout(random.randint(300, 800))
                             await browser.page.mouse.click(target_x, target_y, delay=random.randint(60, 130))
                             continue_clicked = True
                             logger.info(f"Кнопка LOG IN нажата (mouse, Безье): {selector}")
@@ -1293,9 +1297,12 @@ async def _purchase_flow(request: PurchaseRequest):
 
                     await browser.human_like_delay(1000, 2000)
                     await _accept_cookies(browser)
-                    delay_after_submit = max(6, getattr(settings, "SUPERCELL_LOGIN_DELAY_AFTER_SUBMIT", 8))
-                    logger.info(f"Ожидание {delay_after_submit} сек после LOG IN перед проверкой страницы...")
-                    await browser.page.wait_for_timeout(delay_after_submit * 1000)
+                    base_delay_after = getattr(settings, "SUPERCELL_LOGIN_DELAY_AFTER_SUBMIT", 12)
+                    delay_after_submit_sec = base_delay_after * random.uniform(0.7, 1.3)
+                    logger.info(
+                        f"Ожидание {delay_after_submit_sec:.1f} сек после LOG IN перед проверкой (база {base_delay_after} ±30%)..."
+                    )
+                    await browser.page.wait_for_timeout(int(delay_after_submit_sec * 1000))
                     try:
                         page_text_after = (await browser.page.evaluate("() => document.body.innerText")).lower()
                     except Exception as nav_err:

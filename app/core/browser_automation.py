@@ -35,23 +35,29 @@ def _get_playwright():
     return async_playwright, use_recommended
 
 
-# Реалистичные User-Agents для ротации
+# Реалистичные User-Agents для ротации (Chrome, Firefox, Edge, Safari)
 USER_AGENTS = [
-    # Windows 10 Chrome (самый популярный)
+    # Windows 10 Chrome
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    # Windows 11 Chrome
+    # Edge
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    # Firefox
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    # Safari (macOS)
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
 ]
 
 # Реалистичные viewport размеры
 VIEWPORTS = [
     {"width": 1920, "height": 1080},  # Full HD
     {"width": 1680, "height": 1050},  # WSXGA+
-    {"width": 1600, "height": 900},    # HD+
-    {"width": 1536, "height": 864},   # Common laptop
-    {"width": 1440, "height": 900},    # MacBook
+    {"width": 1600, "height": 900},   # HD+
+    {"width": 1536, "height": 864},  # Common laptop
+    {"width": 1440, "height": 900},   # MacBook
+    {"width": 1366, "height": 768},  # Common
 ]
 
 # Реалистичные языки
@@ -59,6 +65,24 @@ LANGUAGES = [
     ["en-US", "en"],
     ["en-US", "en", "ru"],
     ["en-GB", "en"],
+]
+
+# Часовые пояса и геолокации для привязки к региону прокси (US, EU)
+TIMEZONES = [
+    "America/New_York",
+    "America/Los_Angeles",
+    "America/Chicago",
+    "Europe/London",
+    "Europe/Berlin",
+    "Europe/Paris",
+]
+GEOLOCATIONS = [
+    {"latitude": 40.7128, "longitude": -74.0060},   # New York
+    {"latitude": 34.0522, "longitude": -118.2437},  # Los Angeles
+    {"latitude": 41.8781, "longitude": -87.6298},  # Chicago
+    {"latitude": 51.5074, "longitude": -0.1278},   # London
+    {"latitude": 52.5200, "longitude": 13.4050},   # Berlin
+    {"latitude": 48.8566, "longitude": 2.3522},    # Paris
 ]
 
 
@@ -73,8 +97,27 @@ class BrowserAutomation:
         self.playwright = None
         self.current_user_agent: Optional[str] = None
         self.current_viewport: Optional[Dict] = None
+        self.current_languages: Optional[List[str]] = None
+        self.current_timezone: Optional[str] = None
+        self.current_geolocation: Optional[Dict] = None
         self.current_proxy: Optional[Dict] = None  # для mark_proxy_failed при ошибке навигации
         self._gl = None  # GoLogin instance
+
+    def randomize_fingerprint(self, proxy_region: Optional[str] = None) -> None:
+        """
+        Меняет User-Agent, viewport, язык (и опционально timezone/geolocation) перед новой попыткой.
+        Вызывать до start() для ротации fingerprint между retry.
+        proxy_region: "us" / "eu" — привязка timezone/geolocation к региону прокси.
+        """
+        self.current_user_agent = random.choice(USER_AGENTS)
+        self.current_viewport = random.choice(VIEWPORTS)
+        self.current_languages = random.choice(LANGUAGES)
+        if proxy_region and proxy_region.lower() == "eu":
+            self.current_timezone = random.choice(["Europe/London", "Europe/Berlin", "Europe/Paris"])
+            self.current_geolocation = random.choice(GEOLOCATIONS[3:6])  # London, Berlin, Paris
+        else:
+            self.current_timezone = random.choice(["America/New_York", "America/Los_Angeles", "America/Chicago"])
+            self.current_geolocation = random.choice(GEOLOCATIONS[0:3])  # US
 
     def _proxy_to_gologin_format(self, proxy: Dict) -> Optional[Dict]:
         """
@@ -213,10 +256,12 @@ class BrowserAutomation:
                 else:
                     logger.info("Прокси не используется (отключен или не настроен)")
 
-                # ВАЖНО: Рандомизация User-Agent и Viewport ДО создания браузера
-                self.current_viewport = random.choice(VIEWPORTS)
-                self.current_user_agent = random.choice(USER_AGENTS)
-                current_languages = random.choice(LANGUAGES)
+                # ВАЖНО: Рандомизация User-Agent и Viewport ДО создания браузера (или из randomize_fingerprint)
+                if self.current_viewport is None:
+                    self.current_viewport = random.choice(VIEWPORTS)
+                if self.current_user_agent is None:
+                    self.current_user_agent = random.choice(USER_AGENTS)
+                current_languages = self.current_languages or random.choice(LANGUAGES)
                 
                 logger.info(f"Используется User-Agent: {self.current_user_agent[:50]}...")
                 logger.info(f"Используется Viewport: {self.current_viewport}")
@@ -267,11 +312,11 @@ class BrowserAutomation:
 
                 proxy_enabled = getattr(settings, "PROXY_ENABLED", False)
                 if proxy_enabled and proxy:
-                    ctx_timezone = "America/New_York"
-                    ctx_geolocation = {"latitude": 40.7128, "longitude": -74.0060}
+                    ctx_timezone = self.current_timezone or "America/New_York"
+                    ctx_geolocation = self.current_geolocation or {"latitude": 40.7128, "longitude": -74.0060}
                 else:
-                    ctx_timezone = None
-                    ctx_geolocation = None
+                    ctx_timezone = self.current_timezone
+                    ctx_geolocation = self.current_geolocation
 
                 if use_patchright and use_persistent and not headless_mode:
                     # Patchright: минимум опций. Один args нужен для Google — иначе «This browser or app may not be secure».
@@ -293,13 +338,14 @@ class BrowserAutomation:
                         context_options["permissions"] = ["geolocation"]
                         context_options["geolocation"] = ctx_geolocation
                 else:
+                    viewport = (self.current_viewport or {"width": 1920, "height": 1080})
                     context_options = {
-                        "viewport": {"width": 1920, "height": 1080},
-                        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                        "locale": "en-US",
-                        "timezone_id": "America/New_York",
+                        "viewport": viewport,
+                        "user_agent": self.current_user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                        "locale": current_languages[0] if current_languages else "en-US",
+                        "timezone_id": ctx_timezone or "America/New_York",
                         "permissions": ["geolocation"],
-                        "geolocation": {"latitude": 40.7128, "longitude": -74.0060},
+                        "geolocation": ctx_geolocation or {"latitude": 40.7128, "longitude": -74.0060},
                         "java_script_enabled": True,
                         "accept_downloads": True,
                         "ignore_https_errors": True,
@@ -792,6 +838,29 @@ class BrowserAutomation:
         """Случайная задержка для имитации человеческого поведения."""
         delay = random.randint(min_ms, max_ms)
         await self.page.wait_for_timeout(delay)
+
+    async def simulate_reading_page(self, duration_sec: int = 5) -> None:
+        """
+        Имитация чтения страницы человеком: скролл с паузами, движение мыши, случайные «зависания».
+        """
+        if not self.page:
+            return
+        loop = asyncio.get_event_loop()
+        start_time = loop.time()
+        while loop.time() - start_time < duration_sec:
+            # Скролл с паузами
+            scroll_y = random.randint(100, 500)
+            await self.page.evaluate(f"window.scrollBy({{ top: {scroll_y}, behavior: 'smooth' }})")
+            await self.human_like_delay(800, 2000)
+            # Движение мыши
+            await self.page.mouse.move(
+                random.randint(200, 1000),
+                random.randint(200, 700),
+            )
+            await self.human_like_delay(500, 1500)
+            # Иногда «зависнуть» на чтении
+            if random.random() < 0.3:
+                await self.human_like_delay(2000, 4000)
 
     async def human_like_type(self, selector: str, text: str, delay_between_chars: int = 80) -> None:
         """

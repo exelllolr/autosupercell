@@ -150,7 +150,7 @@ async def run_demo(
         for attempt in range(1, 5):
             try:
                 wait_until = "commit" if attempt == 4 else "domcontentloaded"
-                timeout_ms = 120000
+                timeout_ms = 180000
                 await browser.page.goto(store_url, wait_until=wait_until, timeout=timeout_ms)
                 goto_ok = True
                 logger.info(f"Store загружен с попытки {attempt}")
@@ -176,7 +176,7 @@ async def run_demo(
                                 await browser.page.goto(
                                     store_url,
                                     wait_until="commit" if retry == 3 else "domcontentloaded",
-                                    timeout=120000,
+                                    timeout=180000,
                                 )
                                 goto_ok = True
                                 logger.info(f"Store загружен без прокси с попытки {retry}")
@@ -313,8 +313,7 @@ def main():
     print()
 
     use_proxy = not getattr(args, "no_proxy", False)
-    if use_proxy and not run_check_proxy_script():
-        sys.exit(1)
+    # help/check_proxy.py отключён — не вызываем
 
     if sys.platform == "win32":
         def _run():

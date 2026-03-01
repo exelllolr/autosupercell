@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     PROXY_ROTATION_ENABLED: bool = True
     PROXY_LIST_FILE: str = "proxies.txt"
     PROXY_USE_FIRST_ONLY: bool = False
+    # Если все прокси провалились — пробовать без прокси (логировать рекомендацию)
+    PROXY_FALLBACK_NO_PROXY: bool = False
 
     # Novada proxy (резидентные/датацентр прокси)
     NOVADA_ENABLED: bool = False
@@ -72,9 +74,9 @@ class Settings(BaseSettings):
     # reCAPTCHA solving (2Captcha) — опционально для обхода блокировки Supercell
     CAPTCHA_2CAPTCHA_API_KEY: str = ""
     # Задержка (сек) перед нажатием LOG IN на accounts.supercell.com — снижает «unusual activity»
-    SUPERCELL_LOGIN_DELAY_BEFORE_SUBMIT: int = 5
+    SUPERCELL_LOGIN_DELAY_BEFORE_SUBMIT: int = 15
     # Задержка (сек) после нажатия LOG IN перед проверкой страницы — даёт время загрузиться форме кода или странице блокировки
-    SUPERCELL_LOGIN_DELAY_AFTER_SUBMIT: int = 8
+    SUPERCELL_LOGIN_DELAY_AFTER_SUBMIT: int = 12
 
     # Payment — Google Pay
     GOOGLE_PAY_ENABLED: bool = True

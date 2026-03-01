@@ -7,6 +7,7 @@ email-validator==2.1.0  # For EmailStr validation
 
 # Browser Automation — только Patchright (undetected Playwright). playwright-stealth не ставим (конфликт с patchright).
 patchright>=1.0.0
+gologin
 
 # Task Queue
 arq==0.25.0

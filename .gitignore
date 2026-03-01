@@ -71,6 +71,9 @@ proofs/
 .playwright/
 playwright-report/
 
+# Browser profile (cache, sessions — do not commit)
+browser_profile/
+
 # OS
 .DS_Store
 Thumbs.db

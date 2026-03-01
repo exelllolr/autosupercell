@@ -156,7 +156,13 @@ class ProxyManager:
         ]
         
         if not available_indices:
-            # Если все прокси провалились, сбрасываем список и используем все
+            if getattr(settings, "PROXY_FALLBACK_NO_PROXY", False):
+                logger.warning(
+                    "Все прокси провалились. Режим PROXY_FALLBACK_NO_PROXY: пробуем без прокси. "
+                    "Рекомендация: проверьте прокси или используйте резидентные прокси (Novada)."
+                )
+                return None
+            # Иначе сбрасываем список и используем все снова
             logger.warning("Все прокси провалились, сбрасываем список failed прокси")
             self.failed_proxies.clear()
             available_indices = list(range(len(self.proxies)))
@@ -215,6 +221,38 @@ class ProxyManager:
             "username": username,
             "password": entry["password"],
         }
+
+    async def test_proxy(self, proxy: Dict[str, str], timeout_sec: int = 10) -> bool:
+        """
+        Быстрая проверка, что прокси работает и не банит Supercell.
+        Запрос к store.supercell.com через прокси. Возвращает True, если ответ 200 и нет «blocked».
+        """
+        if not proxy or not proxy.get("server"):
+            return False
+        try:
+            import aiohttp
+            server = proxy.get("server", "").strip()
+            user = (proxy.get("username") or "").strip()
+            password = (proxy.get("password") or "").strip()
+            if user and password:
+                from urllib.parse import quote_plus
+                proxy_url = server.replace("http://", f"http://{quote_plus(user)}:{quote_plus(password)}@", 1)
+            else:
+                proxy_url = server
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://store.supercell.com",
+                    proxy=proxy_url,
+                    timeout=aiohttp.ClientTimeout(total=timeout_sec),
+                    ssl=False,
+                ) as resp:
+                    text = (await resp.text()).lower() if resp.status == 200 else ""
+                    if resp.status >= 400 or "blocked" in text or "unusual activity" in text:
+                        return False
+                    return True
+        except Exception as e:
+            logger.debug("test_proxy %s: %s", proxy.get("server"), e)
+            return False
 
     def mark_proxy_failed(self, proxy: Dict[str, str]) -> None:
         """

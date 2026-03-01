@@ -3,6 +3,7 @@
 import asyncio
 import random
 import re
+import time
 from fastapi import APIRouter, HTTPException, Body
 from pydantic import BaseModel, EmailStr
 from typing import Optional, Dict
@@ -11,6 +12,17 @@ from app.config import settings
 from app.core.browser_automation import BrowserAutomation
 from app.core.email_code_reader import EmailCodeReader
 from app.core.proxy_manager import proxy_manager
+
+
+def _log_step(step: str, session_id: str, **kwargs) -> None:
+    """Структурированный лог шага авторизации."""
+    logger.info(
+        "supercell_auth_step",
+        step=step,
+        session_id=session_id,
+        timestamp=time.time(),
+        **kwargs,
+    )
 
 router = APIRouter()
 
@@ -92,19 +104,21 @@ async def supercell_login(request: SupercellLoginRequest):
 
     for block_attempt in range(MAX_BLOCK_RETRIES):
         if block_attempt > 0:
-            wait_sec = 20 + block_attempt * 10  # 30 сек, 40 сек
+            wait_sec = 5 + block_attempt * 5  # 10 сек, 15 сек — растущая пауза
             logger.info(
-                f"Retry {block_attempt + 1}/{MAX_BLOCK_RETRIES} с новым IP Novada, "
+                f"Retry {block_attempt + 1}/{MAX_BLOCK_RETRIES} с новым браузером (новый fingerprint), "
                 f"ждём {wait_sec} сек..."
             )
             await asyncio.sleep(wait_sec)
 
+        # Полный перезапуск = новый экземпляр браузера и fingerprint каждую попытку
         browser = BrowserAutomation()
+        browser.randomize_fingerprint()
 
         try:
             result = await _supercell_login_attempt(request, browser, session_id)
 
-            # Если блокировка по result — retry
+            # Если блокировка по result — retry с новым браузером
             msg = (result.get("message") or "").lower()
             if (
                 result
@@ -114,9 +128,13 @@ async def supercell_login(request: SupercellLoginRequest):
             ):
                 logger.warning(
                     f"Блокировка Supercell на попытке {block_attempt + 1} "
-                    f"('{msg[:60]}...'), пробуем новый IP..."
+                    f"('{msg[:60]}...'), закрываем браузер и пробуем с новым..."
                 )
                 last_result = result
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
                 continue
 
             return result
@@ -128,14 +146,14 @@ async def supercell_login(request: SupercellLoginRequest):
             last_error_msg = str(e)
             logger.error(f"Ошибка авторизации в Supercell Store: {e}")
 
-            # Retry если ошибка связана с блокировкой IP
+            # Retry если ошибка связана с блокировкой IP — закрываем браузер полностью
             if (
                 any(p in err_lower for p in BLOCK_PHRASES)
                 and block_attempt < MAX_BLOCK_RETRIES - 1
             ):
                 logger.warning(
                     f"Блокировка через exception на попытке {block_attempt + 1}, "
-                    f"пробуем новый IP..."
+                    f"закрываем браузер и пробуем с новым..."
                 )
                 try:
                     await browser.close()
@@ -150,7 +168,8 @@ async def supercell_login(request: SupercellLoginRequest):
                 pass
             raise HTTPException(status_code=500, detail={"error": str(e)})
 
-    # Все попытки исчерпаны
+    # Все попытки исчерпаны — сбрасываем failed_proxies для следующего цикла
+    proxy_manager.reset_failed_proxies()
     if last_result:
         return last_result
     raise HTTPException(
@@ -234,36 +253,12 @@ async def _supercell_login_attempt(request: SupercellLoginRequest, browser: "Bro
             if store_loaded:
                 break
 
-        # Реалистичная задержка после загрузки страницы (как будто читаем страницу)
-        await browser.human_like_delay(5000, 8000)
-
         # Принимаем cookies, если есть баннер
         await _accept_cookies(browser)
-        await browser.human_like_delay(2000, 3000)
+        await browser.human_like_delay(1000, 2000)
 
-        # Симулируем просмотр страницы (движение мыши, скролл)
-        try:
-            # Движение мыши по странице (как будто читаем)
-            for i in range(3):
-                x = random.randint(100, 800)
-                y = random.randint(100, 600)
-                await browser.page.mouse.move(x, y)
-                await browser.human_like_delay(800, 1500)
-            
-            # Скролл вниз (как будто читаем контент)
-            await browser.page.evaluate("window.scrollTo({ top: 500, behavior: 'smooth' })")
-            await browser.human_like_delay(2000, 3000)
-            
-            # Скролл вверх
-            await browser.page.evaluate("window.scrollTo({ top: 0, behavior: 'smooth' })")
-            await browser.human_like_delay(1500, 2500)
-            
-            # Еще одно движение мыши
-            await browser.page.mouse.move(400, 300)
-            await browser.human_like_delay(1000, 2000)
-        except Exception as e:
-            logger.debug(f"Ошибка симуляции просмотра страницы: {e}")
-        
+        # Долгое «чтение» страницы перед кликом Log in (5–8 сек)
+        await browser.simulate_reading_page(6)
         await browser.take_screenshot(f"supercell_store_start_{session_id}.png")
         
         # Проверяем на наличие блокировки на главной странице
@@ -385,8 +380,11 @@ async def _supercell_login_attempt(request: SupercellLoginRequest, browser: "Bro
         else:
             logger.info(f"На странице логина: {current_url}")
 
-        # Даём странице и reCAPTCHA время «устояться» — имитируем чтение формы (снижает «unusual activity»)
-        await browser.human_like_delay(6000, 11000)
+        # Задержка перед LOG IN с рандомизацией ±30% (из config)
+        base_delay_before = getattr(settings, "SUPERCELL_LOGIN_DELAY_BEFORE_SUBMIT", 15)
+        delay_before_sec = base_delay_before * random.uniform(0.7, 1.3)
+        logger.info(f"Ожидание перед LOG IN: {delay_before_sec:.1f} сек (база {base_delay_before} ±30%)")
+        await asyncio.sleep(delay_before_sec)
         try:
             for _ in range(random.randint(2, 4)):
                 rx = random.randint(150, 700)
@@ -506,6 +504,12 @@ async def _supercell_login_attempt(request: SupercellLoginRequest, browser: "Bro
             await browser.human_like_delay(500, 1000)
         
         await browser.take_screenshot(f"supercell_email_filled_{session_id}.png")
+        _log_step(
+            "email_entered",
+            session_id,
+            proxy=browser.current_proxy.get("server") if browser.current_proxy else None,
+            user_agent=(browser.current_user_agent or "")[:50],
+        )
 
         # Перед нажатием LOG IN: если за время ввода появилось «blocked»/«unusual activity» — не жмём
         page_text_before_click = (await browser.page.evaluate("() => document.body.innerText")).lower()
@@ -555,6 +559,7 @@ async def _supercell_login_attempt(request: SupercellLoginRequest, browser: "Bro
                 page_url=browser.page.url or "https://accounts.supercell.com/login",
                 timeout=120,
             )
+            logger.info("reCAPTCHA токен получен: {}".format(captcha_token is not None))
             if captcha_token:
                 # Подменяем grecaptcha.enterprise.execute — при клике LOG IN сайт получит наш токен
                 import json
@@ -597,70 +602,86 @@ async def _supercell_login_attempt(request: SupercellLoginRequest, browser: "Bro
                 except Exception:
                     pass
             else:
-                logger.warning("2Captcha не вернул токен — продолжаем без него")
+                logger.warning("2Captcha не вернул токен — ожидание 60 сек на ручной ввод reCAPTCHA")
+                try:
+                    await browser.page.wait_for_timeout(60000)  # 60 сек fallback на ручное решение
+                    await browser.take_screenshot(f"supercell_recaptcha_manual_{session_id}.png")
+                except Exception:
+                    pass
         else:
             logger.debug("CAPTCHA_2CAPTCHA_API_KEY не задан — reCAPTCHA не решаем через сервис")
 
+        # Проверка: если на странице есть reCAPTCHA, но токена нет — не отправлять форму (избежать блокировки)
+        has_recaptcha = await browser.page.evaluate(
+            """() => typeof window.grecaptcha !== 'undefined' && (window.grecaptcha && (window.grecaptcha.enterprise || window.grecaptcha))"""
+        )
+        skip_login_click = bool(has_recaptcha and not captcha_token)
+        if skip_login_click:
+            logger.warning(
+                "Обнаружен reCAPTCHA на странице, токен не получен — не отправляем форму. "
+                "Задайте CAPTCHA_2CAPTCHA_API_KEY или решите капчу вручную."
+            )
+            await browser.human_like_delay(1000, 2000)
+
         await browser.human_like_delay(1000, 2000)
 
-        # Ищем кнопку LOG IN и кликаем реальным движением мыши
+        # Ищем кнопку LOG IN и кликаем реальным движением мыши (пропускаем, если reCAPTCHA без токена)
         continue_clicked = False
-
-        # Сначала пробуем через bounding_box — самый надёжный способ
-        for selector in continue_selectors:
-            try:
-                element = await browser.page.wait_for_selector(selector, timeout=3000)
-                if not element or not await element.is_visible():
-                    continue
-                box = await element.bounding_box()
-                if not box:
-                    continue
-                # Целевые координаты — немного смещаем от центра
-                target_x = box["x"] + box["width"] * random.uniform(0.35, 0.65)
-                target_y = box["y"] + box["height"] * random.uniform(0.35, 0.65)
-                # Плавное движение мыши с ускорением (Bezier-подобная кривая)
-                # Начальная позиция — последняя известная позиция (поле email)
+        if not skip_login_click:
+            # Сначала пробуем через bounding_box — самый надёжный способ
+            for selector in continue_selectors:
                 try:
-                    email_box = await browser.page.query_selector(found_email_selector)
-                    if email_box:
-                        eb = await email_box.bounding_box()
-                        start_x = eb["x"] + eb["width"] * 0.5 if eb else target_x - 50
-                        start_y = eb["y"] + eb["height"] * 0.5 if eb else target_y - 80
-                    else:
+                    element = await browser.page.wait_for_selector(selector, timeout=3000)
+                    if not element or not await element.is_visible():
+                        continue
+                    box = await element.bounding_box()
+                    if not box:
+                        continue
+                    # Целевые координаты — немного смещаем от центра
+                    target_x = box["x"] + box["width"] * random.uniform(0.35, 0.65)
+                    target_y = box["y"] + box["height"] * random.uniform(0.35, 0.65)
+                    # Плавное движение мыши с ускорением (Bezier-подобная кривая)
+                    try:
+                        email_box = await browser.page.query_selector(found_email_selector)
+                        if email_box:
+                            eb = await email_box.bounding_box()
+                            start_x = eb["x"] + eb["width"] * 0.5 if eb else target_x - 50
+                            start_y = eb["y"] + eb["height"] * 0.5 if eb else target_y - 80
+                        else:
+                            start_x, start_y = target_x - 50, target_y - 80
+                    except Exception:
                         start_x, start_y = target_x - 50, target_y - 80
-                except Exception:
-                    start_x, start_y = target_x - 50, target_y - 80
-                # Движение по кривой с промежуточной точкой
-                mid_x = (start_x + target_x) / 2 + random.uniform(-20, 20)
-                mid_y = (start_y + target_y) / 2 + random.uniform(-15, 15)
-                steps = random.randint(12, 20)
-                for i in range(steps):
-                    t = (i + 1) / steps
-                    # Квадратичная кривая Безье
-                    bx = (1 - t) ** 2 * start_x + 2 * (1 - t) * t * mid_x + t ** 2 * target_x
-                    by = (1 - t) ** 2 * start_y + 2 * (1 - t) * t * mid_y + t ** 2 * target_y
-                    await browser.page.mouse.move(bx + random.uniform(-1, 1), by + random.uniform(-1, 1))
-                    await browser.page.wait_for_timeout(random.randint(8, 20))
-                await browser.page.wait_for_timeout(random.randint(80, 180))
-                await browser.page.mouse.click(target_x, target_y, delay=random.randint(60, 130))
-                continue_clicked = True
-                logger.info(f"Кнопка LOG IN нажата (mouse.click по bounding_box): {selector}")
-                break
-            except Exception as e:
-                logger.debug(f"Селектор {selector}: {e}")
-                continue
+                    # Движение по кривой (25–40 шагов, микро-дрожания), пауза 300–800 ms перед кликом
+                    mid_x = (start_x + target_x) / 2 + random.uniform(-20, 20)
+                    mid_y = (start_y + target_y) / 2 + random.uniform(-15, 15)
+                    steps = random.randint(25, 40)
+                    for i in range(steps):
+                        t = (i + 1) / steps
+                        bx = (1 - t) ** 2 * start_x + 2 * (1 - t) * t * mid_x + t ** 2 * target_x
+                        by = (1 - t) ** 2 * start_y + 2 * (1 - t) * t * mid_y + t ** 2 * target_y
+                        jitter_x = random.uniform(-2, 2)
+                        jitter_y = random.uniform(-2, 2)
+                        await browser.page.mouse.move(bx + jitter_x, by + jitter_y)
+                        await browser.page.wait_for_timeout(random.randint(8, 20))
+                    await browser.page.wait_for_timeout(random.randint(300, 800))
+                    await browser.page.mouse.click(target_x, target_y, delay=random.randint(60, 130))
+                    continue_clicked = True
+                    logger.info(f"Кнопка LOG IN нажата (mouse.click по bounding_box): {selector}")
+                    break
+                except Exception as e:
+                    logger.debug(f"Селектор {selector}: {e}")
+                    continue
 
-        if not continue_clicked:
-            # Fallback: Tab к кнопке + Enter (без JS)
-            logger.warning("Кнопка не найдена через селекторы, пробуем Tab+Enter")
-            try:
-                await browser.page.keyboard.press("Tab")
-                await browser.page.wait_for_timeout(random.randint(150, 300))
-                await browser.page.keyboard.press("Enter")
-                continue_clicked = True
-                logger.info("Кнопка нажата через Tab+Enter")
-            except Exception as e:
-                logger.debug(f"Tab+Enter не сработал: {e}")
+            if not continue_clicked:
+                logger.warning("Кнопка не найдена через селекторы, пробуем Tab+Enter")
+                try:
+                    await browser.page.keyboard.press("Tab")
+                    await browser.page.wait_for_timeout(random.randint(150, 300))
+                    await browser.page.keyboard.press("Enter")
+                    continue_clicked = True
+                    logger.info("Кнопка нажата через Tab+Enter")
+                except Exception as e:
+                    logger.debug(f"Tab+Enter не сработал: {e}")
 
         # Ждём ответа от сервера после нажатия LOG IN
         await browser.human_like_delay(1000, 2000)
@@ -885,6 +906,7 @@ async def _supercell_login_attempt(request: SupercellLoginRequest, browser: "Bro
                 except Exception:
                     pass
 
+                _log_step("blocked_after_email", session_id, debug_html=str(html_path) if html_path else None)
                 result = {
                     "success": False,
                     "session_id": session_id,
