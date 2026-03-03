@@ -191,6 +191,30 @@ curl http://localhost:8000/metrics
 # Открыть в браузере: http://localhost:9091
 ```
 
+### Деплой на Ubuntu (сервер)
+
+Краткий чеклист для развёртывания на VPS Ubuntu с Docker. Полный гайд: [docs/DEPLOY_UBUNTU_DOCKER.md](docs/DEPLOY_UBUNTU_DOCKER.md).
+
+```bash
+# 1. Установка Docker (один раз)
+curl -fsSL https://get.docker.com | sudo sh && sudo usermod -aG docker $USER
+# Выйти из SSH и зайти снова
+
+# 2. Клонирование и конфигурация
+cd ~ && git clone <URL_РЕПО> autosupercell && cd autosupercell
+cp .env.example .env && nano .env   # REDIS_HOST=redis, REDIS_PORT=6379, ключи API
+touch proxies.txt
+mkdir -p logs screenshots videos proofs
+
+# 3. Запуск
+docker compose up -d --build
+docker compose ps && curl -s http://localhost:8000/api/v1/health
+```
+
+Для сборки на базе Ubuntu 22.04: `docker compose -f docker-compose.yml -f docker-compose.ubuntu.yml up -d --build`.
+
+**Проверка после деплоя:** контейнеры `docker compose ps`, health `curl -s http://localhost:8000/api/v1/health`, логи `docker compose logs -f app`, при использовании Claude/Gemini/OpenAI — `curl -s http://localhost:8000/api/v1/ai/status`. Полный чеклист — раздел 3 в [docs/DEPLOY_UBUNTU_DOCKER.md](docs/DEPLOY_UBUNTU_DOCKER.md).
+
 ---
 
 ## Проверка автоматизации

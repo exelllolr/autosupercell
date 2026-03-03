@@ -197,19 +197,31 @@ class BrowserAutomation:
                     ctx_timezone = None
                     ctx_geolocation = None
 
+                ignore_https = bool(proxy and getattr(settings, "PROXY_IGNORE_HTTPS_ERRORS", False))
+                if ignore_https:
+                    logger.info("Прокси: включён обход ошибок сертификата (PROXY_IGNORE_HTTPS_ERRORS) — снижает ERR_CONNECTION_RESET")
+                # Трафик к Google (логин, G Pay) — напрямую к серверам Google, не через прокси (избегаем ERR_TUNNEL_CONNECTION_FAILED)
+                proxy_for_context = proxy
+                if proxy:
+                    bypass_google = getattr(
+                        settings, "PROXY_BYPASS_GOOGLE", "*.google.com,*.googleapis.com,*.gstatic.com,*.youtube.com"
+                    ).strip()
+                    if bypass_google:
+                        proxy_for_context = {**proxy, "bypass": bypass_google}
+                        logger.info("Прокси: обход для доменов Google — трафик к логину/G Pay идёт напрямую к серверам Google")
                 if use_patchright and use_persistent and not headless_mode:
                     # Рекомендация Patchright: минимум опций, без своего UA/headers/viewport.
                     # args для Google: отключаем детекцию автоматизации ("This browser or app may not be secure").
                     context_options = {
                         "locale": locale,
                         "color_scheme": "light",
-                        "proxy": proxy,
+                        "proxy": proxy_for_context,
                         "headless": headless_mode,
                         "channel": "chrome",
                         "no_viewport": True,
                         "java_script_enabled": True,
                         "accept_downloads": True,
-                        "ignore_https_errors": False,
+                        "ignore_https_errors": ignore_https,
                         "bypass_csp": True,  # FastSpring/pay.fastspring.com блокирует Sentry по CSP — обход для оплаты
                         "args": [
                             "--disable-blink-features=AutomationControlled",
@@ -232,9 +244,9 @@ class BrowserAutomation:
                         "is_mobile": False,
                         "java_script_enabled": True,
                         "accept_downloads": True,
-                        "ignore_https_errors": False,
+                        "ignore_https_errors": ignore_https,
                         "bypass_csp": True,  # FastSpring блокирует connect к sentry-cdn.com по CSP — без обхода оплата ломается
-                        "proxy": proxy,
+                        "proxy": proxy_for_context,
                         "extra_http_headers": {
                             "Accept-Language": ",".join(
                                 [f"{lang};q={0.9 - i*0.1}" for i, lang in enumerate(current_languages)]
@@ -367,6 +379,10 @@ class BrowserAutomation:
                     except Exception as e:
                         logger.debug(f"Прогрев браузера пропущен: {e}")
 
+                # Browsec VPN: включить и выбрать регион US (расширение должно быть установлено в Chrome)
+                if getattr(settings, "BROWSER_USE_BROWSEC_VPN", False):
+                    await self._enable_browsec_vpn_region()
+
                 logger.info("Браузер успешно запущен с улучшенным stealth режимом")
                 return  # Успешно запущен
                 
@@ -418,6 +434,68 @@ class BrowserAutomation:
                                 f"Проверьте настройки прокси в proxies.txt или отключите прокси в .env (PROXY_ENABLED=false)"
                             )
                     raise
+
+    async def _enable_browsec_vpn_region(self) -> None:
+        """
+        Открыть расширение Browsec VPN и включить его с выбранным регионом (по умолчанию US).
+        Требуется: Chrome с установленным Browsec из Chrome Web Store; BROWSER_USE_SYSTEM_PROFILE=true.
+        """
+        if not self.context:
+            return
+        region = (getattr(settings, "BROWSER_BROWSEC_VPN_REGION", "US") or "US").strip().upper()
+        # ID расширения Browsec VPN в Chrome Web Store
+        BROWSEC_EXTENSION_ID = "omghfjlpggmjjaagoclmmobgdodcjboh"
+        ext_url = f"chrome-extension://{BROWSEC_EXTENSION_ID}/popup.html"
+        ext_page = None
+        try:
+            ext_page = await self.context.new_page()
+            await ext_page.goto(ext_url, wait_until="domcontentloaded", timeout=10000)
+            await ext_page.wait_for_timeout(1500)
+            # Включить VPN: кнопка "Protect me" / "Turn on" / переключатель
+            for selector in [
+                'button:has-text("Protect")',
+                'button:has-text("Turn on")',
+                'button:has-text("Enable")',
+                '[role="switch"]',
+                'button:has-text("ON")',
+                'a:has-text("Protect")',
+            ]:
+                try:
+                    btn = await ext_page.wait_for_selector(selector, timeout=2000)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        await ext_page.wait_for_timeout(1000)
+                        break
+                except Exception:
+                    continue
+            # Выбрать регион US
+            for selector in [
+                f'button:has-text("{region}")',
+                f'a:has-text("{region}")',
+                f'[data-country="{region}"]',
+                'text=United States',
+                'text=USA',
+            ]:
+                try:
+                    el = await ext_page.wait_for_selector(selector, timeout=2000)
+                    if el and await el.is_visible():
+                        await el.click()
+                        await ext_page.wait_for_timeout(800)
+                        logger.info("Browsec VPN: включён регион %s", region)
+                        break
+                except Exception:
+                    continue
+            await ext_page.close()
+        except Exception as e:
+            logger.warning(
+                "Browsec VPN: не удалось включить (установите расширение из Chrome Web Store и закройте Chrome перед запуском): %s",
+                e,
+            )
+            try:
+                if ext_page:
+                    await ext_page.close()
+            except Exception:
+                pass
 
     async def _apply_cdp_webdriver_patch(self) -> None:
         """

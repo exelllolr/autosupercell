@@ -12,7 +12,6 @@
 import argparse
 import asyncio
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -42,6 +41,96 @@ def print_step(step_num: int, title: str, description: str):
     print()
 
 
+async def _inject_2captcha_on_login_page(browser):
+    """Получить токен 2Captcha и подставить на странице accounts.supercell.com/login."""
+    page = browser.page if hasattr(browser, "page") else None
+    if not page:
+        return
+    url = page.url or ""
+    if "accounts.supercell.com" not in url or "/login" not in url:
+        return
+    api_key = (getattr(settings, "CAPTCHA_2CAPTCHA_API_KEY", "") or "").strip()
+    if not api_key:
+        return
+    try:
+        from app.core.recaptcha_solver import solve_recaptcha_enterprise
+        token = await solve_recaptcha_enterprise(
+            api_key=api_key,
+            page_url=url,
+            timeout=120,
+        )
+        if not token:
+            return
+        await page.evaluate(
+            """(token) => {
+                window.__2captchaToken = token;
+                var check = setInterval(function() {
+                    if (window.grecaptcha && window.grecaptcha.enterprise) {
+                        clearInterval(check);
+                        var real = window.grecaptcha.enterprise.execute;
+                        if (real && !real.__patched) {
+                            window.grecaptcha.enterprise.execute = function() {
+                                return Promise.resolve(window.__2captchaToken || null);
+                            };
+                            window.grecaptcha.enterprise.execute.__patched = true;
+                        }
+                    }
+                }, 100);
+                setTimeout(function() { clearInterval(check); }, 5000);
+            }""",
+            token,
+        )
+        try:
+            await page.evaluate(
+                """(token) => {
+                    var form = document.querySelector('form');
+                    if (form && !form.querySelector('input[name="g-recaptcha-response"]')) {
+                        var inp = document.createElement('input');
+                        inp.type = 'hidden';
+                        inp.name = 'g-recaptcha-response';
+                        inp.value = token;
+                        form.appendChild(inp);
+                    }
+                }""",
+                token,
+            )
+        except Exception:
+            pass
+        logger.info("2Captcha: токен reCAPTCHA подставлен на странице входа (ручное демо)")
+    except Exception as e:
+        logger.debug("2Captcha при ручном входе: %s", e)
+
+
+def _setup_2captcha_on_login_page(browser):
+    """Включить подстановку 2Captcha при переходе на страницу входа Supercell."""
+    api_key = (getattr(settings, "CAPTCHA_2CAPTCHA_API_KEY", "") or "").strip()
+    if not api_key:
+        return
+    page = browser.page if hasattr(browser, "page") else None
+    if not page:
+        return
+
+    def on_framenavigated(frame):
+        try:
+            if frame != page.main_frame:
+                return
+            url = frame.url or ""
+            if "accounts.supercell.com" in url and "/login" in url:
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(_inject_2captcha_on_login_page(browser))
+                except RuntimeError:
+                    pass
+        except Exception:
+            pass
+
+    try:
+        page.on("framenavigated", on_framenavigated)
+        logger.info("2Captcha: при переходе на страницу входа токен будет подставлен автоматически")
+    except Exception as e:
+        logger.debug("Не удалось подписаться на переход к странице входа: %s", e)
+
+
 def check_proxy_status():
     """Проверка прокси (без API — по настройкам и proxy_manager)."""
     if not getattr(settings, "PROXY_ENABLED", False):
@@ -60,44 +149,12 @@ def check_proxy_status():
         print(f"   [Прокси] Ошибка: {e}")
 
 
-def run_check_proxy_script() -> bool:
-    """
-    Запуск help/check_proxy.py перед покупкой.
-    Возвращает True если проверка пройдена (или прокси отключены), False иначе.
-    """
-    if not getattr(settings, "PROXY_ENABLED", False):
-        return True
-    script = _project_root / "help" / "check_proxy.py"
-    if not script.exists():
-        logger.warning("help/check_proxy.py не найден, пропускаем проверку прокси.")
-        return True
-    print("\n[Проверка прокси для Google Pay] Запуск help/check_proxy.py ...")
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(script)],
-            cwd=str(_project_root),
-            timeout=600,
-        )
-        if proc.returncode != 0:
-            print("\n[X] Проверка прокси не пройдена. Завершение.")
-            return False
-        print("[OK] Проверка прокси пройдена.\n")
-        return True
-    except subprocess.TimeoutExpired:
-        print("\n[X] check_proxy.py превысил таймаут. Завершение.")
-        return False
-    except Exception as e:
-        logger.warning("Ошибка запуска check_proxy.py: %s", e)
-        return True
-
-
 def parse_args():
     p = argparse.ArgumentParser(description="Manual login + GPay purchase demo (без авто-авторизации)")
     p.add_argument("--game", default="brawl-stars", help="Game slug (e.g. brawl-stars, clash-royale)")
     p.add_argument("--product", default="80 Gems", help="Product name to search and buy")
     p.add_argument("--google-email", default="", help="Override Google Pay email from env")
     p.add_argument("--timeout", type=int, default=None, help="Payment timeout in seconds (default 300 for Google login)")
-    p.add_argument("--no-proxy", action="store_true", help="Запуск без прокси (если через прокси таймаут store.supercell.com)")
     return p.parse_args()
 
 
@@ -147,59 +204,45 @@ async def run_demo(
         logger.info("Переход на store.supercell.com...")
         store_url = "https://store.supercell.com"
         goto_ok = False
-        for attempt in range(1, 5):
+        # С прокси: сначала "commit" (меньше данных = реже ERR_CONNECTION_RESET), потом строже
+        for attempt in range(1, 6):
             try:
-                wait_until = "commit" if attempt == 4 else "domcontentloaded"
-                timeout_ms = 120000
+                if attempt <= 2:
+                    wait_until = "commit"  # быстрее, меньше шанс обрыва по прокси
+                elif attempt <= 4:
+                    wait_until = "domcontentloaded"
+                else:
+                    wait_until = "load"
+                timeout_ms = 150000  # 2.5 мин через прокси
                 await browser.page.goto(store_url, wait_until=wait_until, timeout=timeout_ms)
                 goto_ok = True
                 logger.info(f"Store загружен с попытки {attempt}")
                 break
             except Exception as e:
                 err_str = str(e).lower()
-                logger.warning(f"Попытка {attempt}/4 перехода на store: {e}")
-                if attempt < 4:
-                    await asyncio.sleep(3)
+                logger.warning(f"Попытка {attempt}/5 перехода на store: {e}")
+                if attempt < 5:
+                    delay = 4 if "err_connection_reset" in err_str or "connection" in err_str else 3
+                    await asyncio.sleep(delay)
                 else:
-                    # Автоповтор без прокси при таймауте (часто с Novada/прокси store не грузится)
-                    if use_proxy and ("err_timed_out" in err_str or "timeout" in err_str):
-                        logger.warning("Store не открылся через прокси. Перезапуск браузера без прокси...")
-                        try:
-                            await browser.close()
-                        except Exception:
-                            pass
-                        await browser.start(use_proxy=False)
-                        result["proxy_used"] = False
-                        result["proxy_server"] = None
-                        for retry in range(1, 4):
-                            try:
-                                await browser.page.goto(
-                                    store_url,
-                                    wait_until="commit" if retry == 3 else "domcontentloaded",
-                                    timeout=120000,
-                                )
-                                goto_ok = True
-                                logger.info(f"Store загружен без прокси с попытки {retry}")
-                                break
-                            except Exception as e2:
-                                logger.warning(f"Без прокси попытка {retry}/3: {e2}")
-                                if retry < 3:
-                                    await asyncio.sleep(2)
-                        if goto_ok:
-                            break
                     hint = ""
                     if "err_timed_out" in err_str or "timeout" in err_str:
-                        hint = " Запустите с флагом --no-proxy или отключите прокси в .env (PROXY_ENABLED=false)."
+                        hint = " Увеличьте таймаут или проверьте прокси в .env (PROXY_ENABLED / BRIGHTDATA_*)."
                     elif "err_name_not_resolved" in err_str:
-                        hint = " Проверьте DNS или отключите прокси в .env (PROXY_ENABLED=false)."
+                        hint = " Проверьте DNS или прокси в .env."
+                    elif "err_tunnel_connection_failed" in err_str:
+                        hint = " Туннель прокси не установился. Запустите: python scripts/test_novada_connection.py. В .env поставьте NOVADA_PROXY_HOST=super.novada.pro"
                     elif "err_connection_reset" in err_str or "connection" in err_str:
-                        hint = " Прокси может обрывать соединение. Попробуйте другой прокси или PROXY_ENABLED=false."
-                    raise RuntimeError(f"Не удалось открыть {store_url} после 4 попыток.{hint}") from e
+                        hint = " Прокси обрывает соединение — попробуйте NOVADA_PROXY_HOST=super.novada.pro или PROXY_IGNORE_HTTPS_ERRORS=true в .env."
+                    raise RuntimeError(f"Не удалось открыть {store_url} после 5 попыток.{hint}") from e
         if not goto_ok:
             return result
         await browser.page.wait_for_timeout(2000)
         await _accept_cookies(browser)
         await browser.human_like_delay(1000, 2000)
+
+        # Подстановка 2Captcha при переходе на страницу входа (чтобы при ручном нажатии Log in капча уже была решена)
+        _setup_2captcha_on_login_page(browser)
 
         # Шаг 2: Ручной вход в аккаунт
         print_step(
@@ -312,10 +355,6 @@ def main():
     check_proxy_status()
     print()
 
-    use_proxy = not getattr(args, "no_proxy", False)
-    if use_proxy and not run_check_proxy_script():
-        sys.exit(1)
-
     if sys.platform == "win32":
         def _run():
             loop = asyncio.ProactorEventLoop()
@@ -327,7 +366,7 @@ def main():
                         product_name=args.product,
                         google_email=args.google_email or "",
                         payment_timeout=payment_timeout,
-                        use_proxy=not getattr(args, "no_proxy", False),
+                        use_proxy=True,
                     )
                 )
             finally:
@@ -341,7 +380,7 @@ def main():
                 product_name=args.product,
                 google_email=args.google_email or "",
                 payment_timeout=payment_timeout,
-                use_proxy=not getattr(args, "no_proxy", False),
+                use_proxy=True,
             )
         )
 

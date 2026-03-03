@@ -16,9 +16,8 @@ class Settings(BaseSettings):
     BROWSER_WARMUP: bool = True
     BROWSER_USE_PERSISTENT_PROFILE: bool = True
     BROWSER_PROFILE_DIR: str = "browser_profile"
-    # True = использовать профиль установленного Chrome (тот же, где ты заходишь вручную)
-    # ВАЖНО: перед запуском закрой Chrome полностью
-    BROWSER_USE_SYSTEM_PROFILE: bool = False
+    # True = использовать профиль установленного Chrome (нужно для Browsec VPN; закрой Chrome перед запуском)
+    BROWSER_USE_SYSTEM_PROFILE: bool = True
     BROWSER_WARMUP_VISIT_SUPERCELL: bool = True
     BROWSER_USE_STEALTH_PLUGIN: bool = True
     # True = использовать Patchright (undetected Playwright). Нужно: pip install patchright && patchright install chrome
@@ -28,6 +27,16 @@ class Settings(BaseSettings):
     BROWSER_RECORD_VIDEO: bool = True
     # Режим инкогнито (может помочь при блокировках)
     BROWSER_INCOGNITO: bool = False
+    # Расширение US Region для store/accounts.supercell.com
+    BROWSER_USE_US_EXTENSION: bool = False
+    BROWSER_EXTENSION_PATH: str = "browser_extensions/us_region"
+    # Browsec VPN (Chrome Web Store): при запуске включать и ставить регион US. Требуется BROWSER_USE_SYSTEM_PROFILE=true и установленный Browsec в Chrome.
+    BROWSER_USE_BROWSEC_VPN: bool = True
+    BROWSER_BROWSEC_VPN_REGION: str = "US"
+
+    # GoLogin anti-detect browser
+    GOLOGIN_API_TOKEN: str = ""
+    GOLOGIN_PROFILE_ID: str = ""
 
     # Redis
     REDIS_HOST: str = "localhost"
@@ -51,9 +60,18 @@ class Settings(BaseSettings):
     PROXY_ROTATION_ENABLED: bool = True
     PROXY_LIST_FILE: str = "proxies.txt"
     PROXY_USE_FIRST_ONLY: bool = False
+    # False = при провале всех прокси не переходить на реальный IP. True = один раз попробовать без прокси
+    PROXY_FALLBACK_NO_PROXY: bool = False
+    # True = прокси только в браузере (не в системных HTTP_PROXY)
+    PROXY_BROWSER_ONLY: bool = True
+    # True = игнорировать ошибки сертификата при прокси (подключение не защищено)
+    PROXY_IGNORE_HTTPS_ERRORS: bool = False
+    # Обход прокси для доменов Google (логин, G Pay): трафик к Google идёт напрямую к серверам Google. Формат: "*.google.com,*.googleapis.com,...". Пусто = не обходить.
+    PROXY_BYPASS_GOOGLE: str = "*.google.com,*.googleapis.com,*.gstatic.com,*.youtube.com"
 
     # Novada proxy (резидентные/датацентр прокси)
-    NOVADA_ENABLED: bool = False
+    NOVADA_ENABLED: bool = True
+    NOVADA_ONLY: bool = False  # True = только Novada, не грузить прокси из файла
     NOVADA_ROTATING: bool = False  # True = Rotating Session (gateway сам ротирует IP)
     NOVADA_USERNAME: str = ""
     NOVADA_API_KEY: str = ""
@@ -64,6 +82,14 @@ class Settings(BaseSettings):
     NOVADA_PROXY_HOST: str = "super.novada.pro"
     NOVADA_PROXY_PORT: int = 7777
     NOVADA_STICKY_MINUTES: int = 0  # 0 = rotating; 5–120 = sticky session (один IP на N минут)
+
+    # Bright Data proxy (из .env)
+    BRIGHTDATA_ENABLED: bool = False
+    BRIGHTDATA_ONLY: bool = False  # True = только Bright Data, не грузить proxies.txt
+    BRIGHTDATA_HOST: str = "brd.superproxy.io"
+    BRIGHTDATA_PORT: int = 33335
+    BRIGHTDATA_USERNAME: str = ""
+    BRIGHTDATA_PASSWORD: str = ""
 
     # reCAPTCHA solving (2Captcha) — опционально для обхода блокировки Supercell
     CAPTCHA_2CAPTCHA_API_KEY: str = ""

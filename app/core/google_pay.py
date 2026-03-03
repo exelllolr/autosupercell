@@ -16,6 +16,7 @@
 
 import asyncio
 import os
+import re
 import random
 from datetime import datetime
 from loguru import logger
@@ -340,6 +341,12 @@ async def select_gpay_tab_and_pay(page, timeout_ms: int = 90000) -> bool:
 # Шаг 2: Логин в Google в popup
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Таймауты для поиска окна входа Google (приоритет: полное окно → оверлей → popup)
+_SIGNIN_FULL_WINDOW_TIMEOUT_MS = 150000   # 2.5 мин — ждём полное окно (pay.fastspring.com с формой «Вход»/Sign in)
+_SIGNIN_OVERLAY_POLL_MS = 30000            # 30 сек — проверка оверлея (iframe)
+_SIGNIN_POPUP_TIMEOUT_MS = 90000          # 1.5 мин — ожидание popup, если полное окно не открылось
+
+
 def _is_google_block_page(page_text: str) -> bool:
     """Проверяет, показала ли Google страницу «This browser or app may not be secure»."""
     t = (page_text or "").lower()
@@ -347,6 +354,145 @@ def _is_google_block_page(page_text: str) -> bool:
         "couldn't sign you in" in t
         or "this browser or app may not be secure" in t
     )
+
+
+def _url_is_signin_context(url: str) -> bool:
+    """
+    URL относится к контексту входа Google Pay / FastSpring (из структуры pay.fastspring.com):
+    - pay.fastspring.com/.../googlepay.html, embedded-checkout
+    - pay.google.com (официальный домен Google Payments)
+    - accounts.google.com, signin
+    """
+    u = (url or "").lower()
+    if "accounts.google.com" in u or ("signin" in u and "google" in u):
+        return True
+    if "pay.google.com" in u:
+        return True
+    if "pay.fastspring.com" in u and ("googlepay" in u or "embedded-checkout" in u or "google" in u):
+        return True
+    return False
+
+
+async def _is_google_signin_full_window(page) -> bool:
+    """
+    Полное окно входа (как на фото): pay.fastspring.com/.../googlepay.html (embedded-checkout),
+    pay.google.com или страница с формой «Вход»/«Телефон или адрес эл. почты»/«Далее» (или Sign in / Next).
+    """
+    try:
+        u = (page.url or "").lower()
+        if _url_is_signin_context(u):
+            return True
+        if "pay.fastspring.com" in u and ("googlepay" in u or "embedded-checkout" in u or "google" in u):
+            return True
+        if "pay.google.com" in u:
+            return True
+        body = (await page.evaluate("() => document.body.innerText")).lower()
+        # Русский интерфейс (как на фото)
+        if "вход" in body and ("телефон или адрес" in body or "далее" in body):
+            return True
+        # English
+        if "sign in" in body and ("email or phone" in body or "phone or email" in body or "next" in body):
+            return True
+        if "телефон или адрес эл. почты" in body or "далее" in body:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def _is_google_signin_overlay(page) -> bool:
+    """
+    Оверлей: страница содержит iframe с входом Google (payframe, pay.google.com,
+    accounts.google.com или fastspring googlepay.html / embedded-checkout).
+    """
+    try:
+        for frame in page.frames:
+            src = (frame.url or "").lower()
+            if "accounts.google.com" in src:
+                return True
+            if "pay.google.com" in src:
+                return True
+            if "pay.fastspring.com" in src and ("googlepay" in src or "embedded-checkout" in src):
+                return True
+            # payframe — типичное имя iframe для платёжного окна в FastSpring
+            if "payframe" in (getattr(frame, "name", None) or "").lower():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _page_has_signin_url(page) -> bool:
+    """Popup/страница с URL входа: accounts.google.com, signin, pay.google.com, fastspring googlepay/embedded-checkout."""
+    try:
+        return _url_is_signin_context(page.url or "")
+    except Exception:
+        return False
+
+
+async def _get_signin_frame(page):
+    """
+    Если форма входа в iframe (payframe, pay.google.com, accounts.google.com, fastspring googlepay) —
+    возвращает этот frame. Иначе None (работаем с основной страницей).
+    """
+    try:
+        for frame in page.frames:
+            src = (frame.url or "").lower()
+            if "accounts.google.com" in src or "pay.google.com" in src:
+                return frame
+            if "pay.fastspring.com" in src and ("googlepay" in src or "embedded-checkout" in src):
+                return frame
+    except Exception:
+        pass
+    return None
+
+
+async def _wait_for_signin_frame(page, timeout_sec: int = 25):
+    """
+    На pay.fastspring.com/.../googlepay.html форма входа часто в iframe (accounts.google.com).
+    Ждём появления такого iframe до timeout_sec секунд.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout_sec
+    while asyncio.get_event_loop().time() < deadline:
+        frame = await _get_signin_frame(page)
+        if frame is not None:
+            return frame
+        await asyncio.sleep(1)
+    return None
+
+
+async def _find_frame_with_signin_form(page, timeout_sec: int = 35):
+    """
+    Ищет iframe, в котором есть форма входа (текст «Вход»/«Телефон или адрес» или поле identifier).
+    Проверяет по URL и по содержимому фрейма.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout_sec
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            for frame in page.frames:
+                try:
+                    url = (frame.url or "").lower()
+                    if "accounts.google.com" in url or "pay.google.com" in url:
+                        return frame
+                    # Проверка по содержимому (форма может грузиться с другого URL)
+                    has_form = await frame.evaluate("""
+                        () => {
+                            const body = (document.body && document.body.innerText) ? document.body.innerText.toLowerCase() : '';
+                            if (body.includes('вход') && (body.includes('телефон') || body.includes('почты') || body.includes('email')))
+                                return true;
+                            const input = document.querySelector('input[name="identifier"], input[placeholder*="почты"], input[placeholder*="email"], input[placeholder*="Phone"]');
+                            return !!input;
+                        }
+                    """)
+                    if has_form:
+                        logger.info("Найден iframe с формой входа по содержимому")
+                        return frame
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+    return None
 
 
 def _parse_first_backup_code(backup_codes_str: str) -> str | None:
@@ -376,10 +522,11 @@ async def _login_google_in_popup(
     except Exception:
         pass
 
-    current_url = popup_page.url
-    logger.info(f"URL popup Google: {current_url}")
+    current_url = popup_page.url or ""
+    logger.info(f"URL окна Google: {current_url[:80]}")
 
-    if "accounts.google.com" not in current_url and "signin" not in current_url:
+    is_full_window = await _is_google_signin_full_window(popup_page)
+    if not _url_is_signin_context(current_url) and not is_full_window:
         logger.info("Google логин не требуется (уже залогинен или другая страница)")
         return True, None
 
@@ -399,44 +546,170 @@ async def _login_google_in_popup(
     except Exception:
         pass
 
-    # Задержка между нажатиями клавиш (мс) — имитация человека, меньше детект
+    # Задержка между нажатиями клавиш (мс) — имитация человека
     type_delay_min, type_delay_max = 80, 180
 
-    # ── Email ─────────────────────────────────────────────────────────────────
-    email_selectors = ['input[type="email"]', 'input[name="identifier"]', '#identifierId']
+    # На pay.fastspring.com/.../googlepay.html форма «Вход» почти всегда в iframe. Ждём по URL и по содержимому.
+    scope = popup_page
+    if "pay.fastspring.com" in (current_url or "").lower() or "googlepay" in (current_url or "").lower():
+        logger.info("Ожидание iframe с формой входа Google (до 35 сек по URL и содержимому)...")
+        signin_frame = await _find_frame_with_signin_form(popup_page, timeout_sec=35)
+        if signin_frame:
+            scope = signin_frame
+            logger.info("Форма входа в iframe, используем его для ввода email/пароля")
+        else:
+            signin_frame = await _wait_for_signin_frame(popup_page, timeout_sec=15)
+            if signin_frame:
+                scope = signin_frame
+                logger.info("Форма входа в iframe (по URL)")
+        await popup_page.wait_for_timeout(3000)
+
+    # Экран «Вход»: поле «Телефон или адрес эл. почты» (RU) или Email/Phone (EN)
+    email_selectors = [
+        'input[type="email"]',
+        'input[name="identifier"]',
+        '#identifierId',
+        'input[placeholder*="эл. почты"]',
+        'input[placeholder*="Телефон или адрес"]',
+        'input[placeholder*="Phone or email"]',
+        'input[placeholder*="Email or phone"]',
+        'input[aria-label*="email"]',
+        'input[aria-label*="почты"]',
+        'input[type="text"]',
+    ]
     email_entered = False
-    for sel in email_selectors:
+    for attempt in range(2):
+        for sel in email_selectors:
+            try:
+                el = await scope.wait_for_selector(sel, timeout=20000)
+                if el and await el.is_visible():
+                    await el.click()
+                    await _delay(popup_page, 400, 800)
+                    if scope != popup_page:
+                        await el.press_sequentially(email, delay=random.randint(type_delay_min, type_delay_max))
+                    else:
+                        await popup_page.keyboard.type(
+                            email,
+                            delay=random.randint(type_delay_min, type_delay_max),
+                        )
+                    await _delay(popup_page, 500, 1000)
+                    email_entered = True
+                    logger.info(f"Email введён ({sel})")
+                    break
+            except Exception:
+                continue
+        if email_entered:
+            break
         try:
-            el = await popup_page.wait_for_selector(sel, timeout=45000)
-            if el:
-                await el.click()
-                await _delay(popup_page, 400, 800)
-                # Посимвольный ввод с задержкой вместо fill() — меньше шанс блокировки
-                await popup_page.keyboard.type(
-                    email,
-                    delay=random.randint(type_delay_min, type_delay_max),
-                )
-                await _delay(popup_page, 500, 1000)
-                email_entered = True
-                logger.info(f"Email введён ({sel})")
-                break
+            for placeholder in ["Телефон или адрес эл. почты", "Phone or email", "Email or phone"]:
+                el = scope.get_by_placeholder(placeholder).first
+                if await el.count() > 0 and await el.is_visible():
+                    await el.click()
+                    await _delay(popup_page, 400, 800)
+                    if scope != popup_page:
+                        await el.press_sequentially(email, delay=random.randint(type_delay_min, type_delay_max))
+                    else:
+                        await popup_page.keyboard.type(email, delay=random.randint(type_delay_min, type_delay_max))
+                    await _delay(popup_page, 500, 1000)
+                    email_entered = True
+                    logger.info("Email введён (get_by_placeholder)")
+                    break
         except Exception:
-            continue
+            pass
+        if email_entered:
+            break
+        if attempt == 0:
+            logger.info("Поле email не найдено, повтор через 5 сек (форма может грузиться)...")
+            await popup_page.wait_for_timeout(5000)
+
+    # Жёсткий fallback: ввод email и клик «Далее» через JavaScript в текущем scope (страница или iframe)
+    if not email_entered:
+        logger.info("Пробуем ввод email и клик Далее через JavaScript...")
+        try:
+            js_ok = await scope.evaluate("""
+                (email) => {
+                    const sel = 'input[name="identifier"], input[type="email"], #identifierId, input[placeholder*="почты"], input[placeholder*="Phone"], input[placeholder*="email"]';
+                    const input = document.querySelector(sel);
+                    if (!input) return false;
+                    input.focus();
+                    input.value = email;
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                    const nextBtn = Array.from(document.querySelectorAll('button, [role="button"], span, div')).find(el => {
+                        const t = (el.textContent || '').trim();
+                        return t === 'Далее' || t === 'Next';
+                    });
+                    if (nextBtn) {
+                        nextBtn.click();
+                        return true;
+                    }
+                    return false;
+                }
+            """, email)
+            if js_ok:
+                email_entered = True
+                logger.info("Email введён и Далее нажата (JS fallback)")
+        except Exception as e:
+            logger.debug("JS fallback email: %s", e)
 
     if not email_entered:
-        logger.warning("Поле email не найдено в popup Google")
+        logger.warning("Поле email не найдено в popup Google (страница и iframe)")
         return False, None
 
     await _delay(popup_page, 600, 1200)
-    for sel in ['#identifierNext', 'button:has-text("Next")', 'button[type="submit"]']:
+    # Кнопка «Далее» (RU) или Next (EN) после ввода email/телефона
+    next_after_email = [
+        'button:has-text("Далее")',
+        '#identifierNext',
+        'button:has-text("Next")',
+        'span:has-text("Далее")',
+        'div[role="button"]:has-text("Далее")',
+        '[role="button"]:has-text("Далее")',
+        'button[type="submit"]',
+        'input[type="submit"]',
+    ]
+    next_clicked = False
+    for sel in next_after_email:
         try:
-            loc = popup_page.locator(sel).first
-            if await loc.count() > 0:
+            loc = scope.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible():
                 await loc.click(timeout=15000)
-                logger.info("Next после email нажат")
+                next_clicked = True
+                logger.info("Next/Далее после email нажат")
                 break
         except Exception:
             continue
+    if not next_clicked:
+        try:
+            for text in ["Далее", "Next"]:
+                btn = scope.get_by_text(text, exact=False).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click(timeout=15000)
+                    next_clicked = True
+                    logger.info("Next/Далее нажата (get_by_text)")
+                    break
+        except Exception:
+            pass
+    if not next_clicked:
+        try:
+            target = scope if scope != popup_page else popup_page
+            clicked = await target.evaluate("""
+                () => {
+                    const els = document.querySelectorAll('button, [role="button"], span, div');
+                    for (const el of els) {
+                        const t = (el.textContent || '').trim();
+                        if (t === 'Далее' || t === 'Next') {
+                            el.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            if clicked:
+                logger.info("Next/Далее нажата (JS)")
+        except Exception:
+            pass
 
     await popup_page.wait_for_timeout(6000)
 
@@ -459,14 +732,17 @@ async def _login_google_in_popup(
     password_clean = app_password.replace(" ", "")
     for sel in pw_selectors:
         try:
-            el = await popup_page.wait_for_selector(sel, timeout=45000)
+            el = await scope.wait_for_selector(sel, timeout=45000)
             if el:
                 await el.click()
                 await _delay(popup_page, 400, 800)
-                await popup_page.keyboard.type(
-                    password_clean,
-                    delay=random.randint(type_delay_min, type_delay_max),
-                )
+                if scope != popup_page:
+                    await el.press_sequentially(password_clean, delay=random.randint(type_delay_min, type_delay_max))
+                else:
+                    await popup_page.keyboard.type(
+                        password_clean,
+                        delay=random.randint(type_delay_min, type_delay_max),
+                    )
                 await _delay(popup_page, 500, 1000)
                 pw_entered = True
                 logger.info("App Password введён")
@@ -479,9 +755,9 @@ async def _login_google_in_popup(
         return False, None
 
     await _delay(popup_page, 600, 1200)
-    for sel in ['#passwordNext', 'button:has-text("Next")', 'button[type="submit"]']:
+    for sel in ['#passwordNext', 'button:has-text("Next")', 'button:has-text("Далее")', 'button[type="submit"]']:
         try:
-            loc = popup_page.locator(sel).first
+            loc = scope.locator(sel).first
             if await loc.count() > 0:
                 await loc.click(timeout=15000)
                 logger.info("Next после пароля нажат")
@@ -495,7 +771,10 @@ async def _login_google_in_popup(
     backup_code = _parse_first_backup_code(backup_codes)
     if backup_code:
         try:
-            body_text = (await popup_page.evaluate("() => document.body.innerText")).lower()
+            try:
+                body_text = (await scope.evaluate("() => document.body.innerText")).lower()
+            except Exception:
+                body_text = (await popup_page.evaluate("() => document.body.innerText")).lower()
             current_url = (popup_page.url or "").lower()
             is_2sv_challenge = (
                 "challenge" in current_url
@@ -507,11 +786,20 @@ async def _login_google_in_popup(
             )
             if is_2sv_challenge:
                 logger.info("Обнаружена страница 2-Step Verification, прокрутка вниз и поиск «Try another way»...")
-                await popup_page.evaluate("window.scrollBy(0, 400)")
+                try:
+                    await scope.evaluate("window.scrollBy(0, 400)")
+                except Exception:
+                    await popup_page.evaluate("window.scrollBy(0, 400)")
                 await popup_page.wait_for_timeout(500)
-                await popup_page.evaluate("window.scrollBy(0, 400)")
+                try:
+                    await scope.evaluate("window.scrollBy(0, 400)")
+                except Exception:
+                    await popup_page.evaluate("window.scrollBy(0, 400)")
                 await popup_page.wait_for_timeout(400)
-                await popup_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                try:
+                    await scope.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                except Exception:
+                    await popup_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await popup_page.wait_for_timeout(500)
 
                 try_another_way_selectors = [
@@ -524,7 +812,7 @@ async def _login_google_in_popup(
                 try_another_clicked = False
                 for sel in try_another_way_selectors:
                     try:
-                        loc = popup_page.locator(sel).first
+                        loc = scope.locator(sel).first
                         if await loc.count() > 0 and await loc.is_visible():
                             await loc.scroll_into_view_if_needed()
                             await _delay(popup_page, 300, 600)
@@ -536,7 +824,7 @@ async def _login_google_in_popup(
                         continue
                 if not try_another_clicked:
                     try:
-                        link = popup_page.get_by_text("Try another way", exact=False).first
+                        link = scope.get_by_text("Try another way", exact=False).first
                         if await link.count() > 0:
                             await link.scroll_into_view_if_needed()
                             await link.click(timeout=15000)
@@ -545,46 +833,78 @@ async def _login_google_in_popup(
                     except Exception:
                         pass
 
-                await popup_page.wait_for_timeout(6000)
+                await popup_page.wait_for_timeout(10000)
+
+                # Прокрутка, чтобы опция "Enter one of your 8-digit backup codes" была в зоне видимости
+                try:
+                    await scope.evaluate("window.scrollBy(0, 300)")
+                except Exception:
+                    await popup_page.evaluate("window.scrollBy(0, 300)")
+                await popup_page.wait_for_timeout(500)
+                try:
+                    await scope.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                except Exception:
+                    await popup_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await popup_page.wait_for_timeout(800)
 
                 # Выбор входа по 8-значному резервному коду (после "Try another way")
+                # Текст на экране: "Enter one of your 8-digit backup codes" (может быть в div/span/кнопке)
                 backup_option_selectors = [
                     'a:has-text("Enter one of your 8-digit backup codes")',
                     'a:has-text("8-digit backup code")',
                     'span:has-text("Enter one of your 8-digit backup codes")',
                     'div:has-text("Enter one of your 8-digit backup codes")',
+                    'div:has-text("8-digit backup codes")',
+                    'div:has-text("8-digit backup code")',
+                    'button:has-text("Enter one of your 8-digit backup codes")',
+                    'button:has-text("8-digit backup code")',
+                    '[role="option"]:has-text("Enter one of your 8-digit backup codes")',
+                    '[role="option"]:has-text("8-digit backup code")',
+                    '[role="button"]:has-text("8-digit backup")',
                     'a:has-text("Use a backup code")',
                     '[role="option"]:has-text("backup code")',
                     'a:has-text("backup code")',
                     'span:has-text("backup code")',
+                    'div:has-text("backup code")',
                 ]
                 backup_option_clicked = False
-                for sel in backup_option_selectors:
-                    try:
-                        loc = popup_page.locator(sel).first
-                        if await loc.count() > 0 and await loc.is_visible():
-                            await loc.scroll_into_view_if_needed()
-                            await _delay(popup_page, 300, 600)
-                            await loc.click(timeout=15000)
-                            backup_option_clicked = True
-                            logger.info("Выбран вход по 8-значному резервному коду")
-                            break
-                    except Exception:
-                        continue
+                for attempt in range(1, 6):
+                    for sel in backup_option_selectors:
+                        try:
+                            loc = scope.locator(sel).first
+                            if await loc.count() > 0 and await loc.is_visible():
+                                await loc.scroll_into_view_if_needed()
+                                await _delay(popup_page, 300, 600)
+                                await loc.click(timeout=15000)
+                                backup_option_clicked = True
+                                logger.info("Выбран вход по 8-значному резервному коду (селектор: %s)", sel[:50])
+                                break
+                        except Exception:
+                            continue
+                    if backup_option_clicked:
+                        break
+                    await popup_page.wait_for_timeout(2000)
                 if not backup_option_clicked:
                     try:
-                        for text in ["Enter one of your 8-digit backup codes", "8-digit backup code", "Use a backup code"]:
-                            el = popup_page.get_by_text(text, exact=False).first
+                        for text in [
+                            "Enter one of your 8-digit backup codes",
+                            "8-digit backup codes",
+                            "8-digit backup code",
+                            "Use a backup code",
+                            "backup code",
+                        ]:
+                            el = scope.get_by_text(text, exact=False).first
                             if await el.count() > 0 and await el.is_visible():
                                 await el.scroll_into_view_if_needed()
+                                await _delay(popup_page, 300, 500)
                                 await el.click(timeout=15000)
                                 backup_option_clicked = True
-                                logger.info("Выбран вход по 8-значному коду (get_by_text)")
+                                logger.info("Выбран вход по 8-значному коду (get_by_text: %s)", text)
                                 break
                     except Exception:
                         pass
 
-                await popup_page.wait_for_timeout(5000)
+                await popup_page.wait_for_timeout(6000)
         except Exception as e:
             logger.debug("Шаг 2-Step Verification (Try another way): %s", e)
 
@@ -605,7 +925,10 @@ async def _login_google_in_popup(
     code_entered = False
     if backup_code:
         try:
-            body_text = (await popup_page.evaluate("() => document.body.innerText")).lower()
+            try:
+                body_text = (await scope.evaluate("() => document.body.innerText")).lower()
+            except Exception:
+                body_text = (await popup_page.evaluate("() => document.body.innerText")).lower()
             is_backup_page = (
                 "backup" in body_text or "резервн" in body_text or "8-digit" in body_text
                 or "8 digit" in body_text or "верификац" in body_text or "verification code" in body_text
@@ -613,14 +936,17 @@ async def _login_google_in_popup(
             if is_backup_page:
                 for sel in code_input_selectors:
                     try:
-                        loc = popup_page.locator(sel).first
+                        loc = scope.locator(sel).first
                         if await loc.count() > 0 and await loc.is_visible():
                             await loc.click()
                             await _delay(popup_page, 400, 700)
-                            await popup_page.keyboard.type(
-                                backup_code,
-                                delay=random.randint(type_delay_min, type_delay_max),
-                            )
+                            if scope != popup_page:
+                                await loc.press_sequentially(backup_code, delay=random.randint(type_delay_min, type_delay_max))
+                            else:
+                                await popup_page.keyboard.type(
+                                    backup_code,
+                                    delay=random.randint(type_delay_min, type_delay_max),
+                                )
                             await _delay(popup_page, 500, 1000)
                             code_entered = True
                             logger.info("Введён 8-значный резервный код")
@@ -629,9 +955,9 @@ async def _login_google_in_popup(
                         continue
                 if code_entered:
                     await _delay(popup_page, 600, 1200)
-                    for sel in ['button:has-text("Next")', 'button:has-text("Verify")', 'button[type="submit"]', '#identifierNext']:
+                    for sel in ['button:has-text("Next")', 'button:has-text("Verify")', 'button:has-text("Далее")', 'button[type="submit"]', '#identifierNext']:
                         try:
-                            loc = popup_page.locator(sel).first
+                            loc = scope.locator(sel).first
                             if await loc.count() > 0 and await loc.is_visible():
                                 await loc.click(timeout=15000)
                                 logger.info("Next/Verify после резервного кода нажат")
@@ -666,6 +992,134 @@ async def _login_google_in_popup(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Шаг 2.0: В popup сначала «Pay with G Pay» — только после этого открывается Sign-in
+# ──────────────────────────────────────────────────────────────────────────────
+
+_PAY_WITH_GPAY_SELECTORS = [
+    'button:has-text("Pay with G Pay")',
+    'button:has-text("Pay with Google Pay")',
+    'button:has-text("Pay with")',
+    '[role="button"]:has-text("Pay with G Pay")',
+    '[role="button"]:has-text("Pay with Google Pay")',
+    '[role="button"]:has-text("Pay with")',
+    'a:has-text("Pay with G Pay")',
+    'a:has-text("Pay with Google Pay")',
+    'div[role="button"]:has-text("Pay with")',
+    'div:has-text("Pay with G Pay")',
+    'span:has-text("Pay with G Pay")',
+    '[class*="gpay"]:has-text("Pay with")',
+    '[class*="google-pay"]:has-text("Pay with")',
+    '[class*="pay-button"]',
+    '[class*="payButton"]',
+]
+
+
+async def _click_pay_with_gpay_in_popup(popup_page) -> bool:
+    """
+    В открытом popup (pay.fastspring.com/.../googlepay.html) нажимает чёрную кнопку
+    «Pay with G Pay». Только после этого открывается экран Sign-in.
+    """
+    logger.info("Ожидание и клик по кнопке 'Pay with G Pay' в popup...")
+    try:
+        await popup_page.wait_for_load_state("domcontentloaded", timeout=30000)
+    except Exception:
+        pass
+    await popup_page.wait_for_timeout(4000)
+
+    async def _try_click(scope, label: str) -> bool:
+        for sel in _PAY_WITH_GPAY_SELECTORS:
+            try:
+                loc = scope.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    await loc.scroll_into_view_if_needed()
+                    await _delay(popup_page, 400, 800)
+                    await loc.click(timeout=15000)
+                    logger.info("Нажата кнопка 'Pay with G Pay' (%s): %s", label, sel[:50])
+                    return True
+            except Exception:
+                continue
+        return False
+
+    # 1) Основная страница
+    if await _try_click(popup_page, "основная страница"):
+        return True
+
+    # 2) get_by_text (текст может быть разбит на несколько элементов)
+    for text in ["Pay with G Pay", "Pay with Google Pay", "Pay with"]:
+        try:
+            el = popup_page.get_by_text(text, exact=False).first
+            if await el.count() > 0 and await el.is_visible():
+                await el.scroll_into_view_if_needed()
+                await _delay(popup_page, 400, 800)
+                await el.click(timeout=15000)
+                logger.info("Нажата кнопка 'Pay with G Pay' (get_by_text: %s)", text)
+                return True
+        except Exception:
+            continue
+
+    # 3) get_by_role — кнопка с именем, содержащим "Pay with"
+    try:
+        btn = popup_page.get_by_role("button", name=re.compile(r"pay with", re.I))
+        if await btn.count() > 0 and await btn.first.is_visible():
+            await btn.first.scroll_into_view_if_needed()
+            await _delay(popup_page, 400, 800)
+            await btn.first.click(timeout=15000)
+            logger.info("Нажата кнопка 'Pay with G Pay' (get_by_role)")
+            return True
+    except Exception:
+        pass
+
+    # 4) Клик через JS — если кнопка в сложной вёрстке (иконка внутри и т.д.)
+    try:
+        clicked = await popup_page.evaluate("""
+            () => {
+                const texts = ['Pay with G Pay', 'Pay with Google Pay', 'Pay with'];
+                const all = document.querySelectorAll('button, a, [role="button"], div[class*="pay"], div[class*="button"]');
+                for (const el of all) {
+                    const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    if (texts.some(s => t.includes(s))) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }
+        """)
+        if clicked:
+            logger.info("Нажата кнопка 'Pay with G Pay' (JS click)")
+            return True
+    except Exception:
+        pass
+
+    # 5) Iframes (контент может быть во фрейме)
+    for frame in popup_page.frames:
+        if frame == popup_page.main_frame:
+            continue
+        try:
+            if await _try_click(frame, "iframe"):
+                return True
+            clicked = await frame.evaluate("""
+                () => {
+                    const texts = ['Pay with G Pay', 'Pay with Google Pay', 'Pay with'];
+                    const all = document.querySelectorAll('button, a, [role="button"]');
+                    for (const el of all) {
+                        const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                        if (texts.some(s => t.includes(s))) { el.click(); return true; }
+                    }
+                    return false;
+                }
+            """)
+            if clicked:
+                logger.info("Нажата кнопка 'Pay with G Pay' в iframe (JS)")
+                return True
+        except Exception:
+            continue
+
+    logger.warning("Кнопка 'Pay with G Pay' не найдена в popup")
+    return False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Шаг 3: Подтверждение оплаты в popup Google Pay
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -681,9 +1135,15 @@ async def _confirm_payment_in_popup(popup_page) -> bool:
     await popup_page.wait_for_timeout(6000)
     await _screenshot(popup_page, "google_pay_confirm_popup")
 
+    # Сначала «Pay with G Pay» (если ещё не нажали), затем «Оплатить»/Pay после логина
     confirm_selectors = [
         'button:has-text("Pay with G Pay")',
         'button:has-text("Pay with Google Pay")',
+        '[role="button"]:has-text("Pay with G Pay")',
+        '[role="button"]:has-text("Pay with Google Pay")',
+        'button:has-text("Оплатить")',
+        'a:has-text("Оплатить")',
+        '[role="button"]:has-text("Оплатить")',
         'button:has-text("Pay")',
         'button:has-text("Continue")',
         'button:has-text("Confirm")',
@@ -1011,16 +1471,17 @@ async def handle_google_pay(
         await _screenshot(page, "gpay_start")
 
         # ── Шаг 1: Кликнуть вкладку G Pay и кнопку "Place Your Order" ─────────
+        # Приоритет поиска окна аутентификации: 1) полное окно (как на фото), 2) оверлей, 3) popup
         popup_page = None
         clicked = False
         try:
-            async with page.context.expect_page(timeout=90000) as popup_info:
-                clicked = await select_gpay_tab_and_pay(page, timeout_ms=120000)
+            async with page.context.expect_page(timeout=_SIGNIN_FULL_WINDOW_TIMEOUT_MS) as popup_info:
+                clicked = await select_gpay_tab_and_pay(page, timeout_ms=180000)
             if clicked:
                 popup_page = await popup_info.value
-                logger.info(f"Открылся popup Google Pay: {popup_page.url}")
+                logger.info(f"Открылось окно Google Pay: {popup_page.url}")
         except Exception as e:
-            logger.info(f"Popup не открылся или таймаут ({type(e).__name__})")
+            logger.info(f"Окно не открылось или таймаут ({type(e).__name__})")
             # clicked сохраняет значение из select_gpay_tab_and_pay
 
         if not clicked:
@@ -1031,57 +1492,129 @@ async def handle_google_pay(
         result["google_pay_clicked"] = True
         await page.wait_for_timeout(2000)
 
-        # Popup flow: [экран G Pay "Оплатить"] → клик → [sign-in] → логин → [подтверждение] → клик
+        # Выбор страницы для входа: 1) полное окно (большой таймаут), 2) оверлей, 3) popup
+        auth_page = None
+        if browser.context:
+            # До 60 сек ждём появления полного окна (pay.fastspring с формой Вход/Sign in)
+            poll_sec = min(60, _SIGNIN_FULL_WINDOW_TIMEOUT_MS // 1000)
+            for _ in range(poll_sec):
+                await asyncio.sleep(1)
+                for p in browser.context.pages:
+                    if p == page:
+                        continue
+                    try:
+                        if await _is_google_signin_full_window(p):
+                            auth_page = p
+                            logger.info("Найдено полное окно входа Google (приоритет 1): %s", (p.url or "")[:80])
+                            break
+                    except Exception:
+                        continue
+                if auth_page is not None:
+                    break
+            if auth_page is None and browser.context:
+                for p in browser.context.pages:
+                    if p == page:
+                        continue
+                    try:
+                        if await _is_google_signin_overlay(p):
+                            auth_page = p
+                            logger.info("Найден оверлей входа Google (приоритет 2): %s", (p.url or "")[:80])
+                            break
+                    except Exception:
+                        continue
+            if auth_page is None and popup_page:
+                auth_page = popup_page
+                if _page_has_signin_url(popup_page):
+                    logger.info("Используется popup входа Google (приоритет 3): %s", (popup_page.url or "")[:80])
+
+        # Используем выбранное окно; при отсутствии — исходный popup
+        popup_page = auth_page if auth_page else popup_page
         target_page = popup_page if popup_page else page
 
         if popup_page:
             try:
-                await popup_page.wait_for_load_state("domcontentloaded", timeout=60000)
+                await popup_page.wait_for_load_state("domcontentloaded", timeout=90000)
             except Exception:
                 pass
 
-            current_url = (popup_page.url or "").lower()
-            is_signin = "accounts.google.com" in current_url or "signin" in current_url
+            # Сначала в popup нажимаем «Pay with G Pay» — только после этого открывается Sign-in
+            pay_with_gpay_clicked = await _click_pay_with_gpay_in_popup(popup_page)
+            if pay_with_gpay_clicked:
+                await popup_page.wait_for_timeout(8000)
+                if browser.context:
+                    for p in browser.context.pages:
+                        if p != page and p != popup_page:
+                            try:
+                                u = (p.url or "").lower()
+                                if _url_is_signin_context(u) or "accounts.google.com" in u:
+                                    popup_page = p
+                                    target_page = p
+                                    logger.info("Sign-in открылся в новом окне, переключаемся на него")
+                                    break
+                            except Exception:
+                                pass
+                # Ждём появления формы входа в текущем окне (iframe может грузиться)
+                logger.info("Ожидание появления формы входа (до 20 сек)...")
+                for _ in range(20):
+                    await popup_page.wait_for_timeout(1000)
+                    try:
+                        if await _find_frame_with_signin_form(popup_page, timeout_sec=1):
+                            break
+                        body = (await popup_page.evaluate("() => document.body.innerText")).lower()
+                        if "вход" in body and ("телефон" in body or "почты" in body or "email" in body):
+                            break
+                    except Exception:
+                        pass
 
-            # Шаг 2a: Если popup ещё на экране G Pay (не sign-in) — нажимаем "Оплатить"/Pay, после чего откроется sign-in
-            signin_page = None  # страница с accounts.google.com (может быть тот же popup или новое окно)
+            current_url = (popup_page.url or "").lower()
+            is_signin = _url_is_signin_context(current_url) or await _is_google_signin_full_window(popup_page)
+
+            # Шаг 2a: Если окно ещё на экране G Pay (не sign-in) — нажимаем "Оплатить"/Pay, после чего откроется sign-in
+            signin_page = None
             if not is_signin:
-                logger.info("Popup открыт на экране G Pay, нажимаем 'Оплатить' / Pay...")
+                logger.info("Окно открыто на экране G Pay, нажимаем 'Оплатить' / Pay...")
                 first_pay_clicked = await _confirm_payment_in_popup(popup_page)
                 if first_pay_clicked:
-                    logger.info("Кнопка оплаты нажата, ожидание перехода на страницу входа Google...")
-                    # Ждём sign-in: либо навигация в том же popup, либо новое окно (до 90 сек)
-                    for _ in range(90):
+                    logger.info("Кнопка оплаты нажата, ожидание страницы входа Google (полное окно → оверлей → popup)...")
+                    # Ждём sign-in с приоритетом: полное окно, оверлей, popup
+                    wait_sec = 90
+                    for _ in range(wait_sec):
                         await popup_page.wait_for_timeout(1000)
                         try:
+                            if await _is_google_signin_full_window(popup_page):
+                                signin_page = popup_page
+                                logger.info("Страница входа в том же окне (полное окно)")
+                                break
                             current_url = (popup_page.url or "").lower()
                             if "accounts.google.com" in current_url or "signin" in current_url:
                                 signin_page = popup_page
-                                logger.info("Открылась страница входа Google (sign-in) в том же popup")
+                                logger.info("Открылась страница входа Google в том же окне")
                                 break
                         except Exception:
                             pass
-                        # Проверяем все страницы контекста — sign-in мог открыться в новом окне
                         if signin_page is None and browser.context:
                             for p in browser.context.pages:
+                                if p == page:
+                                    continue
                                 try:
-                                    u = (p.url or "").lower()
-                                    if "accounts.google.com" in u or ("signin" in u and "google" in u):
+                                    if await _is_google_signin_full_window(p):
                                         signin_page = p
-                                        logger.info("Найдена страница входа Google в новом окне: %s", p.url[:80])
+                                        logger.info("Найдено полное окно входа в новом окне: %s", (p.url or "")[:80])
+                                        break
+                                    if _page_has_signin_url(p):
+                                        signin_page = p
+                                        logger.info("Найдена страница входа в новом окне: %s", (p.url or "")[:80])
                                         break
                                 except Exception:
                                     continue
                         if signin_page is not None:
                             break
                     if signin_page is None:
-                        logger.warning("Страница sign-in не обнаружена за 90 сек (popup и все окна проверены)")
+                        logger.warning("Страница sign-in не обнаружена за %s сек (полное окно, оверлей, popup проверены)", wait_sec)
 
-            # Страница для логина: найденная sign-in или текущий popup если уже на sign-in
             if signin_page is None and popup_page:
                 try:
-                    u = (popup_page.url or "").lower()
-                    if "accounts.google.com" in u or "signin" in u:
+                    if await _is_google_signin_full_window(popup_page) or _page_has_signin_url(popup_page):
                         signin_page = popup_page
                 except Exception:
                     pass
@@ -1091,7 +1624,14 @@ async def handle_google_pay(
                 login_page = signin_page or popup_page
                 try:
                     target_url = (login_page.url or "").lower()
-                    if "accounts.google.com" in target_url or "signin" in target_url:
+                    need_login = (
+                        _url_is_signin_context(target_url)
+                        or await _is_google_signin_full_window(login_page)
+                    )
+                    if "pay.fastspring.com" in target_url and "googlepay" in target_url:
+                        need_login = True
+                    if need_login:
+                        logger.info("Запуск входа в Google на странице: %s", (login_page.url or "")[:90])
                         backup_codes = getattr(settings, "GOOGLE_BACKUP_CODES", "") or ""
                         try:
                             logged_in, login_msg = await _login_google_in_popup(

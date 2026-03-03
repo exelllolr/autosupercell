@@ -20,10 +20,97 @@ class ProxyManager:
         self._load_proxies()
 
     def _load_proxies(self) -> None:
-        """Загрузка списка прокси из файла и/или Novada из конфига."""
+        """Загрузка списка прокси из конфига (Bright Data / Novada) и/или из файла."""
         if not settings.PROXY_ENABLED:
             logger.info("Прокси отключены в конфигурации")
             return
+
+        novada_only = getattr(settings, "NOVADA_ENABLED", False) and getattr(settings, "NOVADA_ONLY", False)
+        if novada_only:
+            self._load_novada_only()
+            return
+
+        self._load_brightdata_and_novada_and_file()
+
+    def _load_novada_only(self) -> None:
+        """Загрузка только Novada из .env (Bright Data и файл не используются)."""
+        novada_user = (getattr(settings, "NOVADA_USERNAME", "") or "").strip()
+        novada_key = (getattr(settings, "NOVADA_API_KEY", "") or "").strip()
+        if not novada_user or not novada_key:
+            logger.error(
+                "Novada не подключён: в .env не заданы NOVADA_USERNAME и/или NOVADA_API_KEY. "
+                "Укажите логин и API-ключ из кабинета Novada (Dashboard → Account Settings → API Key). "
+                "Пример в .env: NOVADA_USERNAME=ваш_логин, NOVADA_API_KEY=ваш_api_ключ"
+            )
+            return
+        host = getattr(settings, "NOVADA_PROXY_HOST", "super.novada.pro") or "super.novada.pro"
+        port = int(getattr(settings, "NOVADA_PROXY_PORT", 7777) or 7777)
+        use_rotating = getattr(settings, "NOVADA_ROTATING", False)
+        zone = getattr(settings, "NOVADA_ZONE", "res") or "res"
+        region = getattr(settings, "NOVADA_REGION", "") or ""
+        state = getattr(settings, "NOVADA_STATE", "") or ""
+        city = getattr(settings, "NOVADA_CITY", "") or ""
+        username_with_params = self._novada_username_with_zone_region(
+            novada_user, zone=zone, region=region, state=state, city=city
+        )
+        if use_rotating:
+            self.proxies.append({
+                "server": f"http://{host}:{port}",
+                "username": username_with_params,
+                "password": novada_key,
+            })
+            logger.info(
+                f"Novada (только): Rotating Session. user={username_with_params}. Сервер: {host}:{port}"
+            )
+        else:
+            sticky_min = max(0, min(120, int(getattr(settings, "NOVADA_STICKY_MINUTES", 0) or 0)))
+            self.proxies.append({
+                "server": f"http://{host}:{port}",
+                "password": novada_key,
+                "_novada_fresh_session": True,
+                "_novada_username_base": username_with_params,
+                "_novada_sticky_min": sticky_min,
+            })
+            logger.info(
+                f"Novada (только): zone={zone}, region={region or 'any'}, sticky={sticky_min} мин. Сервер: {host}:{port}"
+            )
+
+    @staticmethod
+    def _novada_username_with_zone_region(
+        user: str,
+        zone: str = "res",
+        region: str = "",
+        state: str = "",
+        city: str = "",
+    ) -> str:
+        """Собирает username для Novada в формате как в Endpoint Generator: user-zone-X-region-Y[-st-Z][-city-W]."""
+        base = f"{user}-zone-{zone}"
+        if region:
+            base += f"-region-{region.lower()}"
+        if state:
+            base += f"-st-{state.lower().replace(' ', '')}"
+        if city:
+            base += f"-city-{city.lower().replace(' ', '')}"
+        return base
+
+    def _load_brightdata_and_novada_and_file(self) -> None:
+        """Загрузка Bright Data, затем Novada, затем из файла (если не *_ONLY)."""
+        # Bright Data: из .env
+        brightdata_enabled = getattr(settings, "BRIGHTDATA_ENABLED", False)
+        brightdata_user = (getattr(settings, "BRIGHTDATA_USERNAME", "") or "").strip()
+        brightdata_pass = (getattr(settings, "BRIGHTDATA_PASSWORD", "") or "").strip()
+        if brightdata_enabled and brightdata_user and brightdata_pass:
+            host = (getattr(settings, "BRIGHTDATA_HOST", "brd.superproxy.io") or "brd.superproxy.io").strip()
+            port = int(getattr(settings, "BRIGHTDATA_PORT", 33335) or 33335)
+            self.proxies.append({
+                "server": f"http://{host}:{port}",
+                "username": brightdata_user,
+                "password": brightdata_pass,
+            })
+            logger.info(f"Добавлен Bright Data прокси. Сервер: {host}:{port}")
+            if getattr(settings, "BRIGHTDATA_ONLY", False):
+                logger.info("BRIGHTDATA_ONLY=true: используется только Bright Data, прокси из файла не загружаются.")
+                return
 
         # Novada: Rotating Session или Sticky Session
         novada_enabled = getattr(settings, "NOVADA_ENABLED", False)
@@ -34,39 +121,35 @@ class ProxyManager:
             port = getattr(settings, "NOVADA_PROXY_PORT", 7777) or 7777
             use_rotating = getattr(settings, "NOVADA_ROTATING", False)
 
+            zone = getattr(settings, "NOVADA_ZONE", "res") or "res"
+            region = getattr(settings, "NOVADA_REGION", "") or ""
+            state = getattr(settings, "NOVADA_STATE", "") or ""
+            city = getattr(settings, "NOVADA_CITY", "") or ""
+            username_with_params = self._novada_username_with_zone_region(
+                novada_user.strip(), zone=zone, region=region, state=state, city=city
+            )
             if use_rotating:
-                # Rotating Session: один прокси с фиксированным username — gateway сам ротирует IP
+                # Rotating Session: username с zone/region как в Endpoint Generator
                 self.proxies.append({
                     "server": f"http://{host}:{port}",
-                    "username": novada_user,
+                    "username": username_with_params,
                     "password": novada_key,
                 })
                 logger.info(
-                    f"Добавлен Novada прокси (Rotating Session). Сервер: {host}:{port}"
+                    f"Добавлен Novada прокси (Rotating Session). user={username_with_params}. Сервер: {host}:{port}"
                 )
             else:
                 # Sticky Session: при каждом get_proxy() подставляем новый session = новый IP
-                zone = getattr(settings, "NOVADA_ZONE", "res") or "res"
-                region = getattr(settings, "NOVADA_REGION", "") or ""
-                state = getattr(settings, "NOVADA_STATE", "") or ""
-                city = getattr(settings, "NOVADA_CITY", "") or ""
                 sticky_min = getattr(settings, "NOVADA_STICKY_MINUTES", 0) or 0
                 if sticky_min < 0:
                     sticky_min = 0
                 if sticky_min > 120:
                     sticky_min = 120
-                username_base = f"{novada_user}-zone-{zone}"
-                if region:
-                    username_base += f"-region-{region.lower()}"
-                if state:
-                    username_base += f"-st-{state.lower().replace(' ', '')}"
-                if city:
-                    username_base += f"-city-{city.lower().replace(' ', '')}"
                 self.proxies.append({
                     "server": f"http://{host}:{port}",
                     "password": novada_key,
                     "_novada_fresh_session": True,
-                    "_novada_username_base": username_base,
+                    "_novada_username_base": username_with_params,
                     "_novada_sticky_min": sticky_min,
                 })
                 logger.info(
