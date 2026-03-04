@@ -125,8 +125,11 @@ Email: {email}
 
         else:
             print(f"❌ Ошибка: {response.status_code}")
-            error_detail = response.json() if response.content else {}
-            detail = error_detail.get("detail", "Unknown error")
+            try:
+                error_detail = response.json() if response.content else {}
+            except (ValueError, requests.exceptions.JSONDecodeError):
+                error_detail = {"detail": response.text[:500] if response.text else "Ответ не в формате JSON"}
+            detail = error_detail.get("detail", error_detail.get("error", "Unknown error"))
             print(f"   Детали: {detail}")
             if isinstance(detail, dict):
                 if detail.get("screenshot"):
@@ -137,6 +140,8 @@ Email: {email}
                     print(f"\n   Подсказка: {detail['hint']}")
                 if "proxy_used" in detail:
                     print(f"   Прокси использовался: {detail.get('proxy_used')}; сервер: {detail.get('proxy_server', 'N/A')}")
+            else:
+                print(f"   Ответ сервера: {str(detail)[:400]}")
             return None
 
     except requests.exceptions.Timeout:
