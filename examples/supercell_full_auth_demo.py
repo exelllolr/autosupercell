@@ -1,11 +1,13 @@
 """Визуальная демонстрация полной авторизации: Supercell Store + Google."""
 
+import os
 import requests
 import json
 import time
 from pathlib import Path
 
-API_URL = "http://localhost:8000/api/v1"
+# URL API: по умолчанию localhost; для удалённого сервера задайте AUTOSUPERCELL_API_URL
+API_URL = os.environ.get("AUTOSUPERCELL_API_URL", "http://localhost:8000/api/v1")
 # Таймаут запроса: сценарий (спиннер, ожидание кода, прокси) может занимать до 10 мин
 REQUEST_TIMEOUT = 600
 

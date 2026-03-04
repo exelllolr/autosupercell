@@ -2,6 +2,9 @@ services:
   app:
     build: .
     container_name: autosupercell-app
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     ports:
       - "8000:8000"
       - "9090:9090"
@@ -37,6 +40,9 @@ services:
   worker:
     build: .
     container_name: autosupercell-worker
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     command: arq app.workers.arq_worker.WorkerSettings
     environment:
       - REDIS_HOST=redis

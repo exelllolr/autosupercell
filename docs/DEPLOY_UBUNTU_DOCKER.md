@@ -59,7 +59,18 @@ sudo systemctl status docker   # убедиться, что active (running)
 
 ```bash
 docker --version
-docker compose version
+docker compose version   # или: docker-compose --version
+```
+
+**Если выдаёт `unknown command: docker compose`** — на сервере нет плагина Compose v2. Используйте старый клиент с дефисом:
+
+```bash
+# Установка docker-compose (standalone), если ещё нет
+sudo apt install -y docker-compose
+# Дальше везде используйте docker-compose вместо docker compose:
+docker-compose build --no-cache app
+docker-compose up -d --build
+docker-compose ps
 ```
 
 ### 2.3 Размещение проекта
@@ -147,7 +158,7 @@ docker compose -f docker-compose.yml -f docker-compose.ubuntu.yml up -d --build
 **Если сборка падает с `failed to fetch metadata: exit status 2`** — ошибка на шаге apt или pip внутри образа. Узнать точный шаг:
 
 ```bash
-docker compose build app --no-cache 2>&1
+docker compose build --no-cache app 2>&1
 ```
 
 Смотреть конец вывода: какой `RUN` упал (apt-get, pip install или playwright install). Частые причины: нет доступа к репозиториям (проверить сеть/DNS), блокировка PyPI или Docker Hub. Попробовать образ на Ubuntu: `docker compose -f docker-compose.yml -f docker-compose.ubuntu.yml up -d --build`.
@@ -207,6 +218,40 @@ sudo ufw enable
 
 ---
 
+## 3.1 Запуск демо (supercell_full_auth_demo.py)
+
+Скрипт дергает API (полная авторизация Supercell + Google или только логин Supercell). Варианты:
+
+**На сервере (в контейнере app, интерактивно):**
+
+```bash
+docker-compose exec -it autosupercell-app python /app/examples/supercell_full_auth_demo.py
+```
+
+Дальше скрипт запросит email Supercell, код из письма, при полной авторизации — Google email/пароль. API уже на localhost внутри контейнера.
+
+**На сервере (на хосте, если установлен Python и requests):**
+
+```bash
+cd ~/autosupercell
+python3 examples/supercell_full_auth_demo.py
+```
+
+**С вашего ПК (API на VPS):**
+
+Укажите URL API через переменную окружения и запустите скрипт локально (нужен Python и `pip install requests`):
+
+```bash
+set AUTOSUPERCELL_API_URL=http://130.12.44.191:8000/api/v1
+python examples\supercell_full_auth_demo.py
+```
+
+На Linux/macOS: `export AUTOSUPERCELL_API_URL=http://130.12.44.191:8000/api/v1` затем `python3 examples/supercell_full_auth_demo.py`.
+
+Скриншоты сохраняются в `screenshots/` внутри контейнера; с хоста: `docker-compose exec autosupercell-app ls -la /app/screenshots`.
+
+---
+
 ## 4. Опции: образ на базе Ubuntu
 
 По умолчанию используется [Dockerfile](../Dockerfile) (Debian Bookworm). Чтобы собирать образ на базе Ubuntu 22.04 ([Dockerfile.ubuntu](../Dockerfile.ubuntu)), используйте второй compose-файл:
@@ -238,6 +283,26 @@ docker compose ps && curl -s http://localhost:8000/api/v1/health
 # Логи
 docker compose logs -f
 ```
+
+---
+
+## 6. Белые скриншоты и ERR_NAME_NOT_RESOLVED
+
+Если в ответе API приходит ошибка **`Page.goto: net::ERR_NAME_NOT_RESOLVED at https://store.supercell.com/`**, браузер внутри контейнера не может разрешить домен (DNS). Страница не загружается, поэтому скриншот получается **белым**.
+
+**Что сделать:**
+
+1. **Проверить DNS в контейнере** — в [docker-compose.yml](../docker-compose.yml) для сервисов `app` и `worker` заданы DNS `8.8.8.8` и `1.1.1.1`. Перезапустить после изменения: `docker-compose up -d --build`, затем снова запустить сценарий.
+
+2. **Проверить разрешение имён из контейнера:**
+   ```bash
+   docker-compose exec autosupercell-app nslookup store.supercell.com
+   ```
+   Если команда не находит адрес — проблема в сети/DNS хоста или в доступе контейнера к интернету.
+
+3. **Использовать прокси** — если хостинг или регион блокирует Supercell, включите прокси в `.env`: `PROXY_ENABLED=true`, добавьте рабочие прокси в `proxies.txt` и перезапустите контейнеры.
+
+4. **Логи:** `docker-compose logs -f app` — смотреть полный текст ошибки и стек.
 
 ---
 
