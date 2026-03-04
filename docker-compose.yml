@@ -2,11 +2,11 @@ services:
   app:
     build: .
     container_name: autosupercell-app
-    # DNS: сначала встроенный Docker (127.0.0.11) — разрешение redis/app; затем внешние для store.supercell.com
     dns:
-      - 127.0.0.11
       - 8.8.8.8
-      - 1.1.1.1
+      - 8.8.4.4
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
       - "9090:9090"
