@@ -47,7 +47,15 @@ sudo usermod -aG docker $USER
 
 **Важно:** после `usermod -aG docker $USER` выйдите из SSH и зайдите снова (или выполните `newgrp docker`).
 
-Проверка:
+Запуск и автозапуск демона Docker (если при `docker compose up` появляется *Cannot connect to the Docker daemon*):
+
+```bash
+sudo systemctl start docker
+sudo systemctl enable docker
+sudo systemctl status docker   # убедиться, что active (running)
+```
+
+Проверка клиента:
 
 ```bash
 docker --version
@@ -78,6 +86,26 @@ cd autosupercell
 cd ~
 # После копирования архива на сервер (scp/rsync):
 tar -xzf autosupercell.tar.gz && cd autosupercell
+```
+
+**Если `git clone` падает с `GnuTLS recv error`, `HTTP/2 stream was not closed cleanly` или `early EOF`** (нестабильная сеть, ограничения провайдера):
+
+Отключить HTTP/2 для Git (часто решает обрывы) и увеличить буфер:
+
+```bash
+git config --global http.version HTTP/1.1
+git config --global http.postBuffer 524288000
+rm -rf autosupercell
+git clone --depth 1 https://github.com/exelllolr/autosupercell.git autosupercell
+cd autosupercell
+```
+
+Либо только буфер без смены протокола:
+
+```bash
+git config --global http.postBuffer 524288000
+git clone --depth 1 https://github.com/exelllolr/autosupercell.git autosupercell
+cd autosupercell
 ```
 
 ### 2.4 Конфигурация приложения
@@ -115,6 +143,14 @@ docker compose up -d --build   # сборка образов и запуск в 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.ubuntu.yml up -d --build
 ```
+
+**Если сборка падает с `failed to fetch metadata: exit status 2`** — ошибка на шаге apt или pip внутри образа. Узнать точный шаг:
+
+```bash
+docker compose build app --no-cache 2>&1
+```
+
+Смотреть конец вывода: какой `RUN` упал (apt-get, pip install или playwright install). Частые причины: нет доступа к репозиториям (проверить сеть/DNS), блокировка PyPI или Docker Hub. Попробовать образ на Ubuntu: `docker compose -f docker-compose.yml -f docker-compose.ubuntu.yml up -d --build`.
 
 ### 2.6 Файрвол (при необходимости)
 

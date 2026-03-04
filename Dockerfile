@@ -42,10 +42,10 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers (Chromium + Chrome for BROWSER_USE_CHROME=true)
-RUN playwright install chromium && playwright install chrome
+# Install Patchright browsers (Chromium + Chrome for BROWSER_USE_CHROME=true)
+RUN patchright install chromium && patchright install chrome
 
-# Note: playwright install-deps is skipped as we install dependencies manually above
+# Note: patchright uses same deps as Playwright; we install system deps manually above
 # This avoids issues with unavailable font packages (ttf-ubuntu-font-family, ttf-unifont)
 # in newer Debian versions. We use fonts-unifont instead of ttf-unifont.
 

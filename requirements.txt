@@ -4,7 +4,7 @@ uvicorn[standard]==0.27.0
 h11>=0.14.0
 pydantic==2.5.3
 pydantic-settings==2.1.0
-email-validator==2.1.0  # For EmailStr validation
+email-validator>=2.2.0  # For EmailStr validation (2.1.0 yanked on PyPI)
 
 # Browser Automation — только Patchright (undetected Playwright). playwright-stealth не ставим (конфликт с patchright).
 patchright>=1.0.0
