@@ -2,8 +2,9 @@ services:
   app:
     build: .
     container_name: autosupercell-app
-    # DNS: явные серверы; резолвер хоста — если хостинг режет 8.8.8.8, контейнер возьмёт DNS хоста
+    # DNS: сначала встроенный Docker (127.0.0.11) — разрешение redis/app; затем внешние для store.supercell.com
     dns:
+      - 127.0.0.11
       - 8.8.8.8
       - 1.1.1.1
     ports:
@@ -14,7 +15,6 @@ services:
       - REDIS_PORT=6379
       - DEBUG=false
     volumes:
-      - /etc/resolv.conf:/etc/resolv.conf:ro
       - ./logs:/app/logs
       - ./screenshots:/app/screenshots
       - ./videos:/app/videos
@@ -43,6 +43,7 @@ services:
     build: .
     container_name: autosupercell-worker
     dns:
+      - 127.0.0.11
       - 8.8.8.8
       - 1.1.1.1
     command: arq app.workers.arq_worker.WorkerSettings
@@ -50,7 +51,6 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
     volumes:
-      - /etc/resolv.conf:/etc/resolv.conf:ro
       - ./logs:/app/logs
       - ./screenshots:/app/screenshots
       - ./videos:/app/videos

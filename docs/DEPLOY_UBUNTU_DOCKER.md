@@ -292,7 +292,7 @@ docker compose logs -f
 
 **Что сделать:**
 
-1. **Проверить DNS в контейнере** — в [docker-compose.yml](../docker-compose.yml) для сервисов `app` и `worker` заданы DNS `8.8.8.8` и `1.1.1.1`. Перезапустить после изменения: `docker-compose up -d --build`, затем снова запустить сценарий.
+1. **DNS в контейнерах** — в [docker-compose.yml](../docker-compose.yml) для `app` и `worker` заданы: `127.0.0.11` (встроенный DNS Docker — резолв имён `redis`/`app`), затем `8.8.8.8` и `1.1.1.1`. Не монтировать в контейнер `/etc/resolv.conf` с хоста — иначе не резолвится `redis` и воркер падает с «Temporary failure in name resolution». После правок: `docker-compose up -d --build`.
 
 2. **Проверить разрешение имён из контейнера:**
    ```bash
