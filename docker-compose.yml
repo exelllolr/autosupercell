@@ -2,6 +2,7 @@ services:
   app:
     build: .
     container_name: autosupercell-app
+    # DNS: явные серверы; резолвер хоста — если хостинг режет 8.8.8.8, контейнер возьмёт DNS хоста
     dns:
       - 8.8.8.8
       - 1.1.1.1
@@ -13,6 +14,7 @@ services:
       - REDIS_PORT=6379
       - DEBUG=false
     volumes:
+      - /etc/resolv.conf:/etc/resolv.conf:ro
       - ./logs:/app/logs
       - ./screenshots:/app/screenshots
       - ./videos:/app/videos
@@ -48,6 +50,7 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
     volumes:
+      - /etc/resolv.conf:/etc/resolv.conf:ro
       - ./logs:/app/logs
       - ./screenshots:/app/screenshots
       - ./videos:/app/videos
