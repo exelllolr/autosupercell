@@ -14,6 +14,7 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - DEBUG=false
+      - DOCKER_CONTAINER=true
     volumes:
       - ./logs:/app/logs
       - ./screenshots:/app/screenshots
