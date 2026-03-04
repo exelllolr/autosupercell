@@ -1,10 +1,11 @@
 """Демонстрация покупки товара в магазине Brawl Stars."""
 
+import os
 import requests
 import json
 from pathlib import Path
 
-API_URL = "http://localhost:8000/api/v1"
+API_URL = os.environ.get("AUTOSUPERCELL_API_URL", "http://localhost:8000/api/v1")
 REQUEST_TIMEOUT = 600  # 10 минут
 
 
@@ -157,14 +158,15 @@ if __name__ == "__main__":
 
     # Проверка доступности API
     try:
-        health_response = requests.get(f"{API_URL.replace('/api/v1', '')}/", timeout=5)
+        health_response = requests.get(f"{API_URL}/health", timeout=10)
         if health_response.status_code == 200:
             print("✅ API сервер доступен")
         else:
             print("⚠️  API сервер отвечает, но статус не 200")
     except Exception:
         print("❌ API сервер недоступен!")
-        print("   Запустите сервер: python -m uvicorn app.main:app --host 127.0.0.1 --port 8000")
+        print("   Локально: python -m uvicorn app.main:app --host 127.0.0.1 --port 8000")
+        print("   Docker:   docker-compose up -d  затем подождите 10–20 сек и проверьте curl -s http://localhost:8000/api/v1/health")
         exit(1)
 
     print("\n" + "=" * 60)
