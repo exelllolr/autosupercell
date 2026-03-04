@@ -118,6 +118,9 @@ class BrowserAutomation:
                 # Убраны подозрительные флаги типа --disable-web-security
                 browser_args = [
                 "--disable-blink-features=AutomationControlled",
+                "--dns-prefetch-disable",
+                "--no-dns-over-https",
+                "--host-resolver-flags=default_address_family=IPv4",
                 "--disable-dev-shm-usage",
                 "--no-sandbox",  # Требуется для Docker
                 "--disable-setuid-sandbox",  # Требуется для Docker

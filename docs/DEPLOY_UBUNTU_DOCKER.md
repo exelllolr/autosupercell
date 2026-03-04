@@ -302,7 +302,19 @@ docker compose logs -f
 
 3. **Использовать прокси** — если хостинг или регион блокирует Supercell, включите прокси в `.env`: `PROXY_ENABLED=true`, добавьте рабочие прокси в `proxies.txt` и перезапустите контейнеры.
 
-4. **Логи:** `docker-compose logs -f app` — смотреть полный текст ошибки и стек.
+4. **Глобальный DNS для Docker (Ubuntu):** если контейнеры всё равно не резолвят внешние домены, задайте DNS на уровне демона:
+   ```bash
+   sudo bash -c 'cat > /etc/docker/daemon.json << EOF
+   {
+     "dns": ["8.8.8.8", "8.8.4.4"]
+   }
+   EOF'
+   sudo systemctl restart docker
+   docker-compose down && docker-compose up -d
+   ```
+   Затем проверьте: `docker exec autosupercell-app cat /etc/resolv.conf` и `docker exec autosupercell-app nslookup store.supercell.com`.
+
+5. **Логи:** `docker-compose logs -f app` — смотреть полный текст ошибки и стек.
 
 ---
 
