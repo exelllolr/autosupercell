@@ -332,6 +332,17 @@ class BrowserAutomation:
                     }
                     if not use_patchright:
                         launch_options["args"] = browser_args
+                    else:
+                        # Patchright: минимум args, но DNS-флаги нужны в Docker
+                        launch_options["args"] = [
+                            "--dns-prefetch-disable",
+                            "--no-dns-over-https",
+                            "--host-resolver-flags=default_address_family=IPv4",
+                            "--disable-blink-features=AutomationControlled",
+                            "--no-sandbox",
+                            "--disable-setuid-sandbox",
+                            "--disable-dev-shm-usage",
+                        ]
                     if use_chrome:
                         launch_options["channel"] = "chrome"
                     try:
