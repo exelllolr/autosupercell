@@ -161,9 +161,9 @@ if __name__ == "__main__":
     print("ДЕМОНСТРАЦИЯ ПОКУПКИ ТОВАРА")
     print("=" * 60)
 
-    # Проверка доступности API
+    # Проверка доступности API (Docker поднимает приложение ~15 сек — таймаут 20 сек)
     try:
-        health_response = requests.get(f"{API_URL}/health", timeout=10)
+        health_response = requests.get(f"{API_URL}/health", timeout=20)
         if health_response.status_code == 200:
             print("✅ API сервер доступен")
         else:
@@ -171,7 +171,8 @@ if __name__ == "__main__":
     except Exception:
         print("❌ API сервер недоступен!")
         print("   Локально: python -m uvicorn app.main:app --host 127.0.0.1 --port 8000")
-        print("   Docker:   docker-compose up -d  затем подождите 10–20 сек и проверьте curl -s http://localhost:8000/api/v1/health")
+        print("   Docker:   docker-compose up -d  затем подождите 15–20 сек и проверьте: curl -s http://localhost:8000/api/v1/health")
+        print("   Если только что запустили контейнеры — подождите и запустите скрипт снова.")
         exit(1)
 
     print("\n" + "=" * 60)
