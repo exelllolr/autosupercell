@@ -1,10 +1,15 @@
-# Using Debian Bookworm (stable) instead of Trixie for better package compatibility
+# Using Debian Bookworm (stable) for better package compatibility
 FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-# Install system dependencies including Playwright browser dependencies
-RUN apt-get update && apt-get install -y \
+# Install system dependencies:
+#   - Chromium/Chrome runtime libs (Patchright/Playwright)
+#   - libgl1          → required by opencv-python (cv2 imports libGL.so.1)
+#   - libglib2.0-0    → required by opencv-python (libgthread-2.0.so.0)
+#   - libxext6        → required by Chrome (libXext.so.6)
+#   - fonts-unifont   → replaces ttf-unifont (unavailable in Bookworm)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     gnupg \
     ca-certificates \
@@ -28,38 +33,39 @@ RUN apt-get update && apt-get install -y \
     libxkbcommon0 \
     libxrandr2 \
     xdg-utils \
-    # Additional dependencies for Chromium
     libxshmfence1 \
     libxss1 \
     libpangocairo-1.0-0 \
     libcairo-gobject2 \
     libgdk-pixbuf-xlib-2.0-0 \
+    libxext6 \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
+# Copy and install Python dependencies first (Docker layer cache)
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Patchright browsers (Chromium + Chrome for BROWSER_USE_CHROME=true)
+# Install Patchright browsers.
+# chromium — основной браузер; chrome — для BROWSER_USE_CHROME=true.
+# Запускается отдельным слоем, чтобы не пересобирать при изменении кода.
 RUN patchright install chromium && patchright install chrome
-
-# Note: patchright uses same deps as Playwright; we install system deps manually above
-# This avoids issues with unavailable font packages (ttf-ubuntu-font-family, ttf-unifont)
-# in newer Debian versions. We use fonts-unifont instead of ttf-unifont.
 
 # Copy application code
 COPY . .
 
-# Create necessary directories
-RUN mkdir -p logs screenshots proofs
+# Create runtime directories (также создаются при монтировании volumes,
+# но лучше иметь их в образе для случаев без volume-mount)
+RUN mkdir -p logs screenshots proofs videos
 
-# Expose ports
-EXPOSE 8000 9090
+# Only the API port is exposed.
+# Port 9090 removed: Prometheus metrics are served at 8000/metrics, not a separate port.
+EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+# Health check.
+# start_period=60s: первый запуск с установкой/прогревом Chrome может занять до 60 сек.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')" || exit 1
 
 # Run application

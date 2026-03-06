@@ -21,11 +21,19 @@ requests==2.31.0  # For simple examples and testing
 # AI/ML for product search
 openai==1.12.0
 anthropic==0.34.2  # For Claude
-google-generativeai==0.8.3  # For Gemini
+# google-generativeai: используем >=0.8.3 вместо точной версии — поддерживает gemini-1.5-flash/pro.
+# ПРИМЕЧАНИЕ: пакет google-generativeai устаревает в пользу google-genai,
+# но смена требует рефакторинга gemini_provider.py (другой import и API).
+# Оставляем google-generativeai до явного перехода на google-genai.
+google-generativeai>=0.8.3
 pillow==10.2.0
 
 # Image Processing
-opencv-python==4.9.0.80
+# opencv-python-headless используется вместо opencv-python:
+#   - не требует libGL / libgthread (GUI-библиотеки X11)
+#   - подходит для серверов и Docker без дисплея
+#   - полностью совместим по API с opencv-python
+opencv-python-headless==4.9.0.80
 numpy==1.26.3
 
 # Monitoring

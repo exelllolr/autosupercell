@@ -1,13 +1,17 @@
 """Главный файл приложения FastAPI."""
 
-from fastapi import FastAPI
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from loguru import logger
 from prometheus_client import make_asgi_app
-from app.config import settings
-from app.api.routes import router
 
-# Настройка логирования
+from app.api.routes import router
+from app.config import settings
+
+# ─── Логирование ────────────────────────────────────────────────────────────
 logger.add(
     settings.LOG_FILE,
     rotation="10 MB",
@@ -16,22 +20,85 @@ logger.add(
     format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
 )
 
+# ─── Эндпоинты, которые не требуют API-ключа ────────────────────────────────
+_PUBLIC_PATHS = {
+    "/",
+    "/api/v1/health",
+    "/api/v1/routes",
+    "/metrics",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+}
+
+
+# ─── Lifespan (заменяет устаревшие @app.on_event) ───────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Инициализация при запуске и очистка при остановке."""
+    logger.info("Запуск AutoSupercell сервиса...")
+    yield
+    logger.info("Остановка AutoSupercell сервиса...")
+
+
+# ─── Приложение ──────────────────────────────────────────────────────────────
 app = FastAPI(
     title="AutoSupercell",
     description="Автоматизированный сервис для покупки товаров в Supercell Store",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
-# CORS middleware
+# ─── CORS middleware ──────────────────────────────────────────────────────────
+# Читаем список допустимых origins из настроек.
+# В продакшене задайте в .env: CORS_ORIGINS=https://yourdomain.com,https://app.yourdomain.com
+_raw_origins = settings.CORS_ORIGINS.strip()
+if _raw_origins == "*":
+    _allow_origins = ["*"]
+else:
+    _allow_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # В продакшене указать конкретные домены
-    allow_credentials=True,
+    allow_origins=_allow_origins,
+    allow_credentials=_allow_origins != ["*"],  # credentials несовместимы с wildcard
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Подключаем routes
+
+# ─── API-Key middleware ───────────────────────────────────────────────────────
+@app.middleware("http")
+async def api_key_middleware(request: Request, call_next):
+    """
+    Проверка API-ключа (заголовок X-API-Key).
+
+    Активируется только если в .env задан API_SECRET_KEY.
+    Публичные пути (/, /api/v1/health, /docs, /metrics ...) пропускаются без ключа.
+    """
+    if settings.API_SECRET_KEY:
+        # Пропускаем публичные пути и OPTIONS preflight
+        if request.method != "OPTIONS" and request.url.path not in _PUBLIC_PATHS:
+            provided = request.headers.get("X-API-Key", "")
+            if provided != settings.API_SECRET_KEY:
+                logger.warning(
+                    "Отклонён запрос без/с неверным API-ключом: %s %s",
+                    request.method,
+                    request.url.path,
+                )
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "detail": (
+                            "Неверный или отсутствующий API-ключ. "
+                            "Передайте заголовок X-API-Key."
+                        )
+                    },
+                )
+    return await call_next(request)
+
+
+# ─── Роуты ───────────────────────────────────────────────────────────────────
 from app.api.auth_routes import router as auth_router
 from app.api.supercell_auth_routes import router as supercell_auth_router
 
@@ -39,36 +106,25 @@ app.include_router(router, prefix="/api/v1", tags=["orders"])
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["authentication"])
 app.include_router(supercell_auth_router, prefix="/api/v1", tags=["supercell"])
 
-# Подключаем store routes (покупка товаров)
+# Store routes (покупка товаров)
 try:
     from app.api.store_routes import router as store_router
+
     app.include_router(store_router, prefix="/api/v1", tags=["store"])
     logger.info("Store routes подключены успешно")
 except Exception as e:
     import traceback
-    error_msg = f"Ошибка подключения store routes: {e}\n{traceback.format_exc()}"
-    logger.error(error_msg)
-    logger.error(error_msg)
+
+    logger.error("Ошибка подключения store routes: %s\n%s", e, traceback.format_exc())
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Инициализация при запуске."""
-    logger.info("Запуск AutoSupercell сервиса...")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Очистка при остановке."""
-    logger.info("Остановка AutoSupercell сервиса...")
-
-
-# Prometheus metrics
+# ─── Prometheus metrics ───────────────────────────────────────────────────────
 if settings.PROMETHEUS_ENABLED:
     metrics_app = make_asgi_app()
     app.mount("/metrics", metrics_app)
 
 
+# ─── Базовые эндпоинты ────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
     """Корневой endpoint."""
@@ -85,10 +141,12 @@ async def list_routes():
     routes = []
     for route in app.routes:
         if hasattr(route, "path") and hasattr(route, "methods"):
-            routes.append({
-                "path": route.path,
-                "methods": list(route.methods),
-            })
+            routes.append(
+                {
+                    "path": route.path,
+                    "methods": list(route.methods),
+                }
+            )
     return {"routes": routes}
 
 
@@ -96,9 +154,11 @@ async def list_routes():
 async def ai_status():
     """
     Статус AI-провайдера (OpenAI / Claude / Gemini).
-    Проверка: в .env заданы AI_PROVIDER и соответствующий API ключ.
+
+    Проверка: в .env заданы AI_PROVIDER и соответствующий API-ключ.
     """
     from app.core.ai_product_search import AIProductSearch
+
     search = AIProductSearch()
     provider_name = getattr(settings, "AI_PROVIDER", "openai")
     available = search.provider is not None and search.provider.is_available()
@@ -108,13 +168,17 @@ async def ai_status():
         "message": (
             f"Провайдер {provider_name} доступен."
             if available
-            else f"Провайдер {provider_name} недоступен. В .env проверьте: "
-            + (
-                "ANTHROPIC_API_KEY для claude"
-                if provider_name == "claude"
-                else "GEMINI_API_KEY для gemini"
-                if provider_name == "gemini"
-                else "OPENAI_API_KEY для openai"
+            else (
+                f"Провайдер {provider_name} недоступен. В .env проверьте: "
+                + (
+                    "ANTHROPIC_API_KEY для claude"
+                    if provider_name == "claude"
+                    else (
+                        "GEMINI_API_KEY для gemini"
+                        if provider_name == "gemini"
+                        else "OPENAI_API_KEY для openai"
+                    )
+                )
             )
         ),
     }

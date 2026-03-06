@@ -5,8 +5,12 @@ WORKDIR /app
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies including Playwright browser dependencies
-RUN apt-get update && apt-get install -y \
+# Install system dependencies:
+#   - Chromium/Chrome runtime libs (Patchright/Playwright)
+#   - libgl1          → required by opencv-python-headless (libGL.so.1)
+#   - libglib2.0-0    → required by opencv-python-headless (libgthread-2.0.so.0)
+#   - libxext6        → required by Chrome (libXext.so.6)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.11 \
     python3.11-dev \
     python3-pip \
@@ -33,38 +37,41 @@ RUN apt-get update && apt-get install -y \
     libxkbcommon0 \
     libxrandr2 \
     xdg-utils \
-    # Additional dependencies for Chromium
     libxshmfence1 \
     libxss1 \
     libpangocairo-1.0-0 \
     libcairo-gobject2 \
     libgdk-pixbuf2.0-0 \
+    libxext6 \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Create symlink for python
-RUN ln -s /usr/bin/python3.11 /usr/bin/python && \
-    ln -s /usr/bin/python3.11 /usr/bin/python3
+# Create symlinks for python
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python && \
+    ln -sf /usr/bin/python3.11 /usr/bin/python3
 
-# Copy requirements
+# Copy and install Python dependencies first (Docker layer cache)
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Install Patchright browsers
+# Install Patchright browsers.
+# chromium — основной браузер; chrome — для BROWSER_USE_CHROME=true.
 RUN patchright install chromium && patchright install chrome
 
 # Copy application code
 COPY . .
 
-# Create necessary directories
-RUN mkdir -p logs screenshots proofs
+# Create runtime directories
+RUN mkdir -p logs screenshots proofs videos
 
-# Expose ports
-EXPOSE 8000 9090
+# Only the API port is exposed.
+# Port 9090 removed: Prometheus metrics are served at 8000/metrics, not a separate port.
+EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+# Health check.
+# start_period=60s: первый запуск с установкой/прогревом Chrome может занять до 60 сек.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')" || exit 1
 
 # Run application

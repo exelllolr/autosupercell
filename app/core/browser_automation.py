@@ -1,18 +1,19 @@
 """Браузерная автоматизация на Patchright (undetected Playwright)."""
 
 import asyncio
-import re
 import random
-from typing import Optional, Dict, List, Tuple
+import re
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 from loguru import logger
+
 from app.config import settings
 from app.core.proxy_manager import proxy_manager
 
 # Типы и драйвер: Patchright совместим с API Playwright
 try:
-    from patchright.async_api import async_playwright
-    from patchright.async_api import Browser, BrowserContext, Page
+    from patchright.async_api import Browser, BrowserContext, Page, async_playwright
 except ImportError:
     raise ImportError(
         "Установите Patchright: pip install patchright && patchright install chrome"
@@ -43,9 +44,9 @@ USER_AGENTS = [
 VIEWPORTS = [
     {"width": 1920, "height": 1080},  # Full HD
     {"width": 1680, "height": 1050},  # WSXGA+
-    {"width": 1600, "height": 900},    # HD+
-    {"width": 1536, "height": 864},   # Common laptop
-    {"width": 1440, "height": 900},    # MacBook
+    {"width": 1600, "height": 900},  # HD+
+    {"width": 1536, "height": 864},  # Common laptop
+    {"width": 1440, "height": 900},  # MacBook
 ]
 
 # Реалистичные языки
@@ -67,7 +68,9 @@ class BrowserAutomation:
         self.playwright = None
         self.current_user_agent: Optional[str] = None
         self.current_viewport: Optional[Dict] = None
-        self.current_proxy: Optional[Dict] = None  # для mark_proxy_failed при ошибке навигации
+        self.current_proxy: Optional[Dict] = (
+            None  # для mark_proxy_failed при ошибке навигации
+        )
 
     async def start(
         self,
@@ -97,8 +100,8 @@ class BrowserAutomation:
                 self.current_proxy = proxy
 
                 if proxy:
-                    server = proxy.get('server', 'unknown')
-                    username = proxy.get('username', '')
+                    server = proxy.get("server", "unknown")
+                    username = proxy.get("username", "")
                     logger.info(
                         f"Попытка {proxy_attempts + 1}/{max_proxy_retries}: "
                         f"Использование прокси {server} (user: {username})"
@@ -110,72 +113,140 @@ class BrowserAutomation:
                 self.current_viewport = random.choice(VIEWPORTS)
                 self.current_user_agent = random.choice(USER_AGENTS)
                 current_languages = random.choice(LANGUAGES)
-                
-                logger.info(f"Используется User-Agent: {self.current_user_agent[:50]}...")
+
+                logger.info(
+                    f"Используется User-Agent: {self.current_user_agent[:50]}..."
+                )
                 logger.info(f"Используется Viewport: {self.current_viewport}")
 
                 # Расширенные аргументы для обхода детекции
                 # Убраны подозрительные флаги типа --disable-web-security
                 browser_args = [
-                "--disable-blink-features=AutomationControlled",
-                "--dns-prefetch-disable",
-                "--no-dns-over-https",
-                "--host-resolver-flags=default_address_family=IPv4",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",  # Требуется для Docker
-                "--disable-setuid-sandbox",  # Требуется для Docker
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--disable-site-isolation-trials",
-                "--disable-infobars",
-                f"--window-size={self.current_viewport['width']},{self.current_viewport['height']}",
-                "--start-maximized",
-                "--disable-extensions",
-                "--disable-plugins-discovery",
-                "--disable-default-apps",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-renderer-backgrounding",
-                "--disable-features=TranslateUI",
-                "--disable-ipc-flooding-protection",
-                "--exclude-switches=enable-automation",  # Важно: скрывает автоматизацию
-                "--enable-features=NetworkService,NetworkServiceInProcess",
-                "--disable-component-extensions-with-background-pages",
+                    "--disable-blink-features=AutomationControlled",
+                    "--dns-prefetch-disable",
+                    "--no-dns-over-https",
+                    "--host-resolver-flags=default_address_family=IPv4",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",  # Требуется для Docker
+                    "--disable-setuid-sandbox",  # Требуется для Docker
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-site-isolation-trials",
+                    "--disable-infobars",
+                    f"--window-size={self.current_viewport['width']},{self.current_viewport['height']}",
+                    "--start-maximized",
+                    "--disable-extensions",
+                    "--disable-plugins-discovery",
+                    "--disable-default-apps",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-background-timer-throttling",
+                    "--disable-backgrounding-occluded-windows",
+                    "--disable-renderer-backgrounding",
+                    "--disable-features=TranslateUI",
+                    "--disable-ipc-flooding-protection",
+                    "--exclude-switches=enable-automation",  # Важно: скрывает автоматизацию
+                    "--enable-features=NetworkService,NetworkServiceInProcess",
+                    "--disable-component-extensions-with-background-pages",
                 ]
                 if getattr(settings, "BROWSER_INCOGNITO", False):
                     browser_args.append("--incognito")
 
                 # Определяем headless режим
                 import os
-                is_docker = os.path.exists("/.dockerenv") or os.environ.get("DOCKER_CONTAINER") == "true"
-                headless_mode = getattr(settings, "BROWSER_HEADLESS", True) if hasattr(settings, "BROWSER_HEADLESS") else (is_docker or not settings.DEBUG)
+
+                is_docker = (
+                    os.path.exists("/.dockerenv")
+                    or os.environ.get("DOCKER_CONTAINER") == "true"
+                )
+
+                # ИСПРАВЛЕНО: в Docker ВСЕГДА headless — GUI недоступен на сервере.
+                # Настройка BROWSER_HEADLESS=false из .env игнорируется в контейнере.
+                if is_docker:
+                    headless_mode = True
+                    if not getattr(settings, "BROWSER_HEADLESS", True):
+                        logger.warning(
+                            "Docker: принудительно включён headless режим "
+                            "(BROWSER_HEADLESS=false из .env игнорируется в контейнере)"
+                        )
+                else:
+                    headless_mode = (
+                        getattr(settings, "BROWSER_HEADLESS", True)
+                        if hasattr(settings, "BROWSER_HEADLESS")
+                        else not settings.DEBUG
+                    )
                 use_chrome = getattr(settings, "BROWSER_USE_CHROME", False)
 
                 # В headed режиме (локально) убираем Docker-специфичные флаги
                 if not headless_mode:
-                    browser_args = [a for a in browser_args if a not in (
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-extensions",
-                        "--disable-plugins-discovery",
-                        "--disable-default-apps",
-                        "--disable-component-extensions-with-background-pages",
-                    )]
-                    logger.info("Headed режим: убраны Docker-специфичные флаги для лучшей имитации")
+                    browser_args = [
+                        a
+                        for a in browser_args
+                        if a
+                        not in (
+                            "--no-sandbox",
+                            "--disable-setuid-sandbox",
+                            "--disable-dev-shm-usage",
+                            "--disable-extensions",
+                            "--disable-plugins-discovery",
+                            "--disable-default-apps",
+                            "--disable-component-extensions-with-background-pages",
+                        )
+                    ]
+                    logger.info(
+                        "Headed режим: убраны Docker-специфичные флаги для лучшей имитации"
+                    )
 
-                import os
-                use_persistent = getattr(settings, "BROWSER_USE_PERSISTENT_PROFILE", True)
-                use_system_profile = getattr(settings, "BROWSER_USE_SYSTEM_PROFILE", False)
+                use_persistent = getattr(
+                    settings, "BROWSER_USE_PERSISTENT_PROFILE", True
+                )
+                use_system_profile = getattr(
+                    settings, "BROWSER_USE_SYSTEM_PROFILE", False
+                )
+
+                # ИСПРАВЛЕНО: системный профиль Chrome (LOCALAPPDATA) недоступен
+                # в Docker — нет GUI и нет пути %LOCALAPPDATA%. Принудительно отключаем.
+                if is_docker and use_system_profile:
+                    logger.warning(
+                        "Docker: системный профиль Chrome (BROWSER_USE_SYSTEM_PROFILE) "
+                        "принудительно отключён — LOCALAPPDATA недоступен в контейнере."
+                    )
+                    use_system_profile = False
+
+                # Предупреждение: запись видео несовместима с persistent profile
+                # в headed (локальном) режиме. В headless/Docker это не проблема —
+                # используется обычный контекст с поддержкой видео.
+                if (
+                    use_persistent
+                    and not headless_mode
+                    and getattr(settings, "BROWSER_RECORD_VIDEO", True)
+                ):
+                    logger.warning(
+                        "BROWSER_RECORD_VIDEO=true несовместимо с persistent profile "
+                        "в headed режиме — видео записано не будет. "
+                        "Для записи видео установите BROWSER_USE_PERSISTENT_PROFILE=false."
+                    )
+
                 if use_system_profile:
                     localappdata = os.environ.get("LOCALAPPDATA", "")
-                    default_chrome_user_data = os.path.join(localappdata, "Google", "Chrome", "User Data") if localappdata else ""
+                    default_chrome_user_data = (
+                        os.path.join(localappdata, "Google", "Chrome", "User Data")
+                        if localappdata
+                        else ""
+                    )
                     custom = getattr(settings, "BROWSER_PROFILE_DIR", "").strip()
-                    profile_dir = Path(custom) if (custom and os.path.isabs(custom)) else Path(default_chrome_user_data or "browser_profile")
-                    logger.warning("Используется системный профиль Chrome: %s. Закрой Chrome перед запуском.", profile_dir)
+                    profile_dir = (
+                        Path(custom)
+                        if (custom and os.path.isabs(custom))
+                        else Path(default_chrome_user_data or "browser_profile")
+                    )
+                    logger.warning(
+                        "Используется системный профиль Chrome: %s. Закрой Chrome перед запуском.",
+                        profile_dir,
+                    )
                 else:
-                    raw_profile = getattr(settings, "BROWSER_PROFILE_DIR", "browser_profile")
+                    raw_profile = getattr(
+                        settings, "BROWSER_PROFILE_DIR", "browser_profile"
+                    )
                     profile_dir = Path(raw_profile)
                     if not profile_dir.is_absolute():
                         # Абсолютный путь — иначе Chrome выдаёт «Не удалось создать каталог данных»
@@ -200,18 +271,26 @@ class BrowserAutomation:
                     ctx_timezone = None
                     ctx_geolocation = None
 
-                ignore_https = bool(proxy and getattr(settings, "PROXY_IGNORE_HTTPS_ERRORS", False))
+                ignore_https = bool(
+                    proxy and getattr(settings, "PROXY_IGNORE_HTTPS_ERRORS", False)
+                )
                 if ignore_https:
-                    logger.info("Прокси: включён обход ошибок сертификата (PROXY_IGNORE_HTTPS_ERRORS) — снижает ERR_CONNECTION_RESET")
+                    logger.info(
+                        "Прокси: включён обход ошибок сертификата (PROXY_IGNORE_HTTPS_ERRORS) — снижает ERR_CONNECTION_RESET"
+                    )
                 # Трафик к Google (логин, G Pay) — напрямую к серверам Google, не через прокси (избегаем ERR_TUNNEL_CONNECTION_FAILED)
                 proxy_for_context = proxy
                 if proxy:
                     bypass_google = getattr(
-                        settings, "PROXY_BYPASS_GOOGLE", "*.google.com,*.googleapis.com,*.gstatic.com,*.youtube.com"
+                        settings,
+                        "PROXY_BYPASS_GOOGLE",
+                        "*.google.com,*.googleapis.com,*.gstatic.com,*.youtube.com",
                     ).strip()
                     if bypass_google:
                         proxy_for_context = {**proxy, "bypass": bypass_google}
-                        logger.info("Прокси: обход для доменов Google — трафик к логину/G Pay идёт напрямую к серверам Google")
+                        logger.info(
+                            "Прокси: обход для доменов Google — трафик к логину/G Pay идёт напрямую к серверам Google"
+                        )
                 if use_patchright and use_persistent and not headless_mode:
                     # Рекомендация Patchright: минимум опций, без своего UA/headers/viewport.
                     # args для Google: отключаем детекцию автоматизации ("This browser or app may not be secure").
@@ -252,7 +331,10 @@ class BrowserAutomation:
                         "proxy": proxy_for_context,
                         "extra_http_headers": {
                             "Accept-Language": ",".join(
-                                [f"{lang};q={0.9 - i*0.1}" for i, lang in enumerate(current_languages)]
+                                [
+                                    f"{lang};q={0.9 - i * 0.1}"
+                                    for i, lang in enumerate(current_languages)
+                                ]
                             ),
                         },
                     }
@@ -265,7 +347,9 @@ class BrowserAutomation:
                         context_options["geolocation"] = ctx_geolocation
                     if use_chrome:
                         context_options["channel"] = "chrome"
-                        logger.info("Используется установленный Chrome (меньше детекта автоматизации)")
+                        logger.info(
+                            "Используется установленный Chrome (меньше детекта автоматизации)"
+                        )
 
                 if use_persistent and not headless_mode:
                     context_options.pop("record_video_dir", None)
@@ -281,14 +365,21 @@ class BrowserAutomation:
 
                     logger.info(f"Запуск с постоянным профилем: {profile_dir}")
                     try:
-                        self.context = await self.playwright.chromium.launch_persistent_context(
-                            str(profile_dir), **context_options
+                        self.context = (
+                            await self.playwright.chromium.launch_persistent_context(
+                                str(profile_dir), **context_options
+                            )
                         )
                         self.browser = None
                     except Exception as e:
                         err_lower = str(e).lower()
-                        if use_chrome and ("chrome" in err_lower or "not found" in err_lower):
-                            logger.warning("Chrome недоступен для persistent context (%s), пробуем без channel", e)
+                        if use_chrome and (
+                            "chrome" in err_lower or "not found" in err_lower
+                        ):
+                            logger.warning(
+                                "Chrome недоступен для persistent context (%s), пробуем без channel",
+                                e,
+                            )
                             context_options_pop = context_options.pop
                             context_options_pop("channel", None)
                             try:
@@ -346,12 +437,20 @@ class BrowserAutomation:
                     if use_chrome:
                         launch_options["channel"] = "chrome"
                     try:
-                        self.browser = await self.playwright.chromium.launch(**launch_options)
+                        self.browser = await self.playwright.chromium.launch(
+                            **launch_options
+                        )
                     except Exception as e:
-                        if use_chrome and ("chrome" in str(e).lower() or "not found" in str(e).lower()):
-                            logger.warning("Chrome недоступен (%s), используем Chromium", e)
+                        if use_chrome and (
+                            "chrome" in str(e).lower() or "not found" in str(e).lower()
+                        ):
+                            logger.warning(
+                                "Chrome недоступен (%s), используем Chromium", e
+                            )
                             launch_options.pop("channel", None)
-                            self.browser = await self.playwright.chromium.launch(**launch_options)
+                            self.browser = await self.playwright.chromium.launch(
+                                **launch_options
+                            )
                         else:
                             raise
                     context_options.pop("args", None)
@@ -360,34 +459,50 @@ class BrowserAutomation:
                     # proxy остаётся в context_options — применяется ко всему context (все страницы и popup)
                     if getattr(settings, "BROWSER_RECORD_VIDEO", True):
                         context_options["record_video_dir"] = str(video_dir)
-                        context_options["record_video_size"] = {"width": 1280, "height": 720}
+                        context_options["record_video_size"] = {
+                            "width": 1280,
+                            "height": 720,
+                        }
                         logger.info("Запись видео сессии включена (videos/)")
                     self.context = await self.browser.new_context(**context_options)
 
                 # Увеличенные таймауты для работы через прокси (медленная загрузка)
-                self.context.set_default_navigation_timeout(120000)  # 120 сек (2 мин) на навигацию
-                self.context.set_default_timeout(60000)               # 60 сек на действия (селекторы и т.д.)
+                self.context.set_default_navigation_timeout(
+                    120000
+                )  # 120 сек (2 мин) на навигацию
+                self.context.set_default_timeout(
+                    60000
+                )  # 60 сек на действия (селекторы и т.д.)
 
                 self.page = await self.context.new_page()
 
                 if not use_patchright:
                     await self._apply_cdp_webdriver_patch()
-                    use_stealth_plugin = getattr(settings, "BROWSER_USE_STEALTH_PLUGIN", True)
+                    use_stealth_plugin = getattr(
+                        settings, "BROWSER_USE_STEALTH_PLUGIN", True
+                    )
                     if use_stealth_plugin:
                         try:
                             from playwright_stealth import stealth_async
+
                             await stealth_async(self.page)
                         except ImportError:
-                            logger.debug("playwright-stealth не установлен (опционально)")
+                            logger.debug(
+                                "playwright-stealth не установлен (опционально)"
+                            )
                     await self._inject_context_stealth_scripts()
                     await self._inject_page_stealth_scripts()
                 else:
-                    logger.debug("Patchright: только встроенные патчи (рекомендуемый режим)")
+                    logger.debug(
+                        "Patchright: только встроенные патчи (рекомендуемый режим)"
+                    )
 
                 # Прогрев: первый запрос — about:blank, чтобы первый переход на Supercell не был «холодным»
                 if getattr(settings, "BROWSER_WARMUP", True):
                     try:
-                        await self.page.goto("about:blank", wait_until="commit", timeout=5000)
+                        await self.page.goto(
+                            "about:blank", wait_until="commit", timeout=5000
+                        )
                         await self.page.wait_for_timeout(random.randint(2000, 3500))
                         logger.info("Браузер прогрет (about:blank)")
                     except Exception as e:
@@ -399,39 +514,46 @@ class BrowserAutomation:
 
                 logger.info("Браузер успешно запущен с улучшенным stealth режимом")
                 return  # Успешно запущен
-                
+
             except Exception as e:
                 last_error = e
                 error_msg = str(e).lower()
-                
+
                 # Закрываем браузер при ошибке
                 try:
-                    if hasattr(self, 'browser') and self.browser:
+                    if hasattr(self, "browser") and self.browser:
                         await self.browser.close()
-                    if hasattr(self, 'playwright') and self.playwright:
+                    if hasattr(self, "playwright") and self.playwright:
                         await self.playwright.stop()
                 except:
                     pass
-                
+
                 # Проверяем, связана ли ошибка с прокси
-                is_proxy_error = any([
-                    "err_empty_response" in error_msg,
-                    "net::err_" in error_msg,
-                    "proxy" in error_msg,
-                    "connection" in error_msg and "refused" in error_msg,
-                    "timeout" in error_msg and proxy is not None,
-                ])
-                
-                if is_proxy_error and proxy and retry_proxy and proxy_attempts < max_proxy_retries - 1:
+                is_proxy_error = any(
+                    [
+                        "err_empty_response" in error_msg,
+                        "net::err_" in error_msg,
+                        "proxy" in error_msg,
+                        "connection" in error_msg and "refused" in error_msg,
+                        "timeout" in error_msg and proxy is not None,
+                    ]
+                )
+
+                if (
+                    is_proxy_error
+                    and proxy
+                    and retry_proxy
+                    and proxy_attempts < max_proxy_retries - 1
+                ):
                     proxy_attempts += 1
                     logger.warning(
                         f"Ошибка подключения через прокси {proxy.get('server', 'unknown')}: {e}. "
                         f"Попытка {proxy_attempts + 1}/{max_proxy_retries}: пробуем другой прокси..."
                     )
-                    
+
                     # Помечаем прокси как провалившийся
                     proxy_manager.mark_proxy_failed(proxy)
-                    
+
                     # Небольшая задержка перед следующей попыткой
                     await asyncio.sleep(2)
                     continue
@@ -456,7 +578,11 @@ class BrowserAutomation:
         """
         if not self.context:
             return
-        region = (getattr(settings, "BROWSER_BROWSEC_VPN_REGION", "US") or "US").strip().upper()
+        region = (
+            (getattr(settings, "BROWSER_BROWSEC_VPN_REGION", "US") or "US")
+            .strip()
+            .upper()
+        )
         # ID расширения Browsec VPN в Chrome Web Store
         BROWSEC_EXTENSION_ID = "omghfjlpggmjjaagoclmmobgdodcjboh"
         ext_url = f"chrome-extension://{BROWSEC_EXTENSION_ID}/popup.html"
@@ -487,8 +613,8 @@ class BrowserAutomation:
                 f'button:has-text("{region}")',
                 f'a:has-text("{region}")',
                 f'[data-country="{region}"]',
-                'text=United States',
-                'text=USA',
+                "text=United States",
+                "text=USA",
             ]:
                 try:
                     el = await ext_page.wait_for_selector(selector, timeout=2000)
@@ -591,9 +717,16 @@ class BrowserAutomation:
 """
         try:
             cdp = await self.context.new_cdp_session(self.page)
-            await cdp.send("Page.addScriptToEvaluateOnNewDocument", {"source": webdriver_patch})
-            await cdp.send("Runtime.evaluate", {"expression": webdriver_patch, "returnByValue": False})
-            await cdp.send("Page.addScriptToEvaluateOnNewDocument", {"source": permissions_patch})
+            await cdp.send(
+                "Page.addScriptToEvaluateOnNewDocument", {"source": webdriver_patch}
+            )
+            await cdp.send(
+                "Runtime.evaluate",
+                {"expression": webdriver_patch, "returnByValue": False},
+            )
+            await cdp.send(
+                "Page.addScriptToEvaluateOnNewDocument", {"source": permissions_patch}
+            )
             logger.debug("CDP: патч navigator.webdriver и Permissions API применён")
         except Exception as e:
             logger.debug(f"CDP патч не применён (не критично): {e}")
@@ -813,7 +946,9 @@ class BrowserAutomation:
         delay = random.randint(min_ms, max_ms)
         await self.page.wait_for_timeout(delay)
 
-    async def human_like_type(self, selector: str, text: str, delay_between_chars: int = 80) -> None:
+    async def human_like_type(
+        self, selector: str, text: str, delay_between_chars: int = 80
+    ) -> None:
         """
         Ввод текста максимально похожий на человека.
         НЕ использует fill() — только реальные нажатия клавиш через keyboard.
@@ -864,7 +999,11 @@ class BrowserAutomation:
         # Тексты карточек на главной store.supercell.com (например "Brawl Stars Store", "Clash Royale Store")
         card_texts = {
             "brawl-stars": ["Brawl Stars Store", "Brawl Stars", "brawl stars store"],
-            "clash-royale": ["Clash Royale Store", "Clash Royale", "clash royale store"],
+            "clash-royale": [
+                "Clash Royale Store",
+                "Clash Royale",
+                "clash royale store",
+            ],
         }
         texts = card_texts.get(game.lower(), [f"{game} Store", game])
 
@@ -954,7 +1093,9 @@ class BrowserAutomation:
         except Exception as e:
             # При таймауте (например из-за шрифтов) пробуем скриншот без full_page и с коротким таймаутом
             if "timeout" in str(e).lower() or "exceeded" in str(e).lower():
-                logger.warning(f"Скриншот full_page таймаут ({timeout_ms} мс), пробуем viewport...")
+                logger.warning(
+                    f"Скриншот full_page таймаут ({timeout_ms} мс), пробуем viewport..."
+                )
                 try:
                     await self.page.screenshot(path=str(filepath), timeout=5000)
                 except Exception:
@@ -1106,7 +1247,9 @@ class BrowserAutomation:
             'button:has-text("Accept")',
         ]:
             try:
-                button = await self.page.wait_for_selector(selector, timeout=2000, state="visible")
+                button = await self.page.wait_for_selector(
+                    selector, timeout=2000, state="visible"
+                )
                 if button:
                     await button.click(force=True)
                     logger.info(f"Cookies приняты ({selector})")
@@ -1116,7 +1259,9 @@ class BrowserAutomation:
                 continue
         logger.debug("Cookie баннер не найден или уже принят")
 
-    async def login_supercell(self, email: str, verification_code: Optional[str] = None) -> Dict:
+    async def login_supercell(
+        self, email: str, verification_code: Optional[str] = None
+    ) -> Dict:
         """
         Авторизация в Supercell Store (email → код из письма).
         Используется как альтернативный поток; API использует свой сценарий в supercell_auth_routes.
@@ -1254,7 +1399,9 @@ class BrowserAutomation:
                         return {
                             "status": "code_required",
                             "message": "Требуется код верификации из email",
-                            "screenshot": str(await self.take_screenshot("awaiting_code.png")),
+                            "screenshot": str(
+                                await self.take_screenshot("awaiting_code.png")
+                            ),
                         }
                 else:
                     error_text = await self.page.evaluate(

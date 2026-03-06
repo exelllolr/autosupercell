@@ -1,0 +1,7 @@
+2026/03/05-18:50:07.872 5528 Reusing MANIFEST C:\Users\exelllolr\Desktop\autosupercell\browser_profile\Default\IndexedDB\https_checkout-v2.appcharge.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/03/05-18:50:07.873 5528 Recovering log #22
+2026/03/05-18:50:07.873 5528 Reusing old log C:\Users\exelllolr\Desktop\autosupercell\browser_profile\Default\IndexedDB\https_checkout-v2.appcharge.com_0.indexeddb.leveldb/000022.log 
+2026/03/05-18:50:07.880 3ad0 Level-0 table #24: started
+2026/03/05-18:50:07.884 3ad0 Level-0 table #24: 856 bytes OK
+2026/03/05-18:50:07.887 3ad0 Delete type=0 #22
+2026/03/05-18:50:07.887 5144 Manual compaction at level-0 from '\x00\x02\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x03\x00\x00\x00' @ 0 : 0; will stop at (end)

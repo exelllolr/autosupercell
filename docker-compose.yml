@@ -9,10 +9,11 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
-      - "9090:9090"
+      # Порт 9090 убран: метрики Prometheus отдаются на 8000/metrics, не на отдельном порту.
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - DEBUG=false
       - DOCKER_CONTAINER=true
     volumes:
@@ -23,8 +24,22 @@ services:
       - ./.env:/app/.env
       - ./proxies.txt:/app/proxies.txt
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')",
+        ]
+      interval: 30s
+      timeout: 10s
+      # Увеличен start_period: сборка Chrome/Patchright занимает до 60 сек при первом старте
+      start_period: 60s
+      retries: 3
     networks:
       - autosupercell-network
 
@@ -32,13 +47,38 @@ services:
     image: redis:7-alpine
     container_name: autosupercell-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
+      # Привязан только к 127.0.0.1 — Redis не доступен снаружи сервера без явного решения.
     volumes:
       - redis-data:/data
     restart: unless-stopped
+    # Пароль берётся из переменной окружения REDIS_PASSWORD (.env или shell).
+    # Если REDIS_PASSWORD пуст — Redis запускается без пароля (только внутри Docker-сети).
+    command: >
+      sh -c '
+        if [ -n "$$REDIS_PASSWORD" ]; then
+          redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"
+        else
+          redis-server --appendonly yes
+        fi
+      '
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    healthcheck:
+      test: >
+        sh -c '
+          if [ -n "$$REDIS_PASSWORD" ]; then
+            redis-cli -a "$$REDIS_PASSWORD" ping
+          else
+            redis-cli ping
+          fi
+        '
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
     networks:
       - autosupercell-network
-    command: redis-server --appendonly yes
 
   worker:
     build: .
@@ -51,6 +91,8 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - DOCKER_CONTAINER=true
     volumes:
       - ./logs:/app/logs
       - ./screenshots:/app/screenshots
@@ -59,8 +101,10 @@ services:
       - ./.env:/app/.env
       - ./proxies.txt:/app/proxies.txt
     depends_on:
-      - redis
-      - app
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - autosupercell-network
@@ -69,13 +113,14 @@ services:
     image: prom/prometheus:latest
     container_name: autosupercell-prometheus
     ports:
-      - "9091:9090"
+      - "127.0.0.1:9091:9090"
+      # Prometheus привязан только к localhost — не открывается наружу.
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
       - prometheus-data:/prometheus
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
     restart: unless-stopped
     networks:
       - autosupercell-network

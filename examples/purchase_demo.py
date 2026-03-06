@@ -1,19 +1,32 @@
 """Демонстрация покупки товара в магазине Brawl Stars."""
 
 import os
-import requests
-import json
 from pathlib import Path
+
+import requests
 
 API_URL = os.environ.get("AUTOSUPERCELL_API_URL", "http://localhost:8000/api/v1")
 REQUEST_TIMEOUT = 600  # 10 минут
 
+# Если в .env или окружении задан API_SECRET_KEY — передаём его во всех запросах.
+# Пример: set AUTOSUPERCELL_API_KEY=ваш_ключ (Windows) или export ... (Linux/macOS)
+API_KEY = os.environ.get("AUTOSUPERCELL_API_KEY", "")
+
+
+# Заголовки, которые будут добавляться к каждому запросу
+def _get_headers() -> dict:
+    """Сформировать заголовки запроса (включая X-API-Key, если задан)."""
+    headers = {}
+    if API_KEY:
+        headers["X-API-Key"] = API_KEY
+    return headers
+
 
 def print_step(step_num: int, title: str, description: str):
     """Вывести информацию о шаге."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"ШАГ {step_num}: {title}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(description)
     print()
 
@@ -59,19 +72,27 @@ Email: {email}
 
     # Проверка прокси на сервере (API читает .env и proxies.txt)
     try:
-        proxy_status = requests.get(f"{API_URL}/proxy/status", timeout=5)
+        proxy_status = requests.get(
+            f"{API_URL}/proxy/status", timeout=5, headers=_get_headers()
+        )
         if proxy_status.status_code == 200:
             ps = proxy_status.json()
             if ps.get("proxy_enabled") and ps.get("proxies_loaded", 0) > 0:
-                print(f"   [Прокси] Загружено: {ps['proxies_loaded']}, будут использоваться при открытии браузера.")
+                print(
+                    f"   [Прокси] Загружено: {ps['proxies_loaded']}, будут использоваться при открытии браузера."
+                )
             else:
-                print(f"   [Прокси] Не используются: {ps.get('message', 'PROXY_ENABLED или proxies.txt не настроены.')}")
+                print(
+                    f"   [Прокси] Не используются: {ps.get('message', 'PROXY_ENABLED или proxies.txt не настроены.')}"
+                )
     except Exception:
         pass
 
     print("Отправка запроса...")
     print(f"   Endpoint: POST {API_URL}/supercell/purchase")
-    print(f"   Таймаут: {REQUEST_TIMEOUT // 60} мин. Ожидайте ответа (браузер + авторизация), не прерывайте (Ctrl+C).")
+    print(
+        f"   Таймаут: {REQUEST_TIMEOUT // 60} мин. Ожидайте ответа (браузер + авторизация), не прерывайте (Ctrl+C)."
+    )
     print()
 
     try:
@@ -79,6 +100,7 @@ Email: {email}
             f"{API_URL}/supercell/purchase",
             json=data,
             timeout=REQUEST_TIMEOUT,
+            headers=_get_headers(),
         )
 
         if response.status_code == 200:
@@ -86,7 +108,9 @@ Email: {email}
             print("✅ Процесс завершён!")
             print(f"   Успех: {result.get('success')}")
             print(f"   Товар добавлен в корзину: {result.get('added_to_cart')}")
-            print(f"   Окно оформления заказа открыто: {result.get('checkout_opened', False)}")
+            print(
+                f"   Окно оформления заказа открыто: {result.get('checkout_opened', False)}"
+            )
             print(f"   Сообщение: {result.get('message')}")
             print(f"   URL: {result.get('url')}")
 
@@ -110,8 +134,12 @@ Email: {email}
                 print(f"\n   Информация о товаре:")
                 print(f"      Название: {product_name}")
                 print(f"      Цена: {product_info.get('price', 'N/A')}")
-                conf = product_info.get('confidence')
-                print(f"      Уверенность AI: {conf:.2%}" if conf is not None else "      Уверенность AI: N/A")
+                conf = product_info.get("confidence")
+                print(
+                    f"      Уверенность AI: {conf:.2%}"
+                    if conf is not None
+                    else "      Уверенность AI: N/A"
+                )
                 print(f"      Описание: {product_info.get('description', 'N/A')}")
 
             if result.get("screenshot"):
@@ -128,8 +156,14 @@ Email: {email}
             try:
                 error_detail = response.json() if response.content else {}
             except (ValueError, requests.exceptions.JSONDecodeError):
-                error_detail = {"detail": response.text[:500] if response.text else "Ответ не в формате JSON"}
-            detail = error_detail.get("detail", error_detail.get("error", "Unknown error"))
+                error_detail = {
+                    "detail": response.text[:500]
+                    if response.text
+                    else "Ответ не в формате JSON"
+                }
+            detail = error_detail.get(
+                "detail", error_detail.get("error", "Unknown error")
+            )
             print(f"   Детали: {detail}")
             if isinstance(detail, dict):
                 if detail.get("screenshot"):
@@ -139,7 +173,9 @@ Email: {email}
                 if detail.get("hint"):
                     print(f"\n   Подсказка: {detail['hint']}")
                 if "proxy_used" in detail:
-                    print(f"   Прокси использовался: {detail.get('proxy_used')}; сервер: {detail.get('proxy_server', 'N/A')}")
+                    print(
+                        f"   Прокси использовался: {detail.get('proxy_used')}; сервер: {detail.get('proxy_server', 'N/A')}"
+                    )
             else:
                 print(f"   Ответ сервера: {str(detail)[:400]}")
             return None
@@ -150,6 +186,8 @@ Email: {email}
         print("   - Прокси работает медленно")
         print("   - Supercell долго отвечает")
         print("   - AI поиск занял много времени")
+        print("   Если используете nginx — убедитесь, что proxy_read_timeout >= 720s")
+        print("   (см. nginx/nginx.conf в корне проекта)")
         return None
     except Exception as e:
         print(f"❌ Ошибка: {e}")
@@ -162,17 +200,35 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # Проверка доступности API (Docker поднимает приложение ~15 сек — таймаут 20 сек)
+    if API_KEY:
+        print(
+            f"🔑 API-ключ задан (X-API-Key: {'*' * (len(API_KEY) - 4)}{API_KEY[-4:]})"
+        )
+    else:
+        print(
+            "ℹ️  API-ключ не задан (AUTOSUPERCELL_API_KEY не установлен). "
+            "Если на сервере включён API_SECRET_KEY — запросы будут отклонены."
+        )
+
     try:
-        health_response = requests.get(f"{API_URL}/health", timeout=20)
+        health_response = requests.get(
+            f"{API_URL}/health", timeout=20, headers=_get_headers()
+        )
         if health_response.status_code == 200:
             print("✅ API сервер доступен")
         else:
             print("⚠️  API сервер отвечает, но статус не 200")
     except Exception:
         print("❌ API сервер недоступен!")
-        print("   Локально: python -m uvicorn app.main:app --host 127.0.0.1 --port 8000")
-        print("   Docker:   docker-compose up -d  затем подождите 15–20 сек и проверьте: curl -s http://localhost:8000/api/v1/health")
-        print("   Если только что запустили контейнеры — подождите и запустите скрипт снова.")
+        print(
+            "   Локально: python -m uvicorn app.main:app --host 127.0.0.1 --port 8000"
+        )
+        print(
+            "   Docker:   docker-compose up -d  затем подождите 15–20 сек и проверьте: curl -s http://localhost:8000/api/v1/health"
+        )
+        print(
+            "   Если только что запустили контейнеры — подождите и запустите скрипт снова."
+        )
         exit(1)
 
     print("\n" + "=" * 60)
@@ -187,16 +243,27 @@ if __name__ == "__main__":
     print()
     print("Код верификации:")
     print("  - Введите код сейчас (если уже получили письмо от Supercell)")
-    print("  - Нажмите Enter — тогда у вас будет 2 минуты ввести код вручную в браузере")
-    print("  - Или введите пароль от email на следующем шаге — код придёт автоматически")
+    print(
+        "  - Нажмите Enter — тогда у вас будет 2 минуты ввести код вручную в браузере"
+    )
+    print(
+        "  - Или введите пароль от email на следующем шаге — код придёт автоматически"
+    )
     verification_code = input("Код верификации (или Enter): ").strip()
 
     email_password = ""
     if not verification_code:
-        email_password = input("Пароль от email для авто-получения кода (или Enter — ввод вручную): ").strip()
+        email_password = input(
+            "Пароль от email для авто-получения кода (или Enter — ввод вручную): "
+        ).strip()
 
-    game = input("\nИгра (brawl-stars / clash-royale, по умолчанию brawl-stars): ").strip() or "brawl-stars"
-    product_name = input("Название товара (по умолчанию '80 Gems'): ").strip() or "80 Gems"
+    game = (
+        input("\nИгра (brawl-stars / clash-royale, по умолчанию brawl-stars): ").strip()
+        or "brawl-stars"
+    )
+    product_name = (
+        input("Название товара (по умолчанию '80 Gems'): ").strip() or "80 Gems"
+    )
 
     result = demo_purchase(
         email=email,

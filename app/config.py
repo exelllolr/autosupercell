@@ -1,7 +1,8 @@
 """Конфигурация приложения."""
 
-from pydantic_settings import BaseSettings
 from typing import Optional
+
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
@@ -11,27 +12,54 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     DEBUG: bool = False
+
+    # Security — API-ключ для защиты всех эндпоинтов (кроме /health и /).
+    # Если пусто — авторизация отключена (не рекомендуется в продакшене).
+    # Задайте в .env: API_SECRET_KEY=ваш_секретный_ключ
+    # Клиент передаёт его в заголовке: X-API-Key: <ключ>
+    API_SECRET_KEY: str = ""
+
+    # CORS — список разрешённых источников через запятую.
+    # В продакшене укажите конкретные домены: "https://yourdomain.com,https://app.yourdomain.com"
+    # Оставьте "*" только если API доступен исключительно внутри приватной сети.
+    CORS_ORIGINS: str = "*"
+
+    # Browser
     BROWSER_HEADLESS: bool = True
     BROWSER_USE_CHROME: bool = False
     BROWSER_WARMUP: bool = True
     BROWSER_USE_PERSISTENT_PROFILE: bool = True
     BROWSER_PROFILE_DIR: str = "browser_profile"
-    # True = использовать профиль установленного Chrome (нужно для Browsec VPN; закрой Chrome перед запуском)
-    BROWSER_USE_SYSTEM_PROFILE: bool = True
+
+    # ИСПРАВЛЕНО (было True): системный профиль Chrome (LOCALAPPDATA) недоступен
+    # в Docker и на серверах без GUI. Принудительно отключён по умолчанию.
+    # Включайте только при локальной разработке с установленным Chrome + Browsec VPN.
+    BROWSER_USE_SYSTEM_PROFILE: bool = False
+
     BROWSER_WARMUP_VISIT_SUPERCELL: bool = True
     BROWSER_USE_STEALTH_PLUGIN: bool = True
-    # True = использовать Patchright (undetected Playwright). Нужно: pip install patchright && patchright install chrome
-    # Для входа в Google Pay рекомендуется: BROWSER_USE_PATCHRIGHT=True, BROWSER_HEADLESS=False, BROWSER_USE_CHROME=True
+
+    # True = использовать Patchright (undetected Playwright).
+    # Нужно: pip install patchright && patchright install chrome
+    # Для входа в Google Pay рекомендуется: BROWSER_USE_PATCHRIGHT=True,
+    # BROWSER_HEADLESS=False, BROWSER_USE_CHROME=True
     BROWSER_USE_PATCHRIGHT: bool = False
-    # Записывать видео сессии (только при обычном контексте; при persistent профиле недоступно)
+
+    # Записывать видео сессии (только при обычном контексте;
+    # при persistent профиле в headed режиме недоступно).
     BROWSER_RECORD_VIDEO: bool = True
+
     # Режим инкогнито (может помочь при блокировках)
     BROWSER_INCOGNITO: bool = False
+
     # Расширение US Region для store/accounts.supercell.com
     BROWSER_USE_US_EXTENSION: bool = False
     BROWSER_EXTENSION_PATH: str = "browser_extensions/us_region"
-    # Browsec VPN (Chrome Web Store): при запуске включать и ставить регион US. Требуется BROWSER_USE_SYSTEM_PROFILE=true и установленный Browsec в Chrome.
-    BROWSER_USE_BROWSEC_VPN: bool = True
+
+    # ИСПРАВЛЕНО (было True): Browsec VPN требует установленного расширения в Chrome
+    # и системного профиля — недоступно в Docker/сервере без GUI.
+    # Включайте только при локальной разработке с Browsec в Chrome.
+    BROWSER_USE_BROWSEC_VPN: bool = False
     BROWSER_BROWSEC_VPN_REGION: str = "US"
 
     # GoLogin anti-detect browser
@@ -60,14 +88,18 @@ class Settings(BaseSettings):
     PROXY_ROTATION_ENABLED: bool = True
     PROXY_LIST_FILE: str = "proxies.txt"
     PROXY_USE_FIRST_ONLY: bool = False
-    # False = при провале всех прокси не переходить на реальный IP. True = один раз попробовать без прокси
+    # False = при провале всех прокси не переходить на реальный IP.
+    # True = один раз попробовать без прокси.
     PROXY_FALLBACK_NO_PROXY: bool = False
     # True = прокси только в браузере (не в системных HTTP_PROXY)
     PROXY_BROWSER_ONLY: bool = True
-    # True = игнорировать ошибки сертификата при прокси (подключение не защищено)
+    # True = игнорировать ошибки сертификата при прокси
     PROXY_IGNORE_HTTPS_ERRORS: bool = False
-    # Обход прокси для доменов Google (логин, G Pay): трафик к Google идёт напрямую к серверам Google. Формат: "*.google.com,*.googleapis.com,...". Пусто = не обходить.
-    PROXY_BYPASS_GOOGLE: str = "*.google.com,*.googleapis.com,*.gstatic.com,*.youtube.com"
+    # Обход прокси для доменов Google (логин, G Pay).
+    # Пусто = не обходить.
+    PROXY_BYPASS_GOOGLE: str = (
+        "*.google.com,*.googleapis.com,*.gstatic.com,*.youtube.com"
+    )
 
     # Novada proxy (резидентные/датацентр прокси)
     NOVADA_ENABLED: bool = True
@@ -75,15 +107,15 @@ class Settings(BaseSettings):
     NOVADA_ROTATING: bool = False  # True = Rotating Session (gateway сам ротирует IP)
     NOVADA_USERNAME: str = ""
     NOVADA_API_KEY: str = ""
-    NOVADA_ZONE: str = "res"   # res | dcp
-    NOVADA_REGION: str = "us"  # Страна: us, gb, de и т.д. (2-letter ISO или код Novada)
-    NOVADA_STATE: str = ""     # Штат/регион: oregon, california (пусто = любой)
-    NOVADA_CITY: str = ""      # Город: portland (пусто = любой). Список: country_map_en.xlsx на novada.com
+    NOVADA_ZONE: str = "res"  # res | dcp
+    NOVADA_REGION: str = "us"  # Страна: us, gb, de и т.д. (2-letter ISO)
+    NOVADA_STATE: str = ""  # Штат: oregon, california (пусто = любой)
+    NOVADA_CITY: str = ""  # Город: portland (пусто = любой)
     NOVADA_PROXY_HOST: str = "super.novada.pro"
     NOVADA_PROXY_PORT: int = 7777
-    NOVADA_STICKY_MINUTES: int = 0  # 0 = rotating; 5–120 = sticky session (один IP на N минут)
+    NOVADA_STICKY_MINUTES: int = 0  # 0 = rotating; 5–120 = sticky session
 
-    # Bright Data proxy (из .env)
+    # Bright Data proxy
     BRIGHTDATA_ENABLED: bool = False
     BRIGHTDATA_ONLY: bool = False  # True = только Bright Data, не грузить proxies.txt
     BRIGHTDATA_HOST: str = "brd.superproxy.io"
@@ -100,7 +132,9 @@ class Settings(BaseSettings):
     # Google аккаунт для оплаты (App Password: myaccount.google.com/apppasswords)
     GOOGLE_EMAIL: str = ""
     GOOGLE_APP_PASSWORD: str = ""
-    # Резервные коды Google (8-значная верификация после пароля). Один код или несколько через запятую; пробелы игнорируются. Пример: 5519 2680 или 55192680,12345678
+    # Резервные коды Google (8-значная верификация после пароля).
+    # Один код или несколько через запятую; пробелы игнорируются.
+    # Пример: 5519 2680 или 55192680,12345678
     GOOGLE_BACKUP_CODES: str = ""
 
     # External Services
