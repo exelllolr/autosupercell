@@ -1,25 +1,29 @@
 """API routes для работы с магазином Supercell Store."""
 
 import asyncio
-import re
 import random
+import re
+from typing import Dict, Optional
+
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, EmailStr
-from typing import Optional, Dict
 from loguru import logger
+from pydantic import BaseModel, EmailStr
+
+from app.api.supercell_auth_routes import _accept_cookies
 from app.config import settings
-from app.core.browser_automation import BrowserAutomation
 from app.core.ai_product_search import AIProductSearch
+from app.core.browser_automation import BrowserAutomation
 from app.core.google_pay import handle_google_pay
 from app.core.proxy_manager import proxy_manager
-from app.api.supercell_auth_routes import _accept_cookies
 
 router = APIRouter()
 
 MAX_BLOCK_RETRIES = 3
 
 
-async def _find_and_click_product(browser: "BrowserAutomation", product_name: str) -> bool:
+async def _find_and_click_product(
+    browser: "BrowserAutomation", product_name: str
+) -> bool:
     """
     Поиск карточки товара в секции GEMS и клик по ней.
     Сначала находит секцию GEMS на странице, затем ищет карточку с нужным числом гемов.
@@ -111,7 +115,9 @@ async def _find_and_click_product(browser: "BrowserAutomation", product_name: st
             await page.wait_for_timeout(600)
             bb = await el.bounding_box()
             if bb:
-                logger.info(f"Стратегия 1 (GEMS section): ({bb['x']:.0f},{bb['y']:.0f}) size={bb['width']:.0f}x{bb['height']:.0f}")
+                logger.info(
+                    f"Стратегия 1 (GEMS section): ({bb['x']:.0f},{bb['y']:.0f}) size={bb['width']:.0f}x{bb['height']:.0f}"
+                )
                 await el.click(timeout=5000)
                 return True
     except Exception as e:
@@ -128,7 +134,9 @@ async def _find_and_click_product(browser: "BrowserAutomation", product_name: st
                 await page.wait_for_timeout(400)
                 bb = await el.bounding_box()
                 if bb and bb["width"] > 20:
-                    logger.info(f"Стратегия 2 (exact get_by_text) #{i}: ({bb['x']:.0f},{bb['y']:.0f})")
+                    logger.info(
+                        f"Стратегия 2 (exact get_by_text) #{i}: ({bb['x']:.0f},{bb['y']:.0f})"
+                    )
                     await el.click(timeout=5000)
                     return True
             except Exception:
@@ -150,7 +158,9 @@ async def _find_and_click_product(browser: "BrowserAutomation", product_name: st
                 await page.wait_for_timeout(400)
                 bb = await loc.bounding_box()
                 if bb:
-                    logger.info(f"Стратегия 3 (CSS): '{css}' at ({bb['x']:.0f},{bb['y']:.0f})")
+                    logger.info(
+                        f"Стратегия 3 (CSS): '{css}' at ({bb['x']:.0f},{bb['y']:.0f})"
+                    )
                     await loc.click(timeout=5000)
                     return True
         except Exception:
@@ -175,23 +185,31 @@ async def _find_and_click_product(browser: "BrowserAutomation", product_name: st
                 to_click = None
                 parent = loc.locator("..")
                 if await parent.count() > 0:
-                    tag = await parent.evaluate("el => el ? el.tagName.toLowerCase() : ''")
+                    tag = await parent.evaluate(
+                        "el => el ? el.tagName.toLowerCase() : ''"
+                    )
                     if tag in ("button", "a"):
                         to_click = parent
                 if to_click is None:
                     grandparent = loc.locator("../..")
                     if await grandparent.count() > 0:
-                        tag = await grandparent.evaluate("el => el ? el.tagName.toLowerCase() : ''")
+                        tag = await grandparent.evaluate(
+                            "el => el ? el.tagName.toLowerCase() : ''"
+                        )
                         if tag in ("button", "a"):
                             to_click = grandparent
                 if to_click is not None:
                     await to_click.scroll_into_view_if_needed()
                     await page.wait_for_timeout(200)
                     if await to_click.is_visible():
-                        logger.info(f"Стратегия 4 (кнопка с ценой): клик по кнопке с ценой at ({bb['x']:.0f},{bb['y']:.0f})")
+                        logger.info(
+                            f"Стратегия 4 (кнопка с ценой): клик по кнопке с ценой at ({bb['x']:.0f},{bb['y']:.0f})"
+                        )
                         await to_click.click(timeout=5000)
                         return True
-                logger.info(f"Стратегия 4 (кнопка с ценой): клик по элементу с ценой at ({bb['x']:.0f},{bb['y']:.0f})")
+                logger.info(
+                    f"Стратегия 4 (кнопка с ценой): клик по элементу с ценой at ({bb['x']:.0f},{bb['y']:.0f})"
+                )
                 await loc.click(timeout=5000)
                 return True
             except Exception:
@@ -210,7 +228,9 @@ async def _find_and_click_product(browser: "BrowserAutomation", product_name: st
                         continue
                     await b.scroll_into_view_if_needed()
                     await page.wait_for_timeout(300)
-                    logger.info(f"Стратегия 5 (role=button '{label_pattern}'): клик #{i}")
+                    logger.info(
+                        f"Стратегия 5 (role=button '{label_pattern}'): клик #{i}"
+                    )
                     await b.click(timeout=5000)
                     return True
         except Exception:
@@ -220,7 +240,9 @@ async def _find_and_click_product(browser: "BrowserAutomation", product_name: st
     return False
 
 
-async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: str, desired_qty: int = 1) -> dict:
+async def _manage_cart_and_checkout(
+    browser: "BrowserAutomation", product_name: str, desired_qty: int = 1
+) -> dict:
     """
     Управление корзиной после клика по карточке товара.
 
@@ -238,7 +260,9 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
 
     # Ждём реакции страницы (URL может измениться на /product/...)
     await browser.human_like_delay(2000, 3000)
-    await browser.take_screenshot(f"after_card_click_{product_name.replace(' ', '_')}.png")
+    await browser.take_screenshot(
+        f"after_card_click_{product_name.replace(' ', '_')}.png"
+    )
 
     current_url = page.url
     logger.info(f"URL после клика по карточке: {current_url}")
@@ -247,7 +271,15 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
     # На store после клика по карточке открывается панель с "80 Gems" и кнопкой Buy;
     # без клика по ней корзина не открывается.
     buy_add_clicked = False
-    for btn_text in ["Buy", "BUY", "Add to cart", "ADD TO CART", "Add to bag", "Купить", "Добавить в корзину"]:
+    for btn_text in [
+        "Buy",
+        "BUY",
+        "Add to cart",
+        "ADD TO CART",
+        "Add to bag",
+        "Купить",
+        "Добавить в корзину",
+    ]:
         try:
             btn = page.get_by_role("button", name=re.compile(re.escape(btn_text), re.I))
             if await btn.count() > 0:
@@ -267,7 +299,13 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
             continue
     if not buy_add_clicked:
         try:
-            for sel in ['button:has-text("Buy")', 'button:has-text("BUY")', 'a:has-text("Buy")', 'button:has-text("Add to cart")', '[class*="buy"]:has-text("Buy")']:
+            for sel in [
+                'button:has-text("Buy")',
+                'button:has-text("BUY")',
+                'a:has-text("Buy")',
+                'button:has-text("Add to cart")',
+                '[class*="buy"]:has-text("Buy")',
+            ]:
                 loc = page.locator(sel).first
                 if await loc.count() > 0 and await loc.is_visible():
                     await loc.scroll_into_view_if_needed()
@@ -296,20 +334,26 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
                     to_click = None
                     parent = loc.locator("..")
                     if await parent.count() > 0:
-                        tag = await parent.evaluate("el => el ? el.tagName.toLowerCase() : ''")
+                        tag = await parent.evaluate(
+                            "el => el ? el.tagName.toLowerCase() : ''"
+                        )
                         if tag in ("button", "a"):
                             to_click = parent
                     if to_click is None:
                         grandparent = loc.locator("../..")
                         if await grandparent.count() > 0:
-                            tag = await grandparent.evaluate("el => el ? el.tagName.toLowerCase() : ''")
+                            tag = await grandparent.evaluate(
+                                "el => el ? el.tagName.toLowerCase() : ''"
+                            )
                             if tag in ("button", "a"):
                                 to_click = grandparent
                     if to_click is not None:
                         await to_click.scroll_into_view_if_needed()
                         await page.wait_for_timeout(200)
                         if await to_click.is_visible():
-                            logger.info("Нажимаем кнопку с ценой на странице продукта ($X.XX)")
+                            logger.info(
+                                "Нажимаем кнопку с ценой на странице продукта ($X.XX)"
+                            )
                             await to_click.click(timeout=5000)
                             buy_add_clicked = True
                             break
@@ -323,7 +367,9 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
             logger.debug(f"Клик по кнопке с ценой на product page: {e}")
     if buy_add_clicked:
         await browser.human_like_delay(2000, 3500)
-        await browser.take_screenshot(f"after_buy_click_{product_name.replace(' ', '_')}.png")
+        await browser.take_screenshot(
+            f"after_buy_click_{product_name.replace(' ', '_')}.png"
+        )
         # Ждём появления корзины или кнопки Checkout (панель может открываться с задержкой)
         for wait_text in ["Checkout", "1 item", "item", "Proceed to Checkout"]:
             try:
@@ -340,7 +386,10 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
         logger.info("Открылась страница продукта, ищем панель корзины...")
         # Ждём загрузки панели корзины
         try:
-            await page.wait_for_selector('[class*="cart"], [class*="Cart"], [class*="sidebar"], [class*="panel"]', timeout=15000)
+            await page.wait_for_selector(
+                '[class*="cart"], [class*="Cart"], [class*="sidebar"], [class*="panel"]',
+                timeout=15000,
+            )
         except Exception:
             pass
         await browser.human_like_delay(1000, 1500)
@@ -357,7 +406,7 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
         '[class*="CartDrawer"]',
         '[class*="mini-cart"]',
         '[class*="miniCart"]',
-        'aside',
+        "aside",
         '[role="complementary"]',
     ]
     for sel in cart_panel_selectors:
@@ -398,7 +447,9 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
         if not cart_panel_visible:
             try:
                 # Только кнопки корзины/сумки, не главная кнопка "Checkout" (она внизу панели)
-                cart_btn = page.get_by_role("button", name=re.compile(r"cart|корзин|bag|items?", re.I))
+                cart_btn = page.get_by_role(
+                    "button", name=re.compile(r"cart|корзин|bag|items?", re.I)
+                )
                 if await cart_btn.count() > 0:
                     await cart_btn.first.click(timeout=3000)
                     logger.info("Нажата кнопка корзины (role=button по тексту)")
@@ -451,7 +502,9 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
     cart_stats = await _read_cart_stats()
     total_items = cart_stats.get("totalItems") or 1
     line_count = cart_stats.get("lineCount") or 1
-    logger.info(f"В корзине: всего товаров={total_items}, позиций (линий)={line_count}, нужно оставить={desired_qty}")
+    logger.info(
+        f"В корзине: всего товаров={total_items}, позиций (линий)={line_count}, нужно оставить={desired_qty}"
+    )
 
     # Прокручиваем панель корзины (drawer), чтобы блок количества (- 5 +) был в зоне видимости
     try:
@@ -512,9 +565,16 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
         if not clicked:
             # 2) Playwright: кнопка "−" внутри корзины по роли и тексту
             try:
-                cart_loc = page.locator('[class*="drawer"], [class*="Drawer"], [class*="cart"], [class*="Cart"], aside').first
+                cart_loc = page.locator(
+                    '[class*="drawer"], [class*="Drawer"], [class*="cart"], [class*="Cart"], aside'
+                ).first
                 if await cart_loc.count() > 0:
-                    minus_btn = cart_loc.get_by_role("button", name=re.compile(r"decrease|minus|less|уменьшить|^[\s\-−–]+$", re.I)).first
+                    minus_btn = cart_loc.get_by_role(
+                        "button",
+                        name=re.compile(
+                            r"decrease|minus|less|уменьшить|^[\s\-−–]+$", re.I
+                        ),
+                    ).first
                     if await minus_btn.count() > 0:
                         await minus_btn.scroll_into_view_if_needed()
                         await page.wait_for_timeout(200)
@@ -524,7 +584,9 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
                 pass
         if not clicked:
             try:
-                minus_btn = page.locator('[class*="cart"] button:has-text("-"), [class*="cart"] [role="button"]:has-text("-"), [class*="drawer"] button:has-text("-")').first
+                minus_btn = page.locator(
+                    '[class*="cart"] button:has-text("-"), [class*="cart"] [role="button"]:has-text("-"), [class*="drawer"] button:has-text("-")'
+                ).first
                 if await minus_btn.count() > 0 and await minus_btn.is_visible():
                     await minus_btn.scroll_into_view_if_needed()
                     await minus_btn.click(timeout=3000)
@@ -532,7 +594,9 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
             except Exception:
                 pass
         if not clicked:
-            logger.warning("Кнопка «−» для уменьшения количества не найдена или не сработала")
+            logger.warning(
+                "Кнопка «−» для уменьшения количества не найдена или не сработала"
+            )
             break
         minus_clicks_done += 1
         await browser.human_like_delay(400, 600)
@@ -542,7 +606,9 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
         if total_items <= desired_qty:
             break
     if minus_clicks_done > 0:
-        logger.info(f"Уменьшено количество: нажатий − = {minus_clicks_done}, теперь всего товаров={total_items}")
+        logger.info(
+            f"Уменьшено количество: нажатий − = {minus_clicks_done}, теперь всего товаров={total_items}"
+        )
 
     # Удаляем лишние позиции (оставляем одну): кнопки Remove / Delete / × / trash
     while line_count > 1:
@@ -572,7 +638,9 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
         cart_stats = await _read_cart_stats()
         line_count = cart_stats.get("lineCount") or (line_count - 1)
         total_items = cart_stats.get("totalItems") or total_items
-        logger.info(f"Удалена одна позиция из корзины, осталось позиций={line_count}, товаров={total_items}")
+        logger.info(
+            f"Удалена одна позиция из корзины, осталось позиций={line_count}, товаров={total_items}"
+        )
 
     cart_qty = total_items
 
@@ -581,19 +649,30 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
         diff = desired_qty - cart_qty
         need_plus = diff > 0
         clicks_needed = abs(diff)
-        logger.info(f"Корректируем количество: {cart_qty} → {desired_qty} (нажимаем {'+' if need_plus else '−'} x{clicks_needed})")
+        logger.info(
+            f"Корректируем количество: {cart_qty} → {desired_qty} (нажимаем {'+' if need_plus else '−'} x{clicks_needed})"
+        )
 
         for _ in range(clicks_needed):
             clicked_adj = False
             # Варианты минуса: обычный дефис и Unicode minus
             minus_selectors = [
-                'button:has-text("−")', 'button:has-text("-")', '[aria-label*="decrease"]', '[aria-label*="minus"]',
-                '[class*="qty"] button:has-text("-")', '[class*="quantity"] button:has-text("-")',
-                'button:has-text("–")', '[role="button"]:has-text("−")', '[role="button"]:has-text("-")',
+                'button:has-text("−")',
+                'button:has-text("-")',
+                '[aria-label*="decrease"]',
+                '[aria-label*="minus"]',
+                '[class*="qty"] button:has-text("-")',
+                '[class*="quantity"] button:has-text("-")',
+                'button:has-text("–")',
+                '[role="button"]:has-text("−")',
+                '[role="button"]:has-text("-")',
             ]
             plus_selectors = [
-                'button:has-text("+")', '[aria-label*="increase"]', '[aria-label*="plus"]',
-                '[class*="qty"] button:has-text("+")', '[class*="quantity"] button:has-text("+")',
+                'button:has-text("+")',
+                '[aria-label*="increase"]',
+                '[aria-label*="plus"]',
+                '[class*="qty"] button:has-text("+")',
+                '[class*="quantity"] button:has-text("+")',
                 '[role="button"]:has-text("+")',
             ]
             selectors = plus_selectors if need_plus else minus_selectors
@@ -605,7 +684,9 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
                         await page.wait_for_timeout(200)
                         await loc.click(timeout=3000)
                         clicked_adj = True
-                        logger.info(f"Нажата кнопка {'+' if need_plus else '−'} для количества")
+                        logger.info(
+                            f"Нажата кнопка {'+' if need_plus else '−'} для количества"
+                        )
                         await browser.human_like_delay(400, 700)
                         break
                 except Exception:
@@ -613,7 +694,17 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
             if not clicked_adj:
                 # Fallback: get_by_role по имени кнопки
                 try:
-                    btn = page.get_by_role("button", name=re.compile(r"increase|plus|more|добавить", re.I)) if need_plus else page.get_by_role("button", name=re.compile(r"decrease|minus|less|уменьшить", re.I))
+                    btn = (
+                        page.get_by_role(
+                            "button",
+                            name=re.compile(r"increase|plus|more|добавить", re.I),
+                        )
+                        if need_plus
+                        else page.get_by_role(
+                            "button",
+                            name=re.compile(r"decrease|minus|less|уменьшить", re.I),
+                        )
+                    )
                     if await btn.count() > 0:
                         await btn.first.click(timeout=3000)
                         clicked_adj = True
@@ -649,12 +740,16 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
                     )
                     if clicked_js:
                         clicked_adj = True
-                        logger.info(f"Нажата кнопка {'+' if need_plus else '−'} (JS fallback)")
+                        logger.info(
+                            f"Нажата кнопка {'+' if need_plus else '−'} (JS fallback)"
+                        )
                         await browser.human_like_delay(400, 700)
                 except Exception:
                     pass
             if not clicked_adj:
-                logger.warning(f"Не удалось нажать кнопку {'+' if need_plus else '−'} для корректировки количества")
+                logger.warning(
+                    f"Не удалось нажать кнопку {'+' if need_plus else '−'} для корректировки количества"
+                )
                 break
         await browser.human_like_delay(500, 800)
 
@@ -665,7 +760,9 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
     total_items = cart_stats.get("totalItems") or 1
     line_count = cart_stats.get("lineCount") or 1
     if total_items > desired_qty:
-        logger.info(f"Перед Checkout количество ещё {total_items}, повторяем уменьшение до {desired_qty}")
+        logger.info(
+            f"Перед Checkout количество ещё {total_items}, повторяем уменьшение до {desired_qty}"
+        )
         for _ in range(min(total_items - desired_qty, 30)):
             try:
                 clicked = await page.evaluate(
@@ -695,10 +792,14 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
         logger.info(f"После повторного уменьшения: всего товаров={total_items}")
 
     if total_items > desired_qty:
-        logger.warning(f"Не удалось привести количество к {desired_qty}, в корзине {total_items}. Checkout не нажимаем.")
+        logger.warning(
+            f"Не удалось привести количество к {desired_qty}, в корзине {total_items}. Checkout не нажимаем."
+        )
     else:
         try:
-            await browser.take_screenshot(f"cart_ready_{product_name.replace(' ', '_')}.png")
+            await browser.take_screenshot(
+                f"cart_ready_{product_name.replace(' ', '_')}.png"
+            )
         except Exception as e:
             logger.debug(f"Скриншот cart_ready пропущен: {e}")
 
@@ -749,15 +850,21 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
                     result["checkout_opened"] = True
                     try:
                         await browser.human_like_delay(2000, 3000)
-                        await browser.take_screenshot(f"checkout_{product_name.replace(' ', '_')}.png")
+                        await browser.take_screenshot(
+                            f"checkout_{product_name.replace(' ', '_')}.png"
+                        )
                     except Exception as screenshot_err:
-                        logger.debug(f"Скриншот после Checkout пропущен (страница ушла): {screenshot_err}")
+                        logger.debug(
+                            f"Скриншот после Checkout пропущен (страница ушла): {screenshot_err}"
+                        )
                     break
             except Exception:
                 continue
         if not result["checkout_opened"]:
             try:
-                checkout_btn = page.get_by_role("button", name=re.compile(r"checkout|оформить|proceed", re.I))
+                checkout_btn = page.get_by_role(
+                    "button", name=re.compile(r"checkout|оформить|proceed", re.I)
+                )
                 if await checkout_btn.count() > 0:
                     await checkout_btn.first.scroll_into_view_if_needed()
                     await browser.human_like_delay(500, 800)
@@ -766,26 +873,42 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
                     result["checkout_opened"] = True
                     try:
                         await browser.human_like_delay(2000, 3000)
-                        await browser.take_screenshot(f"checkout_{product_name.replace(' ', '_')}.png")
+                        await browser.take_screenshot(
+                            f"checkout_{product_name.replace(' ', '_')}.png"
+                        )
                     except Exception as screenshot_err:
-                        logger.debug(f"Скриншот после Checkout пропущен: {screenshot_err}")
+                        logger.debug(
+                            f"Скриншот после Checkout пропущен: {screenshot_err}"
+                        )
             except Exception:
                 pass
 
         if not result["checkout_opened"]:
             try:
-                for text_pat in ["Checkout", "Proceed to Checkout", "Proceed", "Place order", "Go to checkout"]:
+                for text_pat in [
+                    "Checkout",
+                    "Proceed to Checkout",
+                    "Proceed",
+                    "Place order",
+                    "Go to checkout",
+                ]:
                     loc = page.get_by_text(re.compile(re.escape(text_pat), re.I)).first
                     if await loc.count() > 0:
                         await loc.scroll_into_view_if_needed()
                         await page.wait_for_timeout(400)
                         if await loc.is_visible():
-                            await loc.evaluate("el => { const b = el.closest('button, a, [role=\"button\"]'); (b || el).click(); }")
-                            logger.info(f"Нажата кнопка Checkout (get_by_text): '{text_pat}'")
+                            await loc.evaluate(
+                                "el => { const b = el.closest('button, a, [role=\"button\"]'); (b || el).click(); }"
+                            )
+                            logger.info(
+                                f"Нажата кнопка Checkout (get_by_text): '{text_pat}'"
+                            )
                             result["checkout_opened"] = True
                             try:
                                 await browser.human_like_delay(2000, 3000)
-                                await browser.take_screenshot(f"checkout_{product_name.replace(' ', '_')}.png")
+                                await browser.take_screenshot(
+                                    f"checkout_{product_name.replace(' ', '_')}.png"
+                                )
                             except Exception:
                                 pass
                             break
@@ -818,7 +941,9 @@ async def _manage_cart_and_checkout(browser: "BrowserAutomation", product_name: 
                     result["checkout_opened"] = True
                     try:
                         await browser.human_like_delay(2000, 3000)
-                        await browser.take_screenshot(f"checkout_{product_name.replace(' ', '_')}.png")
+                        await browser.take_screenshot(
+                            f"checkout_{product_name.replace(' ', '_')}.png"
+                        )
                     except Exception:
                         pass
             except Exception as e:
@@ -862,7 +987,9 @@ async def run_purchase_flow_after_login(
 
     logger.info("Управление корзиной: проверка количества и Checkout...")
     try:
-        cart_result = await _manage_cart_and_checkout(browser, product_name, desired_qty=1)
+        cart_result = await _manage_cart_and_checkout(
+            browser, product_name, desired_qty=1
+        )
     except Exception as e:
         logger.exception("Ошибка при управлении корзиной/Checkout")
         return {
@@ -884,7 +1011,11 @@ async def run_purchase_flow_after_login(
         "message": (
             f"Товар «{product_name}» добавлен в корзину, окно оформления заказа открыто"
             if (added and checkout_opened)
-            else (f"Товар «{product_name}» добавлен в корзину" if added else "Корзина или Checkout не найдены")
+            else (
+                f"Товар «{product_name}» добавлен в корзину"
+                if added
+                else "Корзина или Checkout не найдены"
+            )
         ),
         "session_id": session_id,
     }
@@ -895,7 +1026,9 @@ class PurchaseRequest(BaseModel):
 
     email: EmailStr
     verification_code: Optional[str] = None  # Код верификации (если уже известен)
-    email_password: Optional[str] = None  # Пароль для доступа к email (для получения кода)
+    email_password: Optional[str] = (
+        None  # Пароль для доступа к email (для получения кода)
+    )
     game: str = "brawl-stars"  # Игра: "brawl-stars" или "clash-royale"
     product_name: str = "80 Gems"  # Название товара для поиска
     product_type: str = "gems"  # Тип товара: "gems", "cards", etc.
@@ -911,7 +1044,9 @@ async def purchase_product(request: PurchaseRequest):
     в отдельном потоке со своим ProactorEventLoop.
     """
     import sys as _sys
+
     if _sys.platform == "win32":
+
         def _run_in_proactor():
             loop = asyncio.ProactorEventLoop()
             asyncio.set_event_loop(loop)
@@ -919,6 +1054,7 @@ async def purchase_product(request: PurchaseRequest):
                 return loop.run_until_complete(_purchase_flow(request))
             finally:
                 loop.close()
+
         return await asyncio.get_event_loop().run_in_executor(None, _run_in_proactor)
     return await _purchase_flow(request)
 
@@ -939,12 +1075,40 @@ async def _purchase_flow(request: PurchaseRequest):
             logger.info("Шаг 1: Авторизация в Supercell Store...")
             await browser.start()
 
-            # Как в full-auth: переход на store, пауза, принятие cookies
-            await browser.page.goto(
-                "https://store.supercell.com",
-                wait_until="domcontentloaded",
-                timeout=60000
-            )
+            # Прогрев: посещение supercell.com до store — снижает вероятность Cloudflare-блокировки
+            # (как в supercell_auth_routes.py — естественная цепочка для антибота)
+            if getattr(settings, "BROWSER_WARMUP_VISIT_SUPERCELL", True):
+                try:
+                    logger.info("Прогрев: переход на supercell.com перед store...")
+                    await browser.page.goto(
+                        "https://www.supercell.com",
+                        wait_until="domcontentloaded",
+                        timeout=20000,
+                    )
+                    await browser.human_like_delay(2000, 4000)
+                    logger.info("Прогрев supercell.com завершён")
+                except Exception as warmup_err:
+                    logger.debug("Прогрев supercell.com пропущен: %s", warmup_err)
+
+            # Переход на store, пауза, принятие cookies
+            logger.info("Переход на store.supercell.com...")
+            for _store_attempt in range(2):
+                try:
+                    await browser.page.goto(
+                        "https://store.supercell.com",
+                        wait_until="domcontentloaded",
+                        timeout=60000,
+                    )
+                    break
+                except Exception as store_err:
+                    if _store_attempt == 0:
+                        logger.warning(
+                            "Первая попытка загрузки store не удалась (%s), повтор...",
+                            store_err,
+                        )
+                        await asyncio.sleep(3)
+                    else:
+                        raise
             await browser.page.wait_for_timeout(3000)
             cookies_ok = await _accept_cookies(browser)
             if not cookies_ok:
@@ -953,15 +1117,23 @@ async def _purchase_flow(request: PurchaseRequest):
             await browser.human_like_delay(2000, 3000)
 
             current_url = browser.page.url
-            page_text = await browser.page.evaluate("() => document.body.innerText.toLowerCase()")
+            page_text = await browser.page.evaluate(
+                "() => document.body.innerText.toLowerCase()"
+            )
             is_logged_in = (
                 "store.supercell.com" in current_url
                 and "login" not in current_url.lower()
-                and ("logout" in page_text or "sign out" in page_text or "account" in page_text)
+                and (
+                    "logout" in page_text
+                    or "sign out" in page_text
+                    or "account" in page_text
+                )
             )
 
             if not is_logged_in:
-                logger.info("Требуется авторизация, выполняем вход в том же браузере...")
+                logger.info(
+                    "Требуется авторизация, выполняем вход в том же браузере..."
+                )
                 from app.core.email_code_reader import EmailCodeReader
 
                 login_selectors = [
@@ -969,7 +1141,7 @@ async def _purchase_flow(request: PurchaseRequest):
                     'a:has-text("Sign in")',
                     'button:has-text("Log in")',
                     '[href*="login"]',
-                    'text=Log in',
+                    "text=Log in",
                 ]
                 login_clicked = False
                 for selector in login_selectors:
@@ -984,59 +1156,178 @@ async def _purchase_flow(request: PurchaseRequest):
                         continue
                 if not login_clicked:
                     try:
-                        await browser.page.click('text=Log in', timeout=5000)
+                        await browser.page.click("text=Log in", timeout=5000)
                         login_clicked = True
                     except Exception:
                         pass
 
+                # ── Вспомогательная функция: ожидание прохождения Cloudflare challenge ──
+                async def _wait_for_cloudflare(max_wait_sec: int = 30) -> bool:
+                    """
+                    Ожидает, пока Cloudflare challenge страница ("Just a moment..." / "Checking your browser")
+                    не разрешится в реальную страницу. Возвращает True если challenge прошёл, False если нет.
+                    Cloudflare challenge типичен для VPS/datacenter IP без прокси.
+                    """
+                    cf_phrases = (
+                        "just a moment",
+                        "checking your browser",
+                        "please wait",
+                        "ray id",
+                        "cloudflare",
+                        "enable javascript",
+                        "enable cookies",
+                        "one more step",
+                        "please turn javascript on",
+                        "attention required",
+                    )
+                    for elapsed in range(max_wait_sec):
+                        try:
+                            body_text = (
+                                await browser.page.evaluate(
+                                    "() => document.body.innerText"
+                                )
+                            ).lower()
+                            title = (
+                                await browser.page.evaluate("() => document.title")
+                            ).lower()
+                            is_cf = any(
+                                p in body_text or p in title for p in cf_phrases
+                            )
+                            has_email_input = bool(
+                                await browser.page.query_selector(
+                                    'input[type="email"], input[name="email"]'
+                                )
+                            )
+                            if not is_cf or has_email_input:
+                                if elapsed > 0:
+                                    logger.info(
+                                        "Cloudflare challenge прошёл через %d сек. URL: %s",
+                                        elapsed,
+                                        browser.page.url,
+                                    )
+                                return True
+                            if elapsed == 0:
+                                logger.warning(
+                                    "Обнаружен Cloudflare challenge (%s). "
+                                    "Ждём до %d сек. "
+                                    "Это типично для VPS-IP без резидентного прокси. "
+                                    "Рекомендуется включить прокси (Novada/BrightData) в .env.",
+                                    title or body_text[:80],
+                                    max_wait_sec,
+                                )
+                                await browser.take_screenshot(
+                                    f"cloudflare_challenge_{session_id}.png"
+                                )
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1)
+                    logger.error(
+                        "Cloudflare challenge не прошёл за %d сек. URL: %s — "
+                        "IP-адрес сервера заблокирован. Включите резидентный прокси в .env.",
+                        max_wait_sec,
+                        browser.page.url,
+                    )
+                    return False
+
+                # ── Навигация на страницу логина ─────────────────────────────────────────
                 if login_clicked:
                     logger.info("Переход на страницу авторизации (ждём редирект)...")
                     try:
                         await browser.page.wait_for_url(
-                            lambda url: "accounts.supercell.com" in url or "id.supercell.com" in url,
+                            lambda url: (
+                                "accounts.supercell.com" in url
+                                or "id.supercell.com" in url
+                            ),
                             timeout=15000,
                         )
                         logger.info(f"Редирект выполнен: {browser.page.url}")
                     except Exception:
-                        logger.warning("Редирект не произошёл, переходим на accounts.supercell.com/login")
+                        logger.warning(
+                            "Редирект не произошёл, переходим на accounts.supercell.com/en/login"
+                        )
+                        login_fallback_urls = [
+                            "https://accounts.supercell.com/en/login",
+                            "https://accounts.supercell.com/login",
+                        ]
+                        for fallback_url in login_fallback_urls:
+                            try:
+                                await browser.page.goto(
+                                    fallback_url,
+                                    wait_until="domcontentloaded",
+                                    timeout=30000,
+                                )
+                                logger.info("Переход на fallback URL: %s", fallback_url)
+                                break
+                            except Exception as e:
+                                logger.debug(
+                                    "Ошибка перехода на %s: %s", fallback_url, e
+                                )
+                else:
+                    logger.warning(
+                        "Кнопка входа не найдена, переходим напрямую на страницу логина"
+                    )
+                    login_fallback_urls = [
+                        "https://accounts.supercell.com/en/login",
+                        "https://accounts.supercell.com/login",
+                    ]
+                    for fallback_url in login_fallback_urls:
                         try:
                             await browser.page.goto(
-                                "https://accounts.supercell.com/login",
+                                fallback_url,
                                 wait_until="domcontentloaded",
                                 timeout=30000,
                             )
+                            logger.info("Переход на fallback URL: %s", fallback_url)
+                            break
                         except Exception as e:
-                            logger.debug(f"Ошибка перехода: {e}")
-                else:
-                    logger.warning("Кнопка входа не найдена, переходим на accounts.supercell.com/login")
-                    try:
-                        await browser.page.goto(
-                            "https://accounts.supercell.com/login",
-                            wait_until="domcontentloaded",
-                            timeout=30000,
-                        )
-                    except Exception as e:
-                        logger.debug(f"Ошибка перехода: {e}")
+                            logger.debug("Ошибка перехода на %s: %s", fallback_url, e)
 
-                await browser.page.wait_for_load_state("domcontentloaded", timeout=15000)
+                try:
+                    await browser.page.wait_for_load_state(
+                        "domcontentloaded", timeout=15000
+                    )
+                except Exception:
+                    pass
+                logger.info("Страница логина загружена: %s", browser.page.url)
+
+                # Ожидаем Cloudflare challenge (если VPS-IP без прокси)
+                await _wait_for_cloudflare(max_wait_sec=30)
+
                 await browser.human_like_delay(800, 1500)
                 await _accept_cookies(browser)
                 await browser.human_like_delay(500, 1000)
 
+                # Скриншот страницы логина — ДО поиска email, чтобы было видно что произошло
+                await browser.take_screenshot(
+                    f"login_page_before_email_{session_id}.png"
+                )
+                logger.info(
+                    "Страница логина — URL: %s | title: %s",
+                    browser.page.url,
+                    await browser.page.evaluate("() => document.title"),
+                )
+
                 current_url = browser.page.url
                 if "id.supercell.com" in current_url:
-                    for sel in ['button:has-text("LOG IN")', 'button:has-text("Log in")', 'a:has-text("Log in")']:
+                    for sel in [
+                        'button:has-text("LOG IN")',
+                        'button:has-text("Log in")',
+                        'a:has-text("Log in")',
+                    ]:
                         try:
                             el = await browser.page.wait_for_selector(sel, timeout=4000)
                             if el and await el.is_visible():
                                 await el.click()
-                                logger.info(f"Кнопка входа на странице id нажата: {sel}")
+                                logger.info(
+                                    f"Кнопка входа на странице id нажата: {sel}"
+                                )
                                 await browser.human_like_delay(2000, 3000)
                                 await _accept_cookies(browser)
                                 break
                         except Exception:
                             continue
 
+                # Даём reCAPTCHA / SPA-роутеру время «устояться»
                 await browser.human_like_delay(6000, 11000)
                 try:
                     for _ in range(random.randint(2, 4)):
@@ -1044,16 +1335,28 @@ async def _purchase_flow(request: PurchaseRequest):
                         ry = random.randint(200, 500)
                         await browser.page.mouse.move(rx, ry)
                         await browser.page.wait_for_timeout(random.randint(400, 900))
-                    await browser.page.evaluate("window.scrollBy({ top: 60, behavior: 'smooth' })")
+                    await browser.page.evaluate(
+                        "window.scrollBy({ top: 60, behavior: 'smooth' })"
+                    )
                     await browser.page.wait_for_timeout(random.randint(500, 1200))
                 except Exception:
                     pass
                 await browser.human_like_delay(1000, 2000)
+
                 try:
-                    page_text_pre = (await browser.page.evaluate("() => document.body.innerText")).lower()
-                    if "something went wrong" in page_text_pre or "try again later" in page_text_pre:
-                        logger.warning("«Something went wrong» на странице логина — перезагрузка")
-                        await browser.page.reload(wait_until="domcontentloaded", timeout=60000)
+                    page_text_pre = (
+                        await browser.page.evaluate("() => document.body.innerText")
+                    ).lower()
+                    if (
+                        "something went wrong" in page_text_pre
+                        or "try again later" in page_text_pre
+                    ):
+                        logger.warning(
+                            "«Something went wrong» на странице логина — перезагрузка"
+                        )
+                        await browser.page.reload(
+                            wait_until="domcontentloaded", timeout=60000
+                        )
                         await browser.human_like_delay(8000, 12000)
                         await _accept_cookies(browser)
                         await browser.human_like_delay(1000, 2000)
@@ -1077,7 +1380,9 @@ async def _purchase_flow(request: PurchaseRequest):
                 for i, selector in enumerate(email_selectors):
                     timeout_ms = 30000 if i == 0 else 10000
                     try:
-                        email_input = await browser.page.wait_for_selector(selector, timeout=timeout_ms)
+                        email_input = await browser.page.wait_for_selector(
+                            selector, timeout=timeout_ms
+                        )
                         if email_input:
                             found_email_selector = selector
                             logger.info(f"Найдено поле email: {selector}")
@@ -1086,12 +1391,18 @@ async def _purchase_flow(request: PurchaseRequest):
                         continue
 
                 if not email_input:
-                    logger.info("Поле email не найдено, повторно проверяем баннер cookies...")
+                    logger.info(
+                        "Поле email не найдено с первой попытки — принимаем cookies и ждём ещё..."
+                    )
                     await _accept_cookies(browser)
                     await browser.human_like_delay(2000, 3000)
+                    # Ещё одно ожидание Cloudflare (мог не пройти сразу)
+                    await _wait_for_cloudflare(max_wait_sec=20)
                     for selector in email_selectors:
                         try:
-                            email_input = await browser.page.wait_for_selector(selector, timeout=8000)
+                            email_input = await browser.page.wait_for_selector(
+                                selector, timeout=8000
+                            )
                             if email_input:
                                 found_email_selector = selector
                                 break
@@ -1099,17 +1410,118 @@ async def _purchase_flow(request: PurchaseRequest):
                             continue
 
                 if not email_input:
-                    page_text = (await browser.page.evaluate("() => document.body.innerText")).lower()
-                    if "something went wrong" in page_text or "try again later" in page_text:
+                    # Финальная попытка — попробовать альтернативный URL логина
+                    alt_login_url = (
+                        "https://accounts.supercell.com/en/login"
+                        if "en/login" not in browser.page.url
+                        else "https://accounts.supercell.com/login"
+                    )
+                    logger.warning(
+                        "Email-поле не найдено на %s — пробуем альтернативный URL: %s",
+                        browser.page.url,
+                        alt_login_url,
+                    )
+                    try:
+                        await browser.page.goto(
+                            alt_login_url, wait_until="domcontentloaded", timeout=30000
+                        )
+                        await _wait_for_cloudflare(max_wait_sec=20)
+                        await browser.human_like_delay(3000, 5000)
+                        await _accept_cookies(browser)
+                        for selector in email_selectors:
+                            try:
+                                email_input = await browser.page.wait_for_selector(
+                                    selector, timeout=10000
+                                )
+                                if email_input:
+                                    found_email_selector = selector
+                                    break
+                            except Exception:
+                                continue
+                    except Exception as alt_err:
+                        logger.warning(
+                            "Альтернативный URL также не сработал: %s", alt_err
+                        )
+
+                if not email_input:
+                    # Сбор диагностики перед броском исключения
+                    current_url_diag = browser.page.url
+                    page_title_diag = ""
+                    page_text_diag = ""
+                    page_html_short = ""
+                    try:
+                        page_title_diag = await browser.page.evaluate(
+                            "() => document.title"
+                        )
+                        page_text_diag = (
+                            await browser.page.evaluate("() => document.body.innerText")
+                        ).lower()[:500]
+                        page_html_short = (await browser.page.content())[:1000]
+                        logger.error(
+                            "Email-поле не найдено.\n"
+                            "  URL: %s\n"
+                            "  Title: %s\n"
+                            "  Текст страницы (первые 500 символов): %s\n"
+                            "  HTML (первые 1000 символов): %s",
+                            current_url_diag,
+                            page_title_diag,
+                            page_text_diag,
+                            page_html_short,
+                        )
+                        await browser.take_screenshot(
+                            f"no_email_field_final_{session_id}.png"
+                        )
+                    except Exception:
+                        pass
+
+                    cf_phrases_check = (
+                        "just a moment",
+                        "checking your browser",
+                        "cloudflare",
+                        "ray id",
+                        "one more step",
+                    )
+                    if any(p in page_text_diag for p in cf_phrases_check):
                         raise Exception(
-                            "Supercell ID вернул «Something went wrong». Попробуйте позже или с другим прокси."
+                            f"Cloudflare заблокировал доступ к странице входа Supercell (URL: {current_url_diag}, title: '{page_title_diag}'). "
+                            "Это происходит при запуске с IP датацентра/VPS без резидентного прокси. "
+                            "Решение: включите резидентный прокси в .env (NOVADA_ENABLED=true + ключи, или BRIGHTDATA_ENABLED=true). "
+                            "Скриншот: screenshots/cloudflare_challenge_*.png"
+                        )
+                    if (
+                        "something went wrong" in page_text_diag
+                        or "try again later" in page_text_diag
+                    ):
+                        raise Exception(
+                            f"Supercell ID вернул «Something went wrong» (URL: {current_url_diag}). "
+                            "Попробуйте позже или с другим прокси."
+                        )
+                    if (
+                        "blocked" in page_text_diag
+                        or "unusual activity" in page_text_diag
+                    ):
+                        raise Exception(
+                            f"Supercell заблокировал вход (unusual activity) (URL: {current_url_diag}). "
+                            "Используйте резидентный прокси или попробуйте позже."
                         )
                     raise Exception(
-                        "Поле email не найдено на странице входа. Проверьте скриншот; возможна ошибка Supercell ID или блокировка."
+                        f"Поле email не найдено на странице входа. "
+                        f"URL: {current_url_diag} | Title: '{page_title_diag}'. "
+                        "Возможные причины: Cloudflare challenge (VPS без прокси), "
+                        "страница не загрузилась или изменилась структура Supercell ID. "
+                        "Скриншот: screenshots/no_email_field_final_*.png и login_page_before_email_*.png. "
+                        "Рекомендации: 1) включить резидентный прокси (Novada/BrightData), "
+                        "2) BROWSER_USE_PATCHRIGHT=true в .env, "
+                        "3) проверить скриншоты для точной диагностики."
                     )
 
-                page_text_before = (await browser.page.evaluate("() => document.body.innerText")).lower()
-                if "blocked your login request" in page_text_before or "unusual activity" in page_text_before:
+                page_text_before = (
+                    await browser.page.evaluate("() => document.body.innerText")
+                ).lower()
+                if (
+                    "blocked your login request" in page_text_before
+                    or "unusual activity" in page_text_before
+                ):
                     raise Exception(
                         "Supercell заблокировал вход (unusual activity). Отключите прокси (PROXY_ENABLED=false) или попробуйте позже."
                     )
@@ -1122,12 +1534,16 @@ async def _purchase_flow(request: PurchaseRequest):
                         if box:
                             await browser.page.mouse.move(
                                 box["x"] + box["width"] * 0.3,
-                                box["y"] + box["height"] * 0.5
+                                box["y"] + box["height"] * 0.5,
                             )
-                            await browser.page.wait_for_timeout(random.randint(200, 400))
+                            await browser.page.wait_for_timeout(
+                                random.randint(200, 400)
+                            )
                 except Exception:
                     pass
-                await browser.human_like_type(found_email_selector, request.email, delay_between_chars=130)
+                await browser.human_like_type(
+                    found_email_selector, request.email, delay_between_chars=130
+                )
                 await browser.human_like_delay(800, 1500)
                 entered_email = await browser.page.input_value(found_email_selector)
                 if entered_email != request.email:
@@ -1135,11 +1551,18 @@ async def _purchase_flow(request: PurchaseRequest):
                     await browser.page.wait_for_timeout(random.randint(50, 150))
                     await browser.page.keyboard.press("Delete")
                     await browser.human_like_delay(200, 400)
-                    await browser.human_like_type(found_email_selector, request.email, delay_between_chars=130)
+                    await browser.human_like_type(
+                        found_email_selector, request.email, delay_between_chars=130
+                    )
                     await browser.human_like_delay(500, 1000)
 
-                page_text_before_click = (await browser.page.evaluate("() => document.body.innerText")).lower()
-                if "blocked your login request" in page_text_before_click or "unusual activity" in page_text_before_click:
+                page_text_before_click = (
+                    await browser.page.evaluate("() => document.body.innerText")
+                ).lower()
+                if (
+                    "blocked your login request" in page_text_before_click
+                    or "unusual activity" in page_text_before_click
+                ):
                     raise Exception(
                         "Supercell заблокировал вход (unusual activity) на шаге ввода email. "
                         "Отключите прокси (PROXY_ENABLED=false) или попробуйте резидентный прокси."
@@ -1152,18 +1575,24 @@ async def _purchase_flow(request: PurchaseRequest):
                     f"form:has({found_email_selector}) button",
                 ]
                 continue_selectors = form_scoped + [
-                    'button:has-text("Send code")', 'button:has-text("Get code")',
-                    'button:has-text("Next")', 'button:has-text("Continue")',
-                    'button:has-text("Log in")', 'button:has-text("Sign in")',
-                    'button[type="submit"]', 'input[type="submit"]',
+                    'button:has-text("Send code")',
+                    'button:has-text("Get code")',
+                    'button:has-text("Next")',
+                    'button:has-text("Continue")',
+                    'button:has-text("Log in")',
+                    'button:has-text("Sign in")',
+                    'button[type="submit"]',
+                    'input[type="submit"]',
                 ]
 
                 if getattr(settings, "CAPTCHA_2CAPTCHA_API_KEY", ""):
                     try:
                         from app.core.recaptcha_solver import solve_recaptcha_enterprise
+
                         captcha_token = await solve_recaptcha_enterprise(
                             api_key=settings.CAPTCHA_2CAPTCHA_API_KEY,
-                            page_url=browser.page.url or "https://accounts.supercell.com/login",
+                            page_url=browser.page.url
+                            or "https://accounts.supercell.com/login",
                             timeout=120,
                         )
                         if captcha_token:
@@ -1203,9 +1632,13 @@ async def _purchase_flow(request: PurchaseRequest):
                                 )
                             except Exception:
                                 pass
-                            logger.info("2Captcha: токен reCAPTCHA подставлен перед LOG IN")
+                            logger.info(
+                                "2Captcha: токен reCAPTCHA подставлен перед LOG IN"
+                            )
                         else:
-                            logger.warning("2Captcha не вернул токен — продолжаем без него")
+                            logger.warning(
+                                "2Captcha не вернул токен — продолжаем без него"
+                            )
                     except Exception as e:
                         logger.debug(f"2Captcha при покупке: {e}")
 
@@ -1214,7 +1647,9 @@ async def _purchase_flow(request: PurchaseRequest):
                 continue_clicked = False
                 for selector in continue_selectors:
                     try:
-                        element = await browser.page.wait_for_selector(selector, timeout=3000)
+                        element = await browser.page.wait_for_selector(
+                            selector, timeout=3000
+                        )
                         if not element or not await element.is_visible():
                             continue
                         box = await element.bounding_box()
@@ -1223,11 +1658,19 @@ async def _purchase_flow(request: PurchaseRequest):
                         target_x = box["x"] + box["width"] * random.uniform(0.35, 0.65)
                         target_y = box["y"] + box["height"] * random.uniform(0.35, 0.65)
                         try:
-                            email_box = await browser.page.query_selector(found_email_selector)
+                            email_box = await browser.page.query_selector(
+                                found_email_selector
+                            )
                             if email_box:
                                 eb = await email_box.bounding_box()
-                                start_x = eb["x"] + eb["width"] * 0.5 if eb else target_x - 50
-                                start_y = eb["y"] + eb["height"] * 0.5 if eb else target_y - 80
+                                start_x = (
+                                    eb["x"] + eb["width"] * 0.5 if eb else target_x - 50
+                                )
+                                start_y = (
+                                    eb["y"] + eb["height"] * 0.5
+                                    if eb
+                                    else target_y - 80
+                                )
                             else:
                                 start_x, start_y = target_x - 50, target_y - 80
                         except Exception:
@@ -1237,12 +1680,24 @@ async def _purchase_flow(request: PurchaseRequest):
                         steps = random.randint(12, 20)
                         for i in range(steps):
                             t = (i + 1) / steps
-                            bx = (1 - t) ** 2 * start_x + 2 * (1 - t) * t * mid_x + t ** 2 * target_x
-                            by = (1 - t) ** 2 * start_y + 2 * (1 - t) * t * mid_y + t ** 2 * target_y
-                            await browser.page.mouse.move(bx + random.uniform(-1, 1), by + random.uniform(-1, 1))
+                            bx = (
+                                (1 - t) ** 2 * start_x
+                                + 2 * (1 - t) * t * mid_x
+                                + t**2 * target_x
+                            )
+                            by = (
+                                (1 - t) ** 2 * start_y
+                                + 2 * (1 - t) * t * mid_y
+                                + t**2 * target_y
+                            )
+                            await browser.page.mouse.move(
+                                bx + random.uniform(-1, 1), by + random.uniform(-1, 1)
+                            )
                             await browser.page.wait_for_timeout(random.randint(8, 20))
                         await browser.page.wait_for_timeout(random.randint(80, 180))
-                        await browser.page.mouse.click(target_x, target_y, delay=random.randint(60, 130))
+                        await browser.page.mouse.click(
+                            target_x, target_y, delay=random.randint(60, 130)
+                        )
                         continue_clicked = True
                         logger.info(f"Кнопка LOG IN нажата (mouse, Безье): {selector}")
                         break
@@ -1263,8 +1718,13 @@ async def _purchase_flow(request: PurchaseRequest):
                 await browser.human_like_delay(1000, 2000)
                 await _accept_cookies(browser)
                 await browser.human_like_delay(1500, 2500)
-                page_text_after = (await browser.page.evaluate("() => document.body.innerText")).lower()
-                if "blocked your login request" in page_text_after or "unusual activity" in page_text_after:
+                page_text_after = (
+                    await browser.page.evaluate("() => document.body.innerText")
+                ).lower()
+                if (
+                    "blocked your login request" in page_text_after
+                    or "unusual activity" in page_text_after
+                ):
                     raise Exception(
                         "Supercell заблокировал вход после отправки email (unusual activity). "
                         "Попробуйте: PROXY_ENABLED=false, 2Captcha (CAPTCHA_2CAPTCHA_API_KEY), резидентный прокси или BROWSER_USE_PATCHRIGHT=true."
@@ -1275,7 +1735,9 @@ async def _purchase_flow(request: PurchaseRequest):
 
                 # Режим ручного ввода: если код не передан — ждём 2 минуты, пока пользователь введёт код вручную
                 if not verification_code and not request.email_password:
-                    logger.info("Ожидание до 2 минут — введите код верификации вручную в браузере.")
+                    logger.info(
+                        "Ожидание до 2 минут — введите код верификации вручную в браузере."
+                    )
                     manual_wait_seconds = 120
                     deadline = asyncio.get_event_loop().time() + manual_wait_seconds
                     code_input_selectors = [
@@ -1286,7 +1748,9 @@ async def _purchase_flow(request: PurchaseRequest):
                     ]
                     while asyncio.get_event_loop().time() < deadline:
                         try:
-                            btn_loc = browser.page.get_by_role("button", name=re.compile(r"continue", re.I))
+                            btn_loc = browser.page.get_by_role(
+                                "button", name=re.compile(r"continue", re.I)
+                            )
                             if await btn_loc.count() > 0:
                                 btn = btn_loc.first
                                 aria = (await btn.get_attribute("aria-disabled")) or ""
@@ -1297,7 +1761,9 @@ async def _purchase_flow(request: PurchaseRequest):
                                     disabled = "true" in aria.strip().lower()
                                 if not disabled:
                                     await btn.click()
-                                    logger.info("Код введён вручную, нажата кнопка CONTINUE.")
+                                    logger.info(
+                                        "Код введён вручную, нажата кнопка CONTINUE."
+                                    )
                                     code_entered_manually = True
                                     break
                         except Exception:
@@ -1308,10 +1774,14 @@ async def _purchase_flow(request: PurchaseRequest):
                                 if inp:
                                     val = await inp.get_attribute("value") or ""
                                     if len(val.replace(" ", "").replace("-", "")) >= 6:
-                                        btn_loc = browser.page.get_by_role("button", name=re.compile(r"continue", re.I))
+                                        btn_loc = browser.page.get_by_role(
+                                            "button", name=re.compile(r"continue", re.I)
+                                        )
                                         if await btn_loc.count() > 0:
                                             await btn_loc.first.click()
-                                            logger.info("Обнаружено 6 цифр в поле кода, нажата кнопка CONTINUE.")
+                                            logger.info(
+                                                "Обнаружено 6 цифр в поле кода, нажата кнопка CONTINUE."
+                                            )
                                             code_entered_manually = True
                                     break
                             if code_entered_manually:
@@ -1328,7 +1798,9 @@ async def _purchase_flow(request: PurchaseRequest):
                     # Получаем код верификации из запроса или email
                     if not verification_code and request.email_password:
                         logger.info("Ожидание кода верификации из email...")
-                        email_reader = EmailCodeReader(request.email, request.email_password)
+                        email_reader = EmailCodeReader(
+                            request.email, request.email_password
+                        )
                         verification_code = email_reader.get_supercell_code(timeout=120)
 
                     if not verification_code:
@@ -1337,7 +1809,9 @@ async def _purchase_flow(request: PurchaseRequest):
                             "Введите код верификации из письма Supercell или предоставьте email_password."
                         )
 
-                    verification_code = verification_code.replace(" ", "").replace("-", "").strip()
+                    verification_code = (
+                        verification_code.replace(" ", "").replace("-", "").strip()
+                    )
                     code_selectors = [
                         'input[type="tel"]',
                         'input[autocomplete="one-time-code"]',
@@ -1347,7 +1821,9 @@ async def _purchase_flow(request: PurchaseRequest):
                     code_input = None
                     for selector in code_selectors:
                         try:
-                            code_input = await browser.page.wait_for_selector(selector, timeout=30000)
+                            code_input = await browser.page.wait_for_selector(
+                                selector, timeout=30000
+                            )
                             if code_input:
                                 break
                         except Exception:
@@ -1364,7 +1840,10 @@ async def _purchase_flow(request: PurchaseRequest):
                     await browser.page.wait_for_timeout(5000)
                     try:
                         await browser.page.wait_for_url(
-                            lambda url: "store.supercell.com" in url and "login" not in url.lower(),
+                            lambda url: (
+                                "store.supercell.com" in url
+                                and "login" not in url.lower()
+                            ),
                             timeout=30000,
                         )
                     except Exception:
@@ -1372,7 +1851,7 @@ async def _purchase_flow(request: PurchaseRequest):
 
                 logger.info("Авторизация завершена, продолжаем покупку...")
                 await browser.human_like_delay(2000, 3000)
-        
+
             # Шаг 2–5: Единый путь покупки после входа (как в purchase_demo и manual_login_gpay_demo)
             purchase_result = await run_purchase_flow_after_login(
                 browser, request.game, request.product_name, session_id
@@ -1397,11 +1876,15 @@ async def _purchase_flow(request: PurchaseRequest):
                 "added_to_cart": added,
                 "checkout_opened": checkout_opened,
                 "screenshot": f"after_add_to_cart_{session_id}.png",
-                "checkout_screenshot": f"checkout_{session_id}.png" if checkout_opened else None,
+                "checkout_screenshot": f"checkout_{session_id}.png"
+                if checkout_opened
+                else None,
                 "url": purchase_result.get("url", browser.page.url),
                 "message": purchase_result.get("message", ""),
                 "proxy_used": browser.current_proxy is not None,
-                "proxy_server": browser.current_proxy.get("server") if browser.current_proxy else None,
+                "proxy_server": browser.current_proxy.get("server")
+                if browser.current_proxy
+                else None,
             }
 
             # Шаг 6: Оплата через Google Pay
@@ -1420,20 +1903,26 @@ async def _purchase_flow(request: PurchaseRequest):
                     )
                     logger.info(f"Google Pay результат: {gpay_result}")
                 else:
-                    logger.info("Google Pay отключён: GOOGLE_EMAIL или GOOGLE_APP_PASSWORD не заданы")
+                    logger.info(
+                        "Google Pay отключён: GOOGLE_EMAIL или GOOGLE_APP_PASSWORD не заданы"
+                    )
             else:
-                logger.info("Google Pay пропущен: checkout не открыт или GOOGLE_PAY_ENABLED=false")
+                logger.info(
+                    "Google Pay пропущен: checkout не открыт или GOOGLE_PAY_ENABLED=false"
+                )
 
-            result.update({
-                "payment_success": gpay_result.get("success", False),
-                "google_pay_clicked": gpay_result.get("google_pay_clicked", False),
-                "payment_confirmed": gpay_result.get("payment_confirmed", False),
-                "payment_verified": gpay_result.get("payment_verified", False),
-                "screenshot_success": gpay_result.get("screenshot_success"),
-                "screenshot_account": gpay_result.get("screenshot_account"),
-                "cards_removed": gpay_result.get("cards_removed", 0),
-                "payment_error": gpay_result.get("error"),
-            })
+            result.update(
+                {
+                    "payment_success": gpay_result.get("success", False),
+                    "google_pay_clicked": gpay_result.get("google_pay_clicked", False),
+                    "payment_confirmed": gpay_result.get("payment_confirmed", False),
+                    "payment_verified": gpay_result.get("payment_verified", False),
+                    "screenshot_success": gpay_result.get("screenshot_success"),
+                    "screenshot_account": gpay_result.get("screenshot_account"),
+                    "cards_removed": gpay_result.get("cards_removed", 0),
+                    "payment_error": gpay_result.get("error"),
+                }
+            )
 
             try:
                 video_path = await browser.close()
@@ -1443,12 +1932,17 @@ async def _purchase_flow(request: PurchaseRequest):
                 logger.debug(f"Ошибка при закрытии браузера: {close_err}")
 
             return result
-        
+
         except Exception as e:
             last_error = e
             logger.error(f"Ошибка покупки товара: {e}")
             err_lower = str(e).lower()
-            block_phrases = ("unusual activity", "blocked your login", "blocked", "blocked your login request")
+            block_phrases = (
+                "unusual activity",
+                "blocked your login",
+                "blocked",
+                "blocked your login request",
+            )
             is_block = any(p in err_lower for p in block_phrases)
             if (
                 is_block
@@ -1483,11 +1977,17 @@ async def _purchase_flow(request: PurchaseRequest):
                 "error": str(e),
                 "screenshot": str(screenshot_path) if screenshot_path else None,
                 "proxy_used": getattr(browser, "current_proxy", None) is not None,
-                "proxy_server": browser.current_proxy.get("server") if getattr(browser, "current_proxy", None) else None,
+                "proxy_server": browser.current_proxy.get("server")
+                if getattr(browser, "current_proxy", None)
+                else None,
             }
             if video_path:
                 detail["video"] = video_path
-            if "timed_out" in err_lower or "err_timed_out" in err_lower or "err_connection" in err_lower:
+            if (
+                "timed_out" in err_lower
+                or "err_timed_out" in err_lower
+                or "err_connection" in err_lower
+            ):
                 detail["hint"] = (
                     "Прокси не успел загрузить страницу. Попробуйте PROXY_ENABLED=false или проверьте прокси."
                 )
