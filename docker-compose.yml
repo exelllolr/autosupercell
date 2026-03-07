@@ -20,6 +20,11 @@ services:
       # (headless Chrome блокируется Turnstile на странице accounts.supercell.com/login)
       - DISPLAY=:99
       - BROWSER_HEADLESS=false
+      # Правильные URL магазинов — без дефиса (/clashroyale, /brawlstars).
+      # Явно задаём здесь чтобы перекрыть любой устаревший .env, запечённый в образе.
+      - SUPERCELL_STORE_URL=https://store.supercell.com
+      - CLASH_ROYALE_STORE_URL=https://store.supercell.com/clashroyale
+      - BRAWL_STARS_STORE_URL=https://store.supercell.com/brawlstars
     volumes:
       - ./logs:/app/logs
       - ./screenshots:/app/screenshots
@@ -99,6 +104,9 @@ services:
       - DOCKER_CONTAINER=true
       - DISPLAY=:99
       - BROWSER_HEADLESS=false
+      - SUPERCELL_STORE_URL=https://store.supercell.com
+      - CLASH_ROYALE_STORE_URL=https://store.supercell.com/clashroyale
+      - BRAWL_STARS_STORE_URL=https://store.supercell.com/brawlstars
     volumes:
       - ./logs:/app/logs
       - ./screenshots:/app/screenshots

@@ -2091,6 +2091,35 @@ async def _purchase_flow(request: PurchaseRequest):
                 logger.info("Авторизация завершена, продолжаем покупку...")
                 await browser.human_like_delay(2000, 3000)
 
+                # КРИТИЧНО: После авторизации нужно дождаться синхронизации сессии между
+                # accounts.supercell.com и store.supercell.com. На сервере (особенно через прокси)
+                # это занимает больше времени чем локально. Переходим на главную store.supercell.com
+                # и ждём пока исчезнет кнопка "Log in" (признак что сессия синхронизирована).
+                logger.info("Проверка синхронизации сессии на store.supercell.com...")
+                try:
+                    await browser.page.goto("https://store.supercell.com", wait_until="domcontentloaded", timeout=30000)
+                    await browser.human_like_delay(2000, 3000)
+                    
+                    # Ждём пока исчезнет кнопка "Log in" (максимум 30 сек)
+                    for attempt in range(6):
+                        try:
+                            login_btn = browser.page.locator('a:has-text("Log in"), button:has-text("Log in")').first
+                            if await login_btn.count() > 0 and await login_btn.is_visible():
+                                logger.info(f"Сессия ещё не синхронизирована (попытка {attempt + 1}/6), ждём...")
+                                await browser.human_like_delay(5000, 6000)
+                            else:
+                                logger.info("Сессия синхронизирована - кнопка Log in исчезла")
+                                break
+                        except Exception:
+                            logger.info("Сессия синхронизирована - кнопка Log in не найдена")
+                            break
+                    else:
+                        logger.warning("Сессия может быть не синхронизирована после 30 сек ожидания")
+                    
+                    await browser.take_screenshot(f"store_after_auth_{session_id}.png")
+                except Exception as e:
+                    logger.warning(f"Ошибка проверки синхронизации сессии: {e}")
+
             # Шаг 2–5: Единый путь покупки после входа (как в purchase_demo и manual_login_gpay_demo)
             purchase_result = await run_purchase_flow_after_login(
                 browser, request.game, request.product_name, session_id

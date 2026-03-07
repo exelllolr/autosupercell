@@ -1078,24 +1078,47 @@ class BrowserAutomation:
             except Exception:
                 pass
             try:
-                # Ссылка по href (например /brawl-stars, /clash-royale)
-                slug = game.lower().replace("_", "-")
-                link = await self.page.query_selector(f'a[href*="{slug}"]')
-                if link and await link.is_visible():
-                    await link.click()
-                    clicked = True
-                    logger.info(f"Клик по ссылке магазина: href*={slug}")
+                # Ссылка по href — пробуем ОБА варианта: с дефисом и без
+                # /clashroyale и /clash-royale, /brawlstars и /brawl-stars
+                slug_hyphen = game.lower().replace("_", "-")  # clash-royale
+                slug_nohyphen = slug_hyphen.replace("-", "")  # clashroyale
+                for slug_variant in [slug_nohyphen, slug_hyphen]:
+                    link = await self.page.query_selector(f'a[href*="{slug_variant}"]')
+                    if link and await link.is_visible():
+                        await link.click()
+                        clicked = True
+                        logger.info(f"Клик по ссылке магазина: href*={slug_variant}")
+                        break
+                if clicked:
                     break
             except Exception:
                 pass
 
         if not clicked:
-            # Fallback: прямой переход по URL
+            # Fallback: прямой переход по URL.
+            # Правильные URL Supercell Store — без дефиса (/clashroyale, /brawlstars).
+            # Если в settings попали старые значения с дефисом (например из старого .env),
+            # принудительно подставляем корректные URL.
+            _CORRECT_URLS = {
+                "clash-royale": "https://store.supercell.com/clashroyale",
+                "brawl-stars": "https://store.supercell.com/brawlstars",
+            }
             url_map = {
                 "clash-royale": settings.CLASH_ROYALE_STORE_URL,
                 "brawl-stars": settings.BRAWL_STARS_STORE_URL,
             }
             url = url_map.get(game.lower(), settings.SUPERCELL_STORE_URL)
+            # Если URL содержит дефисный вариант — исправляем на правильный
+            if "-royale" in url and "/clash-royale" in url:
+                url = _CORRECT_URLS["clash-royale"]
+                logger.warning(
+                    "navigate_to_store: исправлен URL clash-royale → clashroyale (старый .env)"
+                )
+            elif "-stars" in url and "/brawl-stars" in url:
+                url = _CORRECT_URLS["brawl-stars"]
+                logger.warning(
+                    "navigate_to_store: исправлен URL brawl-stars → brawlstars (старый .env)"
+                )
             logger.warning(f"Карточка магазина не найдена, переход по URL: {url}")
             try:
                 # Используем "commit" (первый байт ответа) — быстрее, затем ждём domcontentloaded
