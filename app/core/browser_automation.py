@@ -1098,10 +1098,28 @@ class BrowserAutomation:
             url = url_map.get(game.lower(), settings.SUPERCELL_STORE_URL)
             logger.warning(f"Карточка магазина не найдена, переход по URL: {url}")
             try:
-                await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                # Используем "commit" (первый байт ответа) — быстрее, затем ждём domcontentloaded
+                await self.page.goto(url, wait_until="commit", timeout=60000)
+                await self.page.wait_for_load_state("domcontentloaded", timeout=30000)
             except Exception as e:
                 logger.error(f"Ошибка перехода на страницу: {e}")
                 raise
+
+            # store.supercell.com — Next.js SPA: продукты загружаются через клиентские
+            # API-запросы после парсинга HTML. Ждём networkidle (конец сетевой активности).
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=20000)
+                logger.info(
+                    f"navigate_to_store (URL fallback): networkidle, URL={self.page.url}"
+                )
+            except Exception:
+                logger.info(
+                    f"navigate_to_store (URL fallback): networkidle таймаут, продолжаем. URL={self.page.url}"
+                )
+
+            # Принудительная пауза для финальной отрисовки SPA
+            await self.human_like_delay(2000, 3000)
+
         else:
             # Дождаться перехода на страницу магазина (чтобы не «висеть на одном месте»)
             slug = game.lower().replace("_", "-").replace(" ", "-")
@@ -1114,10 +1132,16 @@ class BrowserAutomation:
             except Exception:
                 pass
             try:
-                await self.page.wait_for_load_state("domcontentloaded", timeout=30000)
+                await self.page.wait_for_load_state("networkidle", timeout=20000)
                 await self.human_like_delay(2000, 4000)
             except Exception:
-                pass
+                try:
+                    await self.page.wait_for_load_state(
+                        "domcontentloaded", timeout=15000
+                    )
+                    await self.human_like_delay(2000, 4000)
+                except Exception:
+                    pass
 
     async def take_screenshot(self, filename: str, timeout_ms: int = 20000) -> Path:
         """

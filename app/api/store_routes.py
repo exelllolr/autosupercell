@@ -26,7 +26,8 @@ async def _find_and_click_product(
 ) -> bool:
     """
     Поиск карточки товара в секции GEMS и клик по ней.
-    Сначала находит секцию GEMS на странице, затем ищет карточку с нужным числом гемов.
+    Сначала ждёт загрузки SPA/lazy-контента, прокручивает страницу,
+    пытается кликнуть категорию Gems, затем ищет карточку несколькими стратегиями.
     """
     import re as _re
 
@@ -34,78 +35,170 @@ async def _find_and_click_product(
     if not page:
         return False
 
-    # Ждём загрузки страницы
-    try:
-        await page.wait_for_load_state("networkidle", timeout=15000)
-    except Exception:
-        try:
-            await page.wait_for_load_state("domcontentloaded", timeout=8000)
-        except Exception:
-            pass
-
     num_match = _re.search(r"\d+", product_name)
     num_str = num_match.group() if num_match else ""
     name_lower = product_name.lower().strip()
 
     logger.info(f"Поиск товара '{product_name}' (num={num_str})")
 
-    # ── Стратегия 1: Найти секцию GEMS, затем карточку с нужным числом ────────
-    # JS: ищем заголовок секции "GEMS", затем ближайшую карточку с нужным числом
+    # ── ШАГ 0: Ожидание полной загрузки SPA (Next.js + API-запросы к товарам) ──
+    # store.supercell.com — Next.js SPA; продукты загружаются через клиентские API-запросы
+    # после парсинга HTML. networkidle ждёт окончания сетевой активности.
+    try:
+        await page.wait_for_load_state("networkidle", timeout=20000)
+        logger.info("Страница магазина: networkidle достигнут")
+    except Exception:
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
+
+    # ── ШАГ 1: Прокрутка страницы для триггера lazy-loading ────────────────────
+    # SPA-страница магазина может использовать IntersectionObserver — товары
+    # рендерятся только когда секция появляется в viewport.
+    try:
+        page_height = await page.evaluate("() => document.body.scrollHeight || 3000")
+        step = min(600, max(300, page_height // 8))
+        for scroll_y in range(0, min(int(page_height), 4000), step):
+            await page.evaluate(f"window.scrollTo(0, {scroll_y})")
+            await page.wait_for_timeout(300)
+        # Возвращаемся наверх
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(600)
+        logger.info("Прокрутка страницы выполнена (lazy-load trigger)")
+    except Exception as e:
+        logger.debug(f"Ошибка прокрутки: {e}")
+
+    # ── ШАГ 2: Клик на категорию "Gems" если есть табы/фильтры ────────────────
+    for cat_text in ["Gems", "GEM PACKS", "Gem Packs", "GEMS", "gems"]:
+        for role in ("button", "link", "tab"):
+            try:
+                cat_loc = page.get_by_role(role, name=_re.compile(rf"^{_re.escape(cat_text)}$", _re.I))
+                if await cat_loc.count() > 0 and await cat_loc.first.is_visible():
+                    await cat_loc.first.click()
+                    logger.info(f"Нажата вкладка категории '{cat_text}' (role={role})")
+                    await page.wait_for_timeout(2000)
+                    # После клика снова прокручиваем
+                    try:
+                        await page.evaluate("window.scrollTo(0, 0)")
+                        await page.wait_for_timeout(300)
+                    except Exception:
+                        pass
+                    break
+            except Exception:
+                continue
+        else:
+            continue
+        break
+
+    # ── ШАГ 3: Ожидание появления элементов товаров ────────────────────────────
+    product_appeared = False
+    for wait_sel in [
+        '[class*="ProductCard"]',
+        '[class*="product-card"]',
+        '[class*="product_card"]',
+        '[class*="ProductItem"]',
+        '[class*="gemCard"]',
+        '[class*="GemCard"]',
+        'button[class*="AddToCart"]',
+        'button[class*="add-to-cart"]',
+        'li[class*="product"]',
+        'li[class*="Product"]',
+    ]:
+        try:
+            await page.wait_for_selector(wait_sel, timeout=4000, state="visible")
+            logger.info(f"Элементы товаров обнаружены: {wait_sel}")
+            product_appeared = True
+            break
+        except Exception:
+            continue
+
+    if not product_appeared:
+        # Финальная попытка — ждём любую кнопку с ценой $X.XX
+        try:
+            await page.wait_for_selector('button:has-text("$"), a:has-text("$")', timeout=5000, state="visible")
+            logger.info("Обнаружены кнопки с ценами на странице")
+            product_appeared = True
+        except Exception:
+            logger.warning("Элементы товаров не обнаружены по ожидаемым селекторам — продолжаем поиск")
+
+    # ── Стратегия 1: JS-поиск с учётом секции GEMS и разных форматов текста ───
     try:
         handle = await page.evaluate_handle(
             """([num, name]) => {
                 const nameLower = name.toLowerCase();
-                // Ищем заголовок секции GEMS
+
+                // Вспомогательная функция: возвращает true если элемент содержит нужный товар
+                function matchesProduct(el) {
+                    const t = (el.innerText || el.textContent || '').toLowerCase().trim();
+                    if (!t) return false;
+                    // Проверяем оба варианта: в одном элементе или в разных дочерних
+                    const hasNum = t.includes(num);
+                    const hasGem = t.includes('gem');
+                    return hasNum && hasGem;
+                }
+
+                // Функция для получения видимой bounding box
+                function isVisible(el) {
+                    const r = el.getBoundingClientRect();
+                    return (r.width > 0 && r.height > 0) || el.offsetParent !== null;
+                }
+
+                // Ищем заголовок секции GEMS (разные варианты)
                 let gemsSection = null;
-                for (const el of document.querySelectorAll('*')) {
-                    const t = (el.innerText || el.textContent || '').trim();
-                    if (t.toUpperCase() === 'GEMS' || t.toUpperCase() === '🔮 GEMS' || t.toUpperCase() === 'GEMS' ) {
-                        const r = el.getBoundingClientRect();
-                        if (r.width > 0 || el.offsetParent !== null) {
+                const gemHeaders = ['GEMS', '💎 GEMS', '🔮 GEMS', 'GEM PACKS', 'GEMS PACKS'];
+                for (const el of document.querySelectorAll('h1, h2, h3, h4, h5, [class*="title"], [class*="header"], [class*="section"], [class*="category"], [class*="heading"]')) {
+                    const t = (el.innerText || el.textContent || '').trim().toUpperCase();
+                    if (gemHeaders.some(h => t === h || t.startsWith(h))) {
+                        if (isVisible(el)) {
                             gemsSection = el;
                             break;
                         }
                     }
                 }
 
+                const cardSelectors = 'a, button, [class*="card"], [class*="Card"], [class*="product"], [class*="Product"], [class*="item"], [class*="Item"], li, [class*="tile"], [class*="Tile"]';
+
                 // Если нашли секцию GEMS — ищем карточку ниже неё
                 if (gemsSection) {
-                    const gemsRect = gemsSection.getBoundingClientRect();
-                    const gemsTop = gemsSection.offsetTop || 0;
-                    // Ищем карточку с нужным числом в пределах 2000px ниже заголовка
+                    const gemsTop = gemsSection.getBoundingClientRect().top + window.scrollY;
                     let best = null, bestScore = Infinity;
-                    for (const el of document.querySelectorAll('a, button, [class*="card"], [class*="product"], [class*="item"], li')) {
-                        const t = (el.innerText || el.textContent || '').toLowerCase().trim();
-                        if (!t.includes(num) || !t.includes('gem')) continue;
-                        const elTop = el.offsetTop || 0;
-                        if (elTop < gemsTop) continue; // выше секции GEMS — пропускаем
-                        const dist = elTop - gemsTop;
-                        if (dist > 3000) continue; // слишком далеко
+                    for (const el of document.querySelectorAll(cardSelectors)) {
+                        if (!matchesProduct(el)) continue;
+                        const elTop = el.getBoundingClientRect().top + window.scrollY;
+                        if (elTop < gemsTop - 50) continue;
+                        if (elTop > gemsTop + 4000) continue;
                         const r = el.getBoundingClientRect();
                         if (r.width < 20 || r.height < 10) continue;
-                        if (t.length < bestScore) {
-                            best = el;
-                            bestScore = t.length;
-                        }
+                        const score = (el.innerText || el.textContent || '').trim().length;
+                        if (score < bestScore) { best = el; bestScore = score; }
                     }
                     if (best) return best;
                 }
 
-                // Fallback: ищем карточку с точным числом гемов во всём документе
-                // Приоритет: элементы с коротким текстом (карточка, не раздел)
+                // Fallback 1: поиск по всему документу с фильтром по размеру текста
                 let best = null, bestScore = Infinity;
-                for (const el of document.querySelectorAll('a, button, [class*="card"], [class*="product"], [class*="item"], li')) {
-                    const t = (el.innerText || el.textContent || '').toLowerCase().trim();
-                    if (!t.includes(num) || !t.includes('gem')) continue;
+                for (const el of document.querySelectorAll(cardSelectors)) {
+                    if (!matchesProduct(el)) continue;
                     const r = el.getBoundingClientRect();
                     if (r.width < 20 || r.height < 10) continue;
-                    // Предпочитаем элементы с текстом близким к "80 gems"
-                    if (t.length < bestScore && t.length < name.length * 10) {
-                        best = el;
-                        bestScore = t.length;
-                    }
+                    const score = (el.innerText || el.textContent || '').trim().length;
+                    // Допускаем текст до 200 символов (убрали жёсткий лимит name.length*10)
+                    if (score < bestScore && score < 200) { best = el; bestScore = score; }
                 }
-                return best;
+                if (best) return best;
+
+                // Fallback 2: ищем карточку, у которой есть дочерний элемент с числом И дочерний с "gem"
+                for (const el of document.querySelectorAll('[class*="card"], [class*="Card"], [class*="product"], [class*="Product"], li, article')) {
+                    const inner = (el.innerText || el.textContent || '').toLowerCase();
+                    if (!inner.includes(num) || !inner.includes('gem')) continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 60 || r.height < 30) continue;
+                    if (inner.length > 500) continue;
+                    return el;
+                }
+
+                return null;
             }""",
             [num_str, name_lower],
         )
@@ -116,48 +209,65 @@ async def _find_and_click_product(
             bb = await el.bounding_box()
             if bb:
                 logger.info(
-                    f"Стратегия 1 (GEMS section): ({bb['x']:.0f},{bb['y']:.0f}) size={bb['width']:.0f}x{bb['height']:.0f}"
+                    f"Стратегия 1 (GEMS section JS): ({bb['x']:.0f},{bb['y']:.0f}) size={bb['width']:.0f}x{bb['height']:.0f}"
                 )
                 await el.click(timeout=5000)
                 return True
     except Exception as e:
-        logger.debug(f"Стратегия 1 (GEMS section): {e}")
+        logger.debug(f"Стратегия 1 (GEMS section JS): {e}")
 
-    # ── Стратегия 2: get_by_text точное совпадение ────────────────────────────
-    try:
-        loc = page.get_by_text(_re.compile(rf"^{_re.escape(num_str)}\s*gems?$", _re.I))
-        count = await loc.count()
-        for i in range(min(count, 5)):
-            el = loc.nth(i)
-            try:
-                await el.scroll_into_view_if_needed()
-                await page.wait_for_timeout(400)
-                bb = await el.bounding_box()
-                if bb and bb["width"] > 20:
-                    logger.info(
-                        f"Стратегия 2 (exact get_by_text) #{i}: ({bb['x']:.0f},{bb['y']:.0f})"
-                    )
-                    await el.click(timeout=5000)
-                    return True
-            except Exception:
-                continue
-    except Exception as e:
-        logger.debug(f"Стратегия 2: {e}")
+    # ── Стратегия 2: get_by_text — несколько шаблонов ─────────────────────────
+    text_patterns = [
+        _re.compile(rf"^{_re.escape(num_str)}\s*gems?$", _re.I),          # "80 Gems"
+        _re.compile(rf"{_re.escape(num_str)}\s*gems?", _re.I),             # содержит "80 Gems"
+        _re.compile(rf"^{_re.escape(num_str)}$"),                           # только число "80"
+        _re.compile(rf"{_re.escape(product_name)}", _re.I),                 # полное название
+    ]
+    for pattern in text_patterns:
+        try:
+            loc = page.get_by_text(pattern)
+            count = await loc.count()
+            for i in range(min(count, 8)):
+                el = loc.nth(i)
+                try:
+                    await el.scroll_into_view_if_needed()
+                    await page.wait_for_timeout(300)
+                    bb = await el.bounding_box()
+                    if bb and bb["width"] > 15 and bb["height"] > 10:
+                        logger.info(
+                            f"Стратегия 2 (get_by_text pattern='{pattern.pattern}') #{i}: ({bb['x']:.0f},{bb['y']:.0f})"
+                        )
+                        await el.click(timeout=5000)
+                        return True
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug(f"Стратегия 2 (pattern='{pattern.pattern}'): {e}")
 
-    # ── Стратегия 3: CSS :has-text ────────────────────────────────────────────
-    for css in [
+    # ── Стратегия 3: CSS :has-text — расширенный список селекторов ────────────
+    css_selectors = [
         f'[class*="card"]:has-text("{product_name}")',
+        f'[class*="Card"]:has-text("{product_name}")',
         f'[class*="product"]:has-text("{product_name}")',
+        f'[class*="Product"]:has-text("{product_name}")',
+        f'[class*="tile"]:has-text("{product_name}")',
+        f'[class*="item"]:has-text("{product_name}")',
         f'a:has-text("{product_name}")',
         f'li:has-text("{product_name}")',
-    ]:
+        f'article:has-text("{product_name}")',
+        # Поиск только по числу в контексте Gems
+        f'[class*="card"]:has-text("{num_str}")',
+        f'[class*="product"]:has-text("{num_str}")',
+        f'li:has-text("{num_str}")',
+    ]
+    for css in css_selectors:
         try:
             loc = page.locator(css).first
             if await loc.count() > 0:
                 await loc.scroll_into_view_if_needed()
                 await page.wait_for_timeout(400)
                 bb = await loc.bounding_box()
-                if bb:
+                if bb and bb["width"] > 20 and bb["height"] > 10:
                     logger.info(
                         f"Стратегия 3 (CSS): '{css}' at ({bb['x']:.0f},{bb['y']:.0f})"
                     )
@@ -166,68 +276,109 @@ async def _find_and_click_product(
         except Exception:
             continue
 
-    # ── Стратегия 4: Кнопка Buy с ценой (сумка + $4.99) ───────────────────────
-    # На странице магазина кнопка добавления в корзину — белая кнопка с иконкой сумки и ценой
+    # ── Стратегия 4: Кнопка с ценой ($X.XX) в контексте Gems-секции ──────────
     try:
-        price_loc = page.get_by_text(_re.compile(r"\$\d+\.\d+"))
+        price_loc = page.get_by_text(_re.compile(r"\$\d+[\.,]\d+"))
         n = await price_loc.count()
-        for i in range(min(n, 15)):
+        logger.info(f"Стратегия 4: найдено {n} элементов с ценой $X.XX")
+        for i in range(min(n, 20)):
             loc = price_loc.nth(i)
             try:
                 await loc.scroll_into_view_if_needed()
-                await page.wait_for_timeout(300)
+                await page.wait_for_timeout(200)
                 if not await loc.is_visible():
                     continue
                 bb = await loc.bounding_box()
-                if not bb or bb["height"] < 15:
+                if not bb or bb["height"] < 10:
                     continue
-                # Текст цены часто внутри кнопки — кликаем родителя (button/a), иначе сам элемент
+                # Проверяем: находится ли кнопка с ценой в контексте с нашим товаром?
+                context_text = await loc.evaluate(
+                    """el => {
+                        let p = el;
+                        for (let i = 0; i < 6; i++) {
+                            p = p.parentElement;
+                            if (!p) break;
+                            const t = (p.innerText || p.textContent || '').toLowerCase();
+                            if (t.length < 300) return t;
+                        }
+                        return '';
+                    }"""
+                )
+                context_lower = (context_text or "").lower()
+                # Ищем контекст с нужным числом или gem
+                has_context = num_str in context_lower and "gem" in context_lower
                 to_click = None
                 parent = loc.locator("..")
                 if await parent.count() > 0:
-                    tag = await parent.evaluate(
-                        "el => el ? el.tagName.toLowerCase() : ''"
-                    )
+                    tag = await parent.evaluate("el => el ? el.tagName.toLowerCase() : ''")
                     if tag in ("button", "a"):
                         to_click = parent
                 if to_click is None:
                     grandparent = loc.locator("../..")
                     if await grandparent.count() > 0:
-                        tag = await grandparent.evaluate(
-                            "el => el ? el.tagName.toLowerCase() : ''"
-                        )
+                        tag = await grandparent.evaluate("el => el ? el.tagName.toLowerCase() : ''")
                         if tag in ("button", "a"):
                             to_click = grandparent
-                if to_click is not None:
-                    await to_click.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(200)
-                    if await to_click.is_visible():
+                # Кликаем только если контекст совпадает с товаром
+                if has_context:
+                    target = to_click if to_click is not None else loc
+                    if await target.is_visible():
+                        await target.scroll_into_view_if_needed()
+                        await page.wait_for_timeout(200)
                         logger.info(
-                            f"Стратегия 4 (кнопка с ценой): клик по кнопке с ценой at ({bb['x']:.0f},{bb['y']:.0f})"
+                            f"Стратегия 4 (цена в Gems-контексте): клик at ({bb['x']:.0f},{bb['y']:.0f}), контекст='{context_lower[:80]}'"
                         )
-                        await to_click.click(timeout=5000)
+                        await target.click(timeout=5000)
                         return True
-                logger.info(
-                    f"Стратегия 4 (кнопка с ценой): клик по элементу с ценой at ({bb['x']:.0f},{bb['y']:.0f})"
-                )
-                await loc.click(timeout=5000)
-                return True
+            except Exception:
+                continue
+        # Если контекстный поиск не сработал — кликаем на первую видимую кнопку с ценой
+        for i in range(min(n, 10)):
+            loc = price_loc.nth(i)
+            try:
+                if not await loc.is_visible():
+                    continue
+                await loc.scroll_into_view_if_needed()
+                await page.wait_for_timeout(200)
+                bb = await loc.bounding_box()
+                if not bb or bb["height"] < 10:
+                    continue
+                to_click = None
+                parent = loc.locator("..")
+                if await parent.count() > 0:
+                    tag = await parent.evaluate("el => el ? el.tagName.toLowerCase() : ''")
+                    if tag in ("button", "a"):
+                        to_click = parent
+                if to_click is None:
+                    grandparent = loc.locator("../..")
+                    if await grandparent.count() > 0:
+                        tag = await grandparent.evaluate("el => el ? el.tagName.toLowerCase() : ''")
+                        if tag in ("button", "a"):
+                            to_click = grandparent
+                target = to_click if to_click is not None else loc
+                if await target.is_visible():
+                    logger.info(
+                        f"Стратегия 4 (первая кнопка с ценой fallback): клик at ({bb['x']:.0f},{bb['y']:.0f})"
+                    )
+                    await target.click(timeout=5000)
+                    return True
             except Exception:
                 continue
     except Exception as e:
         logger.debug(f"Стратегия 4 (кнопка с ценой): {e}")
 
     # ── Стратегия 5: Кнопка по aria-label / по тексту Buy / Add to cart ───────
-    for label_pattern in ["buy", "add to cart", "add to bag", "purchase", "купить"]:
+    for label_pattern in ["buy", "add to cart", "add to bag", "purchase", "купить", "in cart", "add"]:
         try:
             btn = page.get_by_role("button", name=_re.compile(label_pattern, _re.I))
-            if await btn.count() > 0:
-                for i in range(min(await btn.count(), 5)):
+            cnt = await btn.count()
+            if cnt > 0:
+                for i in range(min(cnt, 8)):
                     b = btn.nth(i)
                     if not await b.is_visible():
                         continue
                     await b.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(300)
+                    await page.wait_for_timeout(200)
                     logger.info(
                         f"Стратегия 5 (role=button '{label_pattern}'): клик #{i}"
                     )
@@ -235,6 +386,49 @@ async def _find_and_click_product(
                     return True
         except Exception:
             continue
+
+    # ── Диагностика: логируем что на странице при неудаче ─────────────────────
+    try:
+        page_text = await page.evaluate("() => document.body.innerText")
+        logger.warning(
+            f"Все стратегии не нашли карточку/кнопку '{product_name}'.\n"
+            f"Текст страницы (первые 1500 симв.):\n{page_text[:1500]}"
+        )
+        # Находим все элементы, содержащие "gem"
+        gem_texts = await page.evaluate(
+            """() => {
+                const result = [];
+                for (const el of document.querySelectorAll('*')) {
+                    if (el.children.length === 0) {
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        if (t.includes('gem') && t.length > 0 && t.length < 150) {
+                            result.push(t);
+                        }
+                    }
+                }
+                return [...new Set(result)].slice(0, 30);
+            }"""
+        )
+        logger.warning(f"Элементы на странице содержащие 'gem': {gem_texts}")
+        # Логируем все кнопки с текстом/ценой
+        buttons_info = await page.evaluate(
+            """() => {
+                const btns = [];
+                for (const b of document.querySelectorAll('button, a[href]')) {
+                    const t = (b.innerText || b.textContent || '').trim().slice(0, 80);
+                    if (t) btns.push(t);
+                }
+                return btns.slice(0, 40);
+            }"""
+        )
+        logger.warning(f"Все кнопки/ссылки на странице: {buttons_info}")
+        # Кол-во элементов с product/card классами
+        card_count = await page.evaluate(
+            """() => document.querySelectorAll('[class*="product"],[class*="Product"],[class*="card"],[class*="Card"],[class*="item"],[class*="Item"]').length"""
+        )
+        logger.warning(f"Элементов с классами product/card/item: {card_count}")
+    except Exception as diag_err:
+        logger.debug(f"Ошибка диагностики: {diag_err}")
 
     logger.warning(f"Все стратегии не нашли карточку/кнопку '{product_name}'")
     return False
@@ -969,7 +1163,59 @@ async def run_purchase_flow_after_login(
     session_id = session_id or f"purchase_{game}"
     logger.info(f"Переход в магазин {game}...")
     await browser.navigate_to_store(game)
-    await browser.human_like_delay(3000, 5000)
+
+    # Дополнительное ожидание после навигации: Next.js SPA грузит продукты через API-запросы.
+    # domcontentloaded — только парсинг HTML, продукты ещё не загружены.
+    # Ждём networkidle или конкретного появления элементов товаров.
+    page = browser.page
+    try:
+        await page.wait_for_load_state("networkidle", timeout=20000)
+        logger.info("navigate_to_store: networkidle достигнут")
+    except Exception:
+        logger.info("navigate_to_store: networkidle не достигнут, продолжаем...")
+
+    # Прокрутка страницы для триггера lazy-loading (IntersectionObserver)
+    try:
+        page_h = await page.evaluate("() => document.body.scrollHeight || 3000")
+        step = min(700, max(300, int(page_h) // 6))
+        for sy in range(0, min(int(page_h), 4500), step):
+            await page.evaluate(f"window.scrollTo(0, {sy})")
+            await page.wait_for_timeout(250)
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(500)
+        logger.info("Прокрутка страницы магазина выполнена (lazy-load)")
+    except Exception as e:
+        logger.debug(f"Прокрутка в run_purchase_flow: {e}")
+
+    # Ждём появления любых элементов товаров (кнопки с ценой $, карточки)
+    product_appeared = False
+    for _wait_sel in [
+        'button:has-text("$")',
+        'a:has-text("$")',
+        '[class*="ProductCard"]',
+        '[class*="product-card"]',
+        '[class*="ProductItem"]',
+        '[class*="gemCard"]',
+    ]:
+        try:
+            await page.wait_for_selector(_wait_sel, timeout=5000, state="visible")
+            logger.info(f"Элементы товаров появились: {_wait_sel}")
+            product_appeared = True
+            break
+        except Exception:
+            continue
+
+    if not product_appeared:
+        logger.warning(
+            "Элементы товаров не обнаружены после ожидания. "
+            "Возможно, SPA ещё грузится или требуется авторизация. "
+            f"URL: {page.url}"
+        )
+        # Ещё одна попытка — ждём дольше
+        await browser.human_like_delay(3000, 5000)
+    else:
+        await browser.human_like_delay(1000, 2000)
+
     await browser.take_screenshot(f"store_{game}_{session_id}.png")
 
     logger.info(f"Поиск товара '{product_name}' и добавление в корзину...")
