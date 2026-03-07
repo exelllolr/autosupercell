@@ -16,6 +16,10 @@ services:
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - DEBUG=false
       - DOCKER_CONTAINER=true
+      # Xvfb virtual display — headed Chrome обходит Cloudflare Turnstile
+      # (headless Chrome блокируется Turnstile на странице accounts.supercell.com/login)
+      - DISPLAY=:99
+      - BROWSER_HEADLESS=false
     volumes:
       - ./logs:/app/logs
       - ./screenshots:/app/screenshots
@@ -93,6 +97,8 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - DOCKER_CONTAINER=true
+      - DISPLAY=:99
+      - BROWSER_HEADLESS=false
     volumes:
       - ./logs:/app/logs
       - ./screenshots:/app/screenshots

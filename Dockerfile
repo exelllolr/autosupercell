@@ -5,8 +5,10 @@ WORKDIR /app
 
 # Install system dependencies:
 #   - Chromium/Chrome runtime libs (Patchright/Playwright)
-#   - libgl1          → required by opencv-python (cv2 imports libGL.so.1)
-#   - libglib2.0-0    → required by opencv-python (libgthread-2.0.so.0)
+#   - xvfb, x11-utils, dbus-x11 → виртуальный дисплей для headed Chrome
+#     (обходит Cloudflare Turnstile, который блокирует headless Chrome)
+#   - libgl1          → required by opencv-python-headless
+#   - libglib2.0-0    → required by opencv-python-headless
 #   - libxext6        → required by Chrome (libXext.so.6)
 #   - fonts-unifont   → replaces ttf-unifont (unavailable in Bookworm)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -41,6 +43,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libgl1 \
     libglib2.0-0 \
+    xvfb \
+    x11-utils \
+    dbus-x11 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy and install Python dependencies first (Docker layer cache)
@@ -59,14 +64,18 @@ COPY . .
 # но лучше иметь их в образе для случаев без volume-mount)
 RUN mkdir -p logs screenshots proofs videos
 
+# Make the Xvfb startup script executable
+RUN chmod +x /app/scripts/start_with_xvfb.sh
+
 # Only the API port is exposed.
-# Port 9090 removed: Prometheus metrics are served at 8000/metrics, not a separate port.
 EXPOSE 8000
 
 # Health check.
-# start_period=60s: первый запуск с установкой/прогревом Chrome может занять до 60 сек.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+# start_period=90s: Xvfb + Chrome первый запуск может занять до 90 сек.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')" || exit 1
 
-# Run application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run application via Xvfb startup script.
+# Xvfb создаёт виртуальный дисплей :99, после чего запускается uvicorn.
+# Chrome работает в headed режиме (BROWSER_HEADLESS=false) — Turnstile проходит.
+CMD ["/app/scripts/start_with_xvfb.sh"]

@@ -159,15 +159,46 @@ class BrowserAutomation:
                     or os.environ.get("DOCKER_CONTAINER") == "true"
                 )
 
-                # ИСПРАВЛЕНО: в Docker ВСЕГДА headless — GUI недоступен на сервере.
-                # Настройка BROWSER_HEADLESS=false из .env игнорируется в контейнере.
+                # В Docker headed режим возможен только при наличии виртуального дисплея (Xvfb).
+                # Если задан DISPLAY (например :99 от Xvfb) — разрешаем BROWSER_HEADLESS=false.
+                # Без DISPLAY в Docker принудительно включаем headless.
+                #
+                # Зачем это нужно:
+                #   Cloudflare Turnstile на accounts.supercell.com/login блокирует headless Chrome —
+                #   форма входа не рендерится (email input не появляется в DOM).
+                #   Xvfb + headed Chrome обходит это: Turnstile не отличает его от реального браузера.
                 if is_docker:
-                    headless_mode = True
-                    if not getattr(settings, "BROWSER_HEADLESS", True):
-                        logger.warning(
-                            "Docker: принудительно включён headless режим "
-                            "(BROWSER_HEADLESS=false из .env игнорируется в контейнере)"
+                    display_var = os.environ.get("DISPLAY", "").strip()
+                    has_xvfb_display = bool(display_var)
+                    requested_headless = getattr(settings, "BROWSER_HEADLESS", True)
+
+                    if has_xvfb_display and not requested_headless:
+                        # Xvfb запущен + явно задан BROWSER_HEADLESS=false → headed Chrome
+                        headless_mode = False
+                        logger.info(
+                            "Docker + Xvfb: headed режим Chrome включён "
+                            "(DISPLAY=%s, BROWSER_HEADLESS=false). "
+                            "Cloudflare Turnstile будет проходить корректно.",
+                            display_var,
                         )
+                    elif has_xvfb_display and requested_headless:
+                        # Xvfb есть, но headless=true — оставляем headless (пользователь сам решил)
+                        headless_mode = True
+                        logger.info(
+                            "Docker + Xvfb: DISPLAY=%s, но BROWSER_HEADLESS=true → headless режим. "
+                            "Если возникает ошибка Turnstile — установите BROWSER_HEADLESS=false в .env.",
+                            display_var,
+                        )
+                    else:
+                        # Нет Xvfb → принудительно headless
+                        headless_mode = True
+                        if not requested_headless:
+                            logger.warning(
+                                "Docker: BROWSER_HEADLESS=false проигнорировано — DISPLAY не задан "
+                                "(Xvfb не запущен). Принудительно headless режим. "
+                                "Для headed режима используйте docker-compose с DISPLAY=:99 "
+                                "и CMD scripts/start_with_xvfb.sh."
+                            )
                 else:
                     headless_mode = (
                         getattr(settings, "BROWSER_HEADLESS", True)
@@ -176,25 +207,35 @@ class BrowserAutomation:
                     )
                 use_chrome = getattr(settings, "BROWSER_USE_CHROME", False)
 
-                # В headed режиме (локально) убираем Docker-специфичные флаги
+                # В headed режиме убираем часть флагов, чтобы Chrome не выглядел подозрительно.
+                # НО: в Docker через Xvfb оставляем --no-sandbox и --disable-dev-shm-usage —
+                # они нужны для стабильной работы Chrome внутри контейнера.
                 if not headless_mode:
-                    browser_args = [
-                        a
-                        for a in browser_args
-                        if a
-                        not in (
+                    _docker_only_flags = (
+                        "--disable-extensions",
+                        "--disable-plugins-discovery",
+                        "--disable-default-apps",
+                        "--disable-component-extensions-with-background-pages",
+                    )
+                    if not is_docker:
+                        # Локально (не Docker) — убираем также sandbox-флаги
+                        _docker_only_flags = _docker_only_flags + (
                             "--no-sandbox",
                             "--disable-setuid-sandbox",
                             "--disable-dev-shm-usage",
-                            "--disable-extensions",
-                            "--disable-plugins-discovery",
-                            "--disable-default-apps",
-                            "--disable-component-extensions-with-background-pages",
                         )
+                    browser_args = [
+                        a for a in browser_args if a not in _docker_only_flags
                     ]
-                    logger.info(
-                        "Headed режим: убраны Docker-специфичные флаги для лучшей имитации"
-                    )
+                    if is_docker:
+                        logger.info(
+                            "Headed режим (Docker+Xvfb): убраны флаги расширений/плагинов, "
+                            "оставлены --no-sandbox и --disable-dev-shm-usage для стабильности в контейнере."
+                        )
+                    else:
+                        logger.info(
+                            "Headed режим (локально): убраны Docker-специфичные флаги для лучшей имитации."
+                        )
 
                 use_persistent = getattr(
                     settings, "BROWSER_USE_PERSISTENT_PROFILE", True

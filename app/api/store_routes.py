@@ -1088,7 +1088,7 @@ async def _purchase_flow(request: PurchaseRequest):
                     await browser.human_like_delay(2000, 4000)
                     logger.info("Прогрев supercell.com завершён")
                 except Exception as warmup_err:
-                    logger.debug("Прогрев supercell.com пропущен: %s", warmup_err)
+                    logger.debug(f"Прогрев supercell.com пропущен: {warmup_err}")
 
             # Переход на store, пауза, принятие cookies
             logger.info("Переход на store.supercell.com...")
@@ -1207,13 +1207,12 @@ async def _purchase_flow(request: PurchaseRequest):
                                     )
                                 return True
                             if elapsed == 0:
+                                _cf_hint = title or body_text[:80]
                                 logger.warning(
-                                    "Обнаружен Cloudflare challenge (%s). "
-                                    "Ждём до %d сек. "
+                                    f"Обнаружен Cloudflare challenge ({_cf_hint}). "
+                                    f"Ждём до {max_wait_sec} сек. "
                                     "Это типично для VPS-IP без резидентного прокси. "
-                                    "Рекомендуется включить прокси (Novada/BrightData) в .env.",
-                                    title or body_text[:80],
-                                    max_wait_sec,
+                                    "Решение: Docker+Xvfb (headed режим) или резидентный прокси."
                                 )
                                 await browser.take_screenshot(
                                     f"cloudflare_challenge_{session_id}.png"
@@ -1222,10 +1221,10 @@ async def _purchase_flow(request: PurchaseRequest):
                             pass
                         await asyncio.sleep(1)
                     logger.error(
-                        "Cloudflare challenge не прошёл за %d сек. URL: %s — "
-                        "IP-адрес сервера заблокирован. Включите резидентный прокси в .env.",
-                        max_wait_sec,
-                        browser.page.url,
+                        f"Cloudflare challenge не прошёл за {max_wait_sec} сек. "
+                        f"URL: {browser.page.url} — IP-адрес заблокирован. "
+                        "Убедитесь что Xvfb запущен (scripts/start_with_xvfb.sh) "
+                        "и BROWSER_HEADLESS=false в .env."
                     )
                     return False
 
@@ -1256,7 +1255,7 @@ async def _purchase_flow(request: PurchaseRequest):
                                     wait_until="domcontentloaded",
                                     timeout=30000,
                                 )
-                                logger.info("Переход на fallback URL: %s", fallback_url)
+                                logger.info(f"Переход на fallback URL: {fallback_url}")
                                 break
                             except Exception as e:
                                 logger.debug(
@@ -1277,10 +1276,10 @@ async def _purchase_flow(request: PurchaseRequest):
                                 wait_until="domcontentloaded",
                                 timeout=30000,
                             )
-                            logger.info("Переход на fallback URL: %s", fallback_url)
+                            logger.info(f"Переход на fallback URL: {fallback_url}")
                             break
                         except Exception as e:
-                            logger.debug("Ошибка перехода на %s: %s", fallback_url, e)
+                            logger.debug(f"Ошибка перехода на {fallback_url}: {e}")
 
                 try:
                     await browser.page.wait_for_load_state(
@@ -1288,7 +1287,7 @@ async def _purchase_flow(request: PurchaseRequest):
                     )
                 except Exception:
                     pass
-                logger.info("Страница логина загружена: %s", browser.page.url)
+                logger.info(f"Страница логина загружена: {browser.page.url}")
 
                 # Ожидаем Cloudflare challenge (если VPS-IP без прокси)
                 await _wait_for_cloudflare(max_wait_sec=30)
@@ -1301,10 +1300,9 @@ async def _purchase_flow(request: PurchaseRequest):
                 await browser.take_screenshot(
                     f"login_page_before_email_{session_id}.png"
                 )
+                _login_title = await browser.page.evaluate("() => document.title")
                 logger.info(
-                    "Страница логина — URL: %s | title: %s",
-                    browser.page.url,
-                    await browser.page.evaluate("() => document.title"),
+                    f"Страница логина — URL: {browser.page.url} | title: '{_login_title}'"
                 )
 
                 current_url = browser.page.url
@@ -1417,9 +1415,8 @@ async def _purchase_flow(request: PurchaseRequest):
                         else "https://accounts.supercell.com/login"
                     )
                     logger.warning(
-                        "Email-поле не найдено на %s — пробуем альтернативный URL: %s",
-                        browser.page.url,
-                        alt_login_url,
+                        f"Email-поле не найдено на {browser.page.url} — "
+                        f"пробуем альтернативный URL: {alt_login_url}"
                     )
                     try:
                         await browser.page.goto(
@@ -1440,7 +1437,7 @@ async def _purchase_flow(request: PurchaseRequest):
                                 continue
                     except Exception as alt_err:
                         logger.warning(
-                            "Альтернативный URL также не сработал: %s", alt_err
+                            f"Альтернативный URL также не сработал: {alt_err}"
                         )
 
                 if not email_input:
@@ -1458,15 +1455,11 @@ async def _purchase_flow(request: PurchaseRequest):
                         ).lower()[:500]
                         page_html_short = (await browser.page.content())[:1000]
                         logger.error(
-                            "Email-поле не найдено.\n"
-                            "  URL: %s\n"
-                            "  Title: %s\n"
-                            "  Текст страницы (первые 500 символов): %s\n"
-                            "  HTML (первые 1000 символов): %s",
-                            current_url_diag,
-                            page_title_diag,
-                            page_text_diag,
-                            page_html_short,
+                            f"Email-поле не найдено.\n"
+                            f"  URL: {current_url_diag}\n"
+                            f"  Title: {page_title_diag}\n"
+                            f"  Текст страницы (первые 500 символов): {page_text_diag}\n"
+                            f"  HTML (первые 1000 символов): {page_html_short}"
                         )
                         await browser.take_screenshot(
                             f"no_email_field_final_{session_id}.png"
