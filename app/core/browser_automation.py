@@ -299,8 +299,14 @@ class BrowserAutomation:
                     profile_dir.mkdir(parents=True, exist_ok=True)
                     logger.debug(f"Профиль браузера: {profile_dir}")
 
-                video_dir = Path("videos")
-                video_dir.mkdir(exist_ok=True)
+                # Абсолютный путь — аналогично take_screenshot: в headed+persistent режиме
+                # Chromium стартует из директории профиля, относительный "videos" → FileNotFoundError.
+                try:
+                    _project_root_v = Path(__file__).resolve().parent.parent.parent
+                except Exception:
+                    _project_root_v = Path.cwd()
+                video_dir = (_project_root_v / "videos").resolve()
+                video_dir.mkdir(parents=True, exist_ok=True)
                 first_lang = current_languages[0]
                 locale = first_lang if "-" in first_lang else f"{first_lang}-US"
 
@@ -1121,13 +1127,25 @@ class BrowserAutomation:
         if not self.page:
             raise RuntimeError("Страница не инициализирована")
 
-        screenshot_dir = Path("screenshots")
-        screenshot_dir.mkdir(exist_ok=True)
+        # Используем абсолютный путь через resolve() — критично для headed режима
+        # с persistent profile: Chromium стартует из директории профиля (/app/browser_profile),
+        # и относительный путь "screenshots/..." Playwright разрешает относительно CWD
+        # браузера, а не Python-процесса → FileNotFoundError.
+        # resolve() преобразует "screenshots" → "/app/screenshots" (абсолютный путь),
+        # который корректно работает и в headless, и в headed+persistent режимах.
+        try:
+            project_root = Path(__file__).resolve().parent.parent.parent
+        except Exception:
+            project_root = Path.cwd()
+        screenshot_dir = (project_root / "screenshots").resolve()
+        screenshot_dir.mkdir(parents=True, exist_ok=True)
 
         filepath = screenshot_dir / filename
+        filepath_abs = str(filepath)
+
         try:
             await self.page.screenshot(
-                path=str(filepath),
+                path=filepath_abs,
                 full_page=True,
                 timeout=timeout_ms,
             )
@@ -1138,13 +1156,15 @@ class BrowserAutomation:
                     f"Скриншот full_page таймаут ({timeout_ms} мс), пробуем viewport..."
                 )
                 try:
-                    await self.page.screenshot(path=str(filepath), timeout=5000)
+                    await self.page.screenshot(path=filepath_abs, timeout=5000)
                 except Exception:
                     raise e
             else:
                 raise
-        logger.info(f"Скриншот сохранен: {filepath}")
-        return filepath
+        # Возвращаем относительный путь (для отображения в API-ответах и логах)
+        rel_path = Path("screenshots") / filename
+        logger.info(f"Скриншот сохранен: {rel_path}")
+        return rel_path
 
     async def get_page_content(self) -> Dict[str, any]:
         """Получить содержимое страницы для AI-анализа."""
