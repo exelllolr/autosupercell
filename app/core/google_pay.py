@@ -173,7 +173,12 @@ async def _is_appcharge_checkout(page) -> bool:
     try:
         text = (await page.evaluate("() => document.body.innerText")).lower()
         url = (page.url or "").lower()
-        return "appcharge" in text or "buy with g pay" in text or "appcharge" in url
+        return (
+            "powered by appcharge" in text
+            or "appcharge" in text
+            or "buy with g pay" in text
+            or "appcharge" in url
+        )
     except Exception:
         return False
 
@@ -220,16 +225,18 @@ async def _wait_for_fastspring_loaded(page, timeout_ms: int = None) -> list:
     return []
 
 
-# Селекторы кнопки "Buy with G Pay" (Appcharge на основной странице)
+# Селекторы кнопки оплаты Appcharge: "Pay $0.99" / "Place Your Order" (после выбора плашки Google Pay)
 _APPCHARGE_BUY_GPAY_SELECTORS = [
+    'button:has-text("Place Your Order")',
+    'button:has-text("Place your order")',
+    'button:has-text("Pay $")',
+    'button:has-text("Pay €")',
+    'button:has-text("Pay £")',
     'button:has-text("Buy with G Pay")',
     'button:has-text("Buy with Google Pay")',
     '[role="button"]:has-text("Buy with G Pay")',
     'button:has-text("Pay with G Pay")',
     'button:has-text("Pay with Google Pay")',
-    'button:has-text("Pay $")',
-    'button:has-text("Pay €")',
-    'button:has-text("Pay £")',
     '.gpay-button',
     '[class*="gpay-button"]',
     '[class*="google-pay-button"]',
@@ -239,11 +246,12 @@ _APPCHARGE_BUY_GPAY_SELECTORS = [
 
 async def select_gpay_and_buy_appcharge(page) -> bool:
     """
-    Checkout на основной странице или в iframe (Appcharge и др.): выбираем Google Pay, нажимаем "Buy with G Pay".
-    Используется, когда FastSpring не открывается. Ищет кнопки на главной странице и во всех iframe.
+    Checkout Appcharge (или на основной странице): выбираем плашку Google Pay,
+    ждём прогрузки, нажимаем "Pay $X.XX" / "Place Your Order". Откроется окно Sign in → те же шаги, что FastSpring.
+    Используется при обнаружении Appcharge или когда FastSpring не открылся.
     Возвращает True, если кнопка оплаты нажата (откроется окно Sign in).
     """
-    logger.info("Пробуем Google Pay на странице и во всех iframe: вкладка G Pay → Buy with G Pay...")
+    logger.info("Appcharge: выбор плашки Google Pay → ожидание загрузки → Pay / Place Your Order...")
     try:
         await page.evaluate("window.scrollTo(0, 0)")
         await page.wait_for_timeout(500)
@@ -273,17 +281,18 @@ async def select_gpay_and_buy_appcharge(page) -> bool:
 
         tab_clicked = await _try_click_in_frame(
             target, _GPAY_TAB_SELECTORS,
-            f"Appcharge ({label}): выбрана вкладка Google Pay"
+            f"Appcharge ({label}): выбрана плашка Google Pay"
         )
         if not tab_clicked:
             continue
 
-        await page.wait_for_timeout(4000)
+        # Ждём прогрузки формы после выбора Google Pay (как на скриншоте Appcharge)
+        await page.wait_for_timeout(8000)
         await _screenshot(page, "appcharge_after_gpay_tab")
 
         pay_clicked = await _try_click_in_frame(
             target, _APPCHARGE_BUY_GPAY_SELECTORS,
-            f"Appcharge ({label}): нажата кнопка Buy with G Pay"
+            f"Appcharge ({label}): нажата кнопка Pay / Place Your Order"
         )
         if not pay_clicked:
             pay_clicked = await _try_click_in_frame(
@@ -294,7 +303,7 @@ async def select_gpay_and_buy_appcharge(page) -> bool:
             await _screenshot(page, "appcharge_buy_with_gpay_clicked")
             return True
 
-    logger.warning("Appcharge: вкладка Google Pay или кнопка Buy with G Pay не найдены ни на странице, ни в iframe")
+    logger.warning("Appcharge: плашка Google Pay или кнопка Pay/Place Your Order не найдены ни на странице, ни в iframe")
     await _screenshot(page, "appcharge_buy_gpay_not_found")
     return False
 
@@ -372,7 +381,14 @@ async def select_gpay_tab_and_pay(page, timeout_ms: int = 90000) -> bool:
 
     await _screenshot(page, "gpay_checkout_start")
 
-    # Сначала ждём FastSpring с коротким таймаутом; если не открылся — пробуем Appcharge
+    # Параллельно с FastSpring: если открыт Appcharge (Powered by appcharge) — сразу его обрабатываем
+    if await _is_appcharge_checkout(page):
+        logger.info("Обнаружен checkout Appcharge (Powered by appcharge), выбираем Google Pay → Pay / Place Your Order...")
+        appcharge_ok = await select_gpay_and_buy_appcharge(page)
+        if appcharge_ok:
+            return True
+
+    # Ждём FastSpring с коротким таймаутом; если не открылся — пробуем Appcharge
     fastspring_wait_ms = min(timeout_ms, _FASTSPRING_SHORT_TIMEOUT_MS)
     loaded_frames = await _wait_for_fastspring_loaded(page, timeout_ms=fastspring_wait_ms)
 

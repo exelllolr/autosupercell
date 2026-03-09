@@ -23,13 +23,22 @@
 4. Далее: Next → пароль → 2FA при необходимости → подтверждение оплаты.
 5. Итог так же: завершение покупки, скриншоты, проверка, отвязка.
 
+### Вариант C: Checkout Appcharge («Powered by appcharge»)
+
+1. После Checkout открывается страница с **Appcharge** (внизу «Powered by appcharge»): способы оплаты Card, Amazon Pay, PayPal, **Google Pay**, Cash App Pay.
+2. Скрипт **сразу** определяет Appcharge и: выбирает **плашку Google Pay** → ждёт прогрузки (8 сек) → нажимает **«Pay $X.XX»** или **«Place Your Order»**.
+3. Открывается окно **Sign in** (как в вариантах A/B) → ввод email, пароля, 2FA при необходимости → подтверждение оплаты.
+4. Итог: «CONGRATULATIONS PURCHASE COMPLETE» → скриншоты, проверка аккаунта, отвязка карты.
+
+Appcharge обрабатывается **параллельно** с FastSpring: если на странице есть «Powered by appcharge», используется flow Appcharge; иначе ждём FastSpring iframe и при отсутствии — fallback на Appcharge.
+
 ### Общая последовательность (независимо от варианта)
 
 | Шаг | Действие |
 |-----|----------|
 | 1 | Store (Supercell) → корзина → Checkout. |
-| 2 | Открывается FastSpring (вкладка/окно): выбор способа оплаты → вкладка **G Pay** → кнопка **«Place Your Order»** (или аналог). |
-| 3 | Страница `pay.fastspring.com/.../googlepay.html`: корзина, кнопка **«Pay with G Pay»**. |
+| 2 | Открывается **FastSpring** или **Appcharge**. **Appcharge**: плашка **Google Pay** → ждём загрузки → **«Pay $X.XX»** / **«Place Your Order»**. **FastSpring**: вкладка **G Pay** → **«Place Your Order»**. |
+| 3 | Страница оплаты (FastSpring `pay.fastspring.com/.../googlepay.html` или аналог): корзина, кнопка **«Pay with G Pay»**. |
 | 4 | Клик **«Pay with G Pay»** → либо **popup** (accounts.google.com), либо форма в **iframe** в том же окне. |
 | 5 | Вход в Google: email → Next → пароль (App Password) → при запросе 2FA — «Try another way» → «Enter one of your 8-digit backup codes» → ввод кода. |
 | 6 | Подтверждение оплаты в окне Google Pay. |
