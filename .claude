@@ -1,0 +1,208 @@
+# Claude Configuration for AutoSupercell
+
+## Project Context
+
+AutoSupercell - автоматизация покупок в Supercell Store (Clash Royale, Brawl Stars) с использованием AI Vision для поиска товаров на странице.
+
+## AI Vision Task
+
+**Задача:** Найти товар на скриншоте страницы магазина и вернуть координаты для клика.
+
+**Входные данные:**
+- Скриншот страницы магазина (PNG, 1920x1080)
+- Название товара (например: "80 Gems", "Mega Lightning Chest")
+- Тип товара (gems, cards, chest)
+
+**Выходные данные (JSON):**
+```json
+{
+  "found": true,
+  "coordinates": {"x": 640, "y": 480, "width": 200, "height": 300},
+  "button_text": "Buy",
+  "price": "$0.99",
+  "confidence": 0.95,
+  "description": "80 Gems pack in center of screen"
+}
+```
+
+## Claude Model Configuration
+
+**Model:** `claude-3-5-sonnet-20241022`
+
+**Reasons:**
+1. Best vision capabilities in Claude family
+2. Excellent at following JSON structure
+3. High accuracy for UI element detection
+4. Cost-effective ($3 per 1M input tokens)
+
+**Parameters:**
+- `max_tokens`: 1024 (достаточно для JSON ответа)
+- `temperature`: 0.0 (детерминированный вывод)
+- `top_p`: 1.0
+
+## Prompt Engineering
+
+### System Prompt
+```
+You are a precise computer vision assistant specialized in finding UI elements on screenshots.
+Your task is to locate products in game store interfaces and return exact coordinates.
+
+CRITICAL RULES:
+1. Always respond with valid JSON only (no markdown, no explanations)
+2. Coordinates must be in pixels from top-left corner (0,0)
+3. If product not found, return {"found": false}
+4. Confidence must be 0.0-1.0 (use 0.9+ only if very certain)
+```
+
+### User Prompt Template
+```
+Find product "{product_name}" (type: {product_type}) on this game store screenshot.
+
+Visible elements on page:
+{visible_elements_text}
+
+Return JSON with:
+- found: boolean
+- coordinates: {x, y, width, height} in pixels
+- button_text: text on buy button
+- price: product price if visible
+- confidence: 0.0-1.0
+- description: brief description of found element
+
+JSON only, no markdown:
+```
+
+## Image Handling
+
+**Format:** PNG (preferred) or JPEG
+**Max size:** 5MB (resize if larger)
+**Recommended resolution:** 1920x1080 or 1280x720
+**Encoding:** Base64 for API
+
+## Error Handling
+
+### Retry Strategy
+```python
+max_retries = 2
+backoff_factor = 2  # 2s, 4s
+timeout = 30  # seconds
+```
+
+### Fallback Chain
+1. Claude 3.5 Sonnet (primary)
+2. OpenAI GPT-4o (fallback)
+3. CSS selector search (last resort)
+
+## Rate Limits
+
+**Tier 1 (default):**
+- 50 requests/minute
+- 40,000 tokens/minute
+- 5 requests/second
+
+**Mitigation:**
+- Queue requests if rate limit hit
+- Exponential backoff on 429 errors
+- Monitor usage via Anthropic dashboard
+
+## Cost Optimization
+
+### Current Costs (Claude 3.5 Sonnet)
+- Input: $3 per 1M tokens (~1000 images)
+- Output: $15 per 1M tokens (~1000 JSON responses)
+- **Total:** ~$3-4 per 1000 product searches
+
+### Optimization Strategies
+1. **Prompt Caching:** Cache system prompt (50% cost reduction)
+2. **Image Compression:** Resize to 1280x720 if > 1920x1080
+3. **Batch Processing:** Group multiple products in one request
+4. **Smart Fallback:** Use CSS selectors first, Claude only if needed
+
+## Monitoring
+
+### Key Metrics
+```python
+# Prometheus metrics
+claude_requests_total
+claude_request_duration_seconds
+claude_errors_total
+claude_cost_usd
+claude_accuracy_rate
+```
+
+### Logging
+```python
+logger.info(f"Claude Vision: found={result['found']}, confidence={result['confidence']}, latency={duration}s")
+```
+
+## Testing
+
+### Test Images
+Store test screenshots in `tests/fixtures/screenshots/`:
+- `clash_royale_gems.png` - 80 Gems pack
+- `brawl_stars_chest.png` - Mega Box
+- `empty_store.png` - No products (negative test)
+
+### Validation
+```python
+assert result["found"] in [True, False]
+assert 0 <= result["confidence"] <= 1.0
+assert result["coordinates"]["x"] >= 0
+assert result["coordinates"]["y"] >= 0
+```
+
+## Security
+
+**API Key Storage:**
+- Never commit `ANTHROPIC_API_KEY` to git
+- Use `.env` file (gitignored)
+- Rotate keys every 90 days
+
+**Data Privacy:**
+- Screenshots may contain user data
+- Don't log full images
+- Comply with GDPR if applicable
+
+## Documentation
+
+**Setup Guide:** `docs/CLAUDE_SETUP.md`
+**API Reference:** `docs/API.md#ai-vision`
+**Troubleshooting:** `docs/TROUBLESHOOTING.md#claude-errors`
+
+## Dependencies
+
+```txt
+anthropic>=0.18.0
+pillow>=10.0.0  # Image processing
+```
+
+## Environment Variables
+
+```bash
+# Required
+ANTHROPIC_API_KEY=sk-ant-api03-...
+
+# Optional
+AI_PROVIDER=claude  # openai | claude | gemini
+CLAUDE_MODEL=claude-3-5-sonnet-20241022
+CLAUDE_MAX_TOKENS=1024
+CLAUDE_TIMEOUT=30
+```
+
+## Known Issues
+
+1. **Coordinate Mismatch:** Claude returns full-page coordinates, but Playwright clicks in viewport
+   - **Solution:** Scroll element into view before click
+   
+2. **JSON Parsing Errors:** Sometimes Claude adds markdown formatting
+   - **Solution:** Strip ```json markers before parsing
+
+3. **Rate Limits:** Tier 1 has 50 req/min limit
+   - **Solution:** Implement request queue with rate limiting
+
+## Future Improvements
+
+1. **Prompt Caching:** Reduce costs by 50%
+2. **Multi-modal Chain:** Claude → GPT-4o → CSS fallback
+3. **Fine-tuning:** Train on Supercell Store screenshots
+4. **Batch Processing:** Find multiple products in one request

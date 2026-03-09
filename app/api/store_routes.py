@@ -1164,6 +1164,9 @@ async def run_purchase_flow_after_login(
     logger.info(f"Переход в магазин {game}...")
     await browser.navigate_to_store(game)
 
+    # Диагностика после перехода в магазин
+    await browser._log_diagnostics("after_navigate_to_store")
+
     # Дополнительное ожидание после навигации: Next.js SPA грузит продукты через API-запросы.
     # domcontentloaded — только парсинг HTML, продукты ещё не загружены.
     # Ждём networkidle или конкретного появления элементов товаров.
@@ -1217,6 +1220,9 @@ async def run_purchase_flow_after_login(
         await browser.human_like_delay(1000, 2000)
 
     await browser.take_screenshot(f"store_{game}_{session_id}.png")
+
+    # Диагностика перед поиском товара
+    await browser._log_diagnostics("before_product_search")
 
     logger.info(f"Поиск товара '{product_name}' и добавление в корзину...")
     clicked = await _find_and_click_product(browser, product_name)
@@ -2091,6 +2097,9 @@ async def _purchase_flow(request: PurchaseRequest):
                 logger.info("Авторизация завершена, продолжаем покупку...")
                 await browser.human_like_delay(2000, 3000)
 
+                # Диагностика после авторизации
+                await browser._log_diagnostics("after_auth")
+
                 # КРИТИЧНО: После авторизации нужно дождаться синхронизации сессии между
                 # accounts.supercell.com и store.supercell.com. На сервере (особенно через прокси)
                 # это занимает больше времени чем локально. Переходим на главную store.supercell.com
@@ -2099,6 +2108,9 @@ async def _purchase_flow(request: PurchaseRequest):
                 try:
                     await browser.page.goto("https://store.supercell.com", wait_until="domcontentloaded", timeout=30000)
                     await browser.human_like_delay(2000, 3000)
+                    
+                    # Диагностика после перехода на store
+                    await browser._log_diagnostics("after_goto_store")
                     
                     # Ждём пока исчезнет кнопка "Log in" (максимум 30 сек)
                     for attempt in range(6):
@@ -2117,6 +2129,9 @@ async def _purchase_flow(request: PurchaseRequest):
                         logger.warning("Сессия может быть не синхронизирована после 30 сек ожидания")
                     
                     await browser.take_screenshot(f"store_after_auth_{session_id}.png")
+                    
+                    # Финальная диагностика перед покупкой
+                    await browser._log_diagnostics("before_purchase_flow")
                 except Exception as e:
                     logger.warning(f"Ошибка проверки синхронизации сессии: {e}")
 

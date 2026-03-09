@@ -98,7 +98,8 @@ class OrderProcessor:
                     if page:
                         x = coords.get("x", 0) + coords.get("width", 0) / 2
                         y = coords.get("y", 0) + coords.get("height", 0) / 2
-                        await page.click(f"x={x},y={y}")
+                        # ИСПРАВЛЕНО: правильный синтаксис Playwright для клика по координатам
+                        await page.mouse.click(x, y)
                         logger.info(f"Клик по координатам: ({x}, {y})")
 
             await asyncio.sleep(2)

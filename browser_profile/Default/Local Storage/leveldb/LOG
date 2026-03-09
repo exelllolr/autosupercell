@@ -1,6 +1,3 @@
-2026/03/06-16:06:04.921 1268 Reusing MANIFEST C:\Users\exelllolr\Desktop\autosupercell\browser_profile\Default\Local Storage\leveldb/MANIFEST-000001
-2026/03/06-16:06:04.925 1268 Recovering log #26
-2026/03/06-16:06:04.927 1268 Reusing old log C:\Users\exelllolr\Desktop\autosupercell\browser_profile\Default\Local Storage\leveldb/000026.log 
-2026/03/06-16:10:07.524 6264 Level-0 table #30: started
-2026/03/06-16:10:07.528 6264 Level-0 table #30: 19764 bytes OK
-2026/03/06-16:10:07.531 6264 Delete type=0 #26
+2026/03/09-16:25:49.712 cec Reusing MANIFEST C:\Users\exelllolr\Desktop\autosupercell\browser_profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/03/09-16:25:49.716 cec Recovering log #44
+2026/03/09-16:25:49.718 cec Reusing old log C:\Users\exelllolr\Desktop\autosupercell\browser_profile\Default\Local Storage\leveldb/000044.log 

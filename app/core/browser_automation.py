@@ -71,6 +71,11 @@ class BrowserAutomation:
         self.current_proxy: Optional[Dict] = (
             None  # для mark_proxy_failed при ошибке навигации
         )
+        # Диагностика
+        self.network_log_enabled = getattr(settings, "BROWSER_NETWORK_LOG", True)
+        self.console_log_enabled = getattr(settings, "BROWSER_CONSOLE_LOG", True)
+        self.request_count = 0
+        self.failed_requests = []
 
     async def start(
         self,
@@ -523,6 +528,10 @@ class BrowserAutomation:
 
                 self.page = await self.context.new_page()
 
+                # Настройка логирования сети и консоли
+                await self._setup_network_logging()
+                await self._setup_console_logging()
+
                 if not use_patchright:
                     await self._apply_cdp_webdriver_patch()
                     use_stealth_plugin = getattr(
@@ -560,6 +569,10 @@ class BrowserAutomation:
                     await self._enable_browsec_vpn_region()
 
                 logger.info("Браузер успешно запущен с улучшенным stealth режимом")
+                
+                # Начальная диагностика
+                await self._log_diagnostics("after_browser_start")
+                
                 return  # Успешно запущен
 
             except Exception as e:
@@ -1542,6 +1555,199 @@ class BrowserAutomation:
             logger.error(f"Ошибка авторизации: {e}")
             await self.take_screenshot("login_error.png")
             raise
+
+    async def _setup_network_logging(self) -> None:
+        """Настройка логирования сетевых запросов."""
+        if not self.page or not self.network_log_enabled:
+            return
+
+        # Фильтр для шумных запросов (fonts, analytics, ads)
+        noise_patterns = [
+            r'\.woff2?$', r'\.ttf$', r'\.eot$',  # fonts
+            r'google-analytics\.com', r'googletagmanager\.com',  # analytics
+            r'doubleclick\.net', r'googlesyndication\.com',  # ads
+            r'facebook\.com/tr', r'connect\.facebook\.net',  # facebook pixel
+            r'\.png$', r'\.jpg$', r'\.jpeg$', r'\.gif$', r'\.svg$', r'\.ico$',  # images (опционально)
+        ]
+        
+        def is_noise(url: str) -> bool:
+            return any(re.search(pattern, url, re.I) for pattern in noise_patterns)
+
+        async def on_request(request):
+            """Логирование исходящих запросов."""
+            if is_noise(request.url):
+                return
+            self.request_count += 1
+            method = request.method
+            url = request.url
+            logger.debug(f"→ [{method}] {url}")
+
+        async def on_response(response):
+            """Логирование ответов."""
+            if is_noise(response.url):
+                return
+            status = response.status
+            url = response.url
+            method = response.request.method
+            
+            # Логируем по уровням
+            if 200 <= status < 300:
+                logger.debug(f"← [{status}] {method} {url}")
+            elif 300 <= status < 400:
+                logger.warning(f"← [{status}] REDIRECT {method} {url}")
+            elif 400 <= status < 500:
+                logger.error(f"← [{status}] CLIENT ERROR {method} {url}")
+                self.failed_requests.append({"url": url, "status": status, "method": method})
+            elif status >= 500:
+                logger.error(f"← [{status}] SERVER ERROR {method} {url}")
+                self.failed_requests.append({"url": url, "status": status, "method": method})
+
+        async def on_request_failed(request):
+            """Логирование failed requests (network errors)."""
+            if is_noise(request.url):
+                return
+            failure = request.failure
+            url = request.url
+            method = request.method
+            error_text = failure if failure else "Unknown error"
+            logger.error(f"✗ [{method}] FAILED {url} - {error_text}")
+            self.failed_requests.append({"url": url, "error": error_text, "method": method})
+
+        self.page.on("request", on_request)
+        self.page.on("response", on_response)
+        self.page.on("requestfailed", on_request_failed)
+        logger.info("Network logging enabled")
+
+    async def _setup_console_logging(self) -> None:
+        """Настройка логирования console messages и errors."""
+        if not self.page or not self.console_log_enabled:
+            return
+
+        async def on_console(msg):
+            """Логирование console messages."""
+            msg_type = msg.type
+            text = msg.text
+            
+            # Фильтруем шум
+            noise_keywords = ['favicon', 'DevTools', 'Autofill', 'Download the React DevTools']
+            if any(keyword in text for keyword in noise_keywords):
+                return
+            
+            if msg_type == "error":
+                logger.error(f"CONSOLE ERROR: {text}")
+            elif msg_type == "warning":
+                logger.warning(f"CONSOLE WARNING: {text}")
+            elif msg_type in ("log", "info"):
+                logger.debug(f"CONSOLE: {text}")
+
+        async def on_page_error(error):
+            """Логирование uncaught exceptions на странице."""
+            logger.error(f"PAGE ERROR (uncaught exception): {error}")
+
+        self.page.on("console", on_console)
+        self.page.on("pageerror", on_page_error)
+        logger.info("Console logging enabled")
+
+    async def _check_viewport_consistency(self, action_name: str = "") -> None:
+        """Проверка соответствия viewport заданному разрешению."""
+        if not self.page:
+            return
+        
+        try:
+            actual_viewport = await self.page.evaluate("""() => ({
+                width: window.innerWidth,
+                height: window.innerHeight,
+                outerWidth: window.outerWidth,
+                outerHeight: window.outerHeight,
+                devicePixelRatio: window.devicePixelRatio,
+                screenWidth: window.screen.width,
+                screenHeight: window.screen.height
+            })""")
+            
+            expected = self.current_viewport
+            actual_inner = {"width": actual_viewport["width"], "height": actual_viewport["height"]}
+            
+            if expected and (actual_inner["width"] != expected["width"] or actual_inner["height"] != expected["height"]):
+                logger.warning(
+                    f"VIEWPORT MISMATCH {action_name}: "
+                    f"expected {expected['width']}x{expected['height']}, "
+                    f"actual {actual_inner['width']}x{actual_inner['height']} "
+                    f"(outer: {actual_viewport['outerWidth']}x{actual_viewport['outerHeight']}, "
+                    f"dpr: {actual_viewport['devicePixelRatio']})"
+                )
+            else:
+                logger.debug(
+                    f"Viewport OK {action_name}: {actual_inner['width']}x{actual_inner['height']} "
+                    f"(dpr: {actual_viewport['devicePixelRatio']})"
+                )
+        except Exception as e:
+            logger.debug(f"Viewport check failed: {e}")
+
+    async def _detect_iframes(self, action_name: str = "") -> List[Dict]:
+        """Детектирование всех iframe на странице."""
+        if not self.page:
+            return []
+        
+        try:
+            iframes_info = await self.page.evaluate("""() => {
+                const iframes = Array.from(document.querySelectorAll('iframe'));
+                return iframes.map((iframe, idx) => ({
+                    index: idx,
+                    src: iframe.src || '',
+                    id: iframe.id || '',
+                    name: iframe.name || '',
+                    width: iframe.offsetWidth,
+                    height: iframe.offsetHeight,
+                    visible: iframe.offsetParent !== null,
+                    sandbox: iframe.sandbox ? iframe.sandbox.toString() : ''
+                }));
+            }""")
+            
+            if iframes_info:
+                logger.info(f"IFRAMES detected {action_name}: {len(iframes_info)} iframe(s)")
+                for iframe in iframes_info:
+                    logger.info(
+                        f"  - iframe[{iframe['index']}]: src={iframe['src'][:80] if iframe['src'] else 'empty'}, "
+                        f"id={iframe['id']}, visible={iframe['visible']}, size={iframe['width']}x{iframe['height']}"
+                    )
+            
+            # Проверяем доступность iframe (same-origin policy)
+            frames = self.page.frames
+            logger.info(f"Page frames count: {len(frames)} (main + iframes)")
+            for idx, frame in enumerate(frames):
+                try:
+                    frame_url = frame.url
+                    is_main = frame == self.page.main_frame
+                    logger.debug(f"  Frame[{idx}]: {'MAIN' if is_main else 'IFRAME'} - {frame_url[:100]}")
+                except Exception as e:
+                    logger.warning(f"  Frame[{idx}]: inaccessible (cross-origin?) - {e}")
+            
+            return iframes_info
+        except Exception as e:
+            logger.debug(f"Iframe detection failed: {e}")
+            return []
+
+    async def _log_diagnostics(self, action_name: str = "") -> None:
+        """Комплексная диагностика: viewport, iframes, network stats."""
+        if not self.page:
+            return
+        
+        logger.info(f"=== DIAGNOSTICS {action_name} ===")
+        logger.info(f"URL: {self.page.url}")
+        
+        # Viewport
+        await self._check_viewport_consistency(action_name)
+        
+        # Iframes
+        await self._detect_iframes(action_name)
+        
+        # Network stats
+        if self.network_log_enabled:
+            logger.info(f"Network: {self.request_count} requests, {len(self.failed_requests)} failed")
+            if self.failed_requests:
+                logger.warning(f"Failed requests: {self.failed_requests[-5:]}")  # последние 5
+        
+        logger.info(f"=== END DIAGNOSTICS ===")
 
     async def close(self):
         """

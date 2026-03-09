@@ -77,11 +77,19 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     ANTHROPIC_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
+    
+    # Claude specific settings
+    CLAUDE_MODEL: str = "claude-3-5-sonnet-20241022"
+    CLAUDE_MAX_TOKENS: int = 1024
+    CLAUDE_TIMEOUT: int = 30
+    CLAUDE_ENABLE_CACHING: bool = True
 
     # Supercell Store URLs
+    # ВАЖНО: правильные URL без дефиса (/clashroyale, /brawlstars)
+    # Старые URL с дефисом (/clash-royale, /brawl-stars) ведут на 404
     SUPERCELL_STORE_URL: str = "https://store.supercell.com"
-    CLASH_ROYALE_STORE_URL: str = "https://store.supercell.com/clash-royale"
-    BRAWL_STARS_STORE_URL: str = "https://store.supercell.com/brawl-stars"
+    CLASH_ROYALE_STORE_URL: str = "https://store.supercell.com/clashroyale"
+    BRAWL_STARS_STORE_URL: str = "https://store.supercell.com/brawlstars"
 
     # Proxy
     PROXY_ENABLED: bool = True
@@ -161,6 +169,10 @@ class Settings(BaseSettings):
     # Logging
     LOG_LEVEL: str = "INFO"
     LOG_FILE: str = "logs/autosupercell.log"
+    
+    # Browser Diagnostics (network and console logging)
+    BROWSER_NETWORK_LOG: bool = True
+    BROWSER_CONSOLE_LOG: bool = True
 
     # Order Configuration
     MAX_ORDER_TTL: int = 600

@@ -52,9 +52,9 @@ class OpenAIProvider(BaseAIProvider):
             with open(image_path_obj, "rb") as image_file:
                 image_data = base64.b64encode(image_file.read()).decode("utf-8")
 
-            # Вызываем GPT-4 Vision
+            # Вызываем GPT-4o (обновлённая модель с vision, заменяет устаревший gpt-4-vision-preview)
             response = await self.client.chat.completions.create(
-                model="gpt-4-vision-preview",
+                model="gpt-4o",
                 messages=[
                     {
                         "role": "user",

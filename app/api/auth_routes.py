@@ -1,5 +1,6 @@
 """API routes для авторизации и управления аккаунтами."""
 
+import re
 from fastapi import APIRouter, HTTPException, Body, Query
 from pydantic import BaseModel, EmailStr
 from typing import Optional, Dict, List
@@ -126,38 +127,101 @@ async def google_login(request: GoogleAuthRequest):
                 continue
         
         if not next_clicked:
-            # Пробуем нажать Enter
             await browser.page.keyboard.press("Enter")
-        
-        await browser.page.wait_for_timeout(3000)  # Увеличено время ожидания
+
+        # Ждём перехода на шаг пароля (v3: .../challenge/pwd или v2: .../challenge)
+        try:
+            await browser.page.wait_for_url(
+                lambda u: "challenge/pwd" in u or "pwd" in u or "challenge" in u,
+                timeout=20000,
+            )
+        except Exception:
+            pass
+        await browser.page.wait_for_timeout(2000)
         await browser.take_screenshot(f"google_login_email_{session_id}.png")
 
-        # Проверяем, что появилось поле пароля или другие варианты
         if request.password:
-            # Ждем появления поля пароля с увеличенным таймаутом
+            # Селекторы для страницы пароля Google (v2 и v3), включая "Enter your password"
             password_selectors = [
                 'input[type="password"]',
-                'input[name="password"]',
-                'input[name="Passwd"]',
-                '#password',
+                'input[aria-label*="Enter your password" i]',
                 'input[aria-label*="password" i]',
+                'input[aria-label*="пароль" i]',
+                'input[name="Passwd"]',
+                'input[name="password"]',
+                'input[autocomplete="current-password"]',
+                '#password input',
+                '#password',
             ]
-            
             password_input = None
+            found_password_selector = None
             for selector in password_selectors:
                 try:
-                    password_input = await browser.page.wait_for_selector(selector, timeout=15000)
-                    if password_input:
-                        logger.info(f"Найдено поле пароля: {selector}")
-                        break
+                    el = await browser.page.wait_for_selector(
+                        selector, timeout=12000, state="visible"
+                    )
+                    if el:
+                        is_visible = await el.is_visible()
+                        if is_visible:
+                            password_input = el
+                            found_password_selector = selector
+                            logger.info(f"Найдено поле пароля: {selector}")
+                            break
                 except Exception:
                     continue
-            
-            if password_input:
-                await browser.page.fill(password_selectors[0], request.password)
+
+            # Fallback: getByLabel / getByRole для "Enter your password"
+            if not password_input and not found_password_selector:
+                for label_text in ["Enter your password", "password", "Введите пароль", "Пароль"]:
+                    try:
+                        loc = browser.page.get_by_label(re.compile(re.escape(label_text), re.I))
+                        await loc.first.wait_for(state="visible", timeout=5000)
+                        password_input = True
+                        found_password_selector = "__getByLabel__"
+                        logger.info(f"Поле пароля найдено через getByLabel: {label_text}")
+                        break
+                    except Exception:
+                        continue
+            if not password_input and not found_password_selector:
+                try:
+                    loc = browser.page.get_by_role(
+                        "textbox", name=re.compile(r"password|пароль|passwd|enter your password", re.I)
+                    )
+                    await loc.first.wait_for(state="visible", timeout=8000)
+                    password_input = True
+                    found_password_selector = "__locator__"
+                    logger.info("Поле пароля найдено через getByRole(textbox)")
+                except Exception as e:
+                    logger.debug(f"getByRole для пароля не сработал: {e}")
+
+            if password_input and found_password_selector:
+                if found_password_selector == "__getByLabel__":
+                    # Используем тот же текст, который сработал (первый из списка, который найдётся при повторе)
+                    for label_text in ["Enter your password", "password", "Введите пароль", "Пароль"]:
+                        try:
+                            loc = browser.page.get_by_label(re.compile(re.escape(label_text), re.I))
+                            await loc.first.fill(request.password)
+                            break
+                        except Exception:
+                            continue
+                elif found_password_selector == "__locator__":
+                    loc = browser.page.get_by_role(
+                        "textbox", name=re.compile(r"password|пароль|passwd|enter your password", re.I)
+                    )
+                    await loc.first.fill(request.password)
+                else:
+                    await browser.page.fill(found_password_selector, request.password)
+                # Если fill не сработал — симулируем ввод с клавиатуры (триггерит события Google)
+                try:
+                    pwd_el = await browser.page.query_selector('input[type="password"]')
+                    if pwd_el:
+                        cur_val = await browser.page.evaluate("el => el.value", pwd_el)
+                        if not cur_val or len(cur_val) == 0:
+                            await pwd_el.click()
+                            await browser.page.keyboard.type(request.password, delay=50)
+                except Exception:
+                    pass
                 await browser.take_screenshot(f"google_login_password_filled_{session_id}.png")
-                
-                # Ищем кнопку "Next" для пароля
                 password_next_clicked = False
                 for selector in next_button_selectors:
                     try:
@@ -166,18 +230,13 @@ async def google_login(request: GoogleAuthRequest):
                         break
                     except Exception:
                         continue
-                
                 if not password_next_clicked:
                     await browser.page.keyboard.press("Enter")
-                
-                await browser.page.wait_for_timeout(5000)  # Увеличено время ожидания
+                await browser.page.wait_for_timeout(5000)
                 await browser.take_screenshot(f"google_login_password_{session_id}.png")
             else:
-                # Поле пароля не появилось - возможно требуется дополнительная верификация
                 logger.warning("Поле пароля не найдено, возможно требуется дополнительная верификация")
                 await browser.take_screenshot(f"google_login_no_password_field_{session_id}.png")
-                
-                # Проверяем наличие капчи или других элементов
                 page_text = await browser.page.evaluate("() => document.body.innerText")
                 if "captcha" in page_text.lower() or "verify" in page_text.lower():
                     raise Exception("Требуется капча или дополнительная верификация")
