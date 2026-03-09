@@ -18,7 +18,7 @@ from app.core.proxy_manager import proxy_manager
 
 router = APIRouter()
 
-MAX_BLOCK_RETRIES = 3
+MAX_BLOCK_RETRIES = 30  # при блокировке входа Supercell — смена прокси и повтор до 30 раз
 
 
 async def _find_and_click_product(
