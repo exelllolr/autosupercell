@@ -1765,8 +1765,16 @@ async def _click_pay_button_inside_iframes(popup_page) -> bool:
     """
     Ищет кнопку Оплатить/Pay внутри iframe на странице pay.google.com.
     Вариант 1: iframe#sM432dIframe и др. Вариант 2 (BT-Portman): цикл ожидания iframe[name$="Iframe"] + Pay exact.
+    На pay.fastspring.com кнопка обычно в основном документе — не тратим время на ожидание pay.google.com и iframe.
     """
     import re
+
+    current_url = (popup_page.url or "").lower()
+    if "fastspring.com" in current_url:
+        # FastSpring Google Pay: кнопка Pay/Оплатить в main frame ([class*="pay-button"] и т.д.), не в iframe pay.google.com
+        logger.info("Страница pay.fastspring.com — ищем кнопку в основном документе, пропускаем ожидание pay.google.com/iframe")
+        await popup_page.wait_for_timeout(2000)
+        return False
 
     # Ожидание перехода на pay.google.com (как в issue #19776)
     try:
@@ -2508,32 +2516,45 @@ async def handle_google_pay(
                 first_pay_clicked = await _confirm_payment_in_popup(popup_page)
                 if first_pay_clicked:
                     logger.info("Кнопка оплаты нажата, ожидание перехода на страницу входа Google...")
-                    # Ждём sign-in: либо навигация в том же popup, либо новое окно (до 90 сек)
-                    for _ in range(90):
-                        await popup_page.wait_for_timeout(1000)
-                        try:
-                            current_url = (popup_page.url or "").lower()
-                            if "accounts.google.com" in current_url or "signin" in current_url:
-                                signin_page = popup_page
-                                logger.info("Открылась страница входа Google (sign-in) в том же popup")
-                                break
-                        except Exception:
-                            pass
-                        # Проверяем все страницы контекста — sign-in мог открыться в новом окне
-                        if signin_page is None and browser.context:
-                            for p in browser.context.pages:
-                                try:
-                                    u = (p.url or "").lower()
-                                    if "accounts.google.com" in u or ("signin" in u and "google" in u):
-                                        signin_page = p
-                                        logger.info("Найдена страница входа Google в новом окне: %s", p.url[:80])
-                                        break
-                                except Exception:
-                                    continue
-                        if signin_page is not None:
-                            break
+                    # Сначала явно ждём навигации в том же popup на accounts.google.com (часто после клика на FastSpring)
+                    try:
+                        await popup_page.wait_for_url(
+                            lambda u: "accounts.google.com" in (u or "") or ("signin" in (u or "").lower() and "google" in (u or "").lower()),
+                            timeout=60_000,
+                        )
+                        signin_page = popup_page
+                        logger.info("Открылась страница входа Google в том же popup (wait_for_url)")
+                    except Exception:
+                        pass
+                    # Дополнительно: опрос popup и всех окон (до 90 сек), если sign-in ещё не найден (новое окно или задержка)
                     if signin_page is None:
-                        logger.warning("Страница sign-in не обнаружена за 90 сек (popup и все окна проверены)")
+                        for _ in range(90):
+                            await popup_page.wait_for_timeout(1000)
+                            try:
+                                current_url = (popup_page.url or "").lower()
+                                if "accounts.google.com" in current_url or "signin" in current_url:
+                                    signin_page = popup_page
+                                    logger.info("Открылась страница входа Google (sign-in) в том же popup")
+                                    break
+                            except Exception:
+                                pass
+                            if signin_page is not None:
+                                break
+                            # Проверяем все страницы контекста — sign-in мог открыться в новом окне
+                            if browser.context:
+                                for p in browser.context.pages:
+                                    try:
+                                        u = (p.url or "").lower()
+                                        if "accounts.google.com" in u or ("signin" in u and "google" in u):
+                                            signin_page = p
+                                            logger.info("Найдена страница входа Google в новом окне: %s", p.url[:80])
+                                            break
+                                    except Exception:
+                                        continue
+                            if signin_page is not None:
+                                break
+                        if signin_page is None:
+                            logger.warning("Страница sign-in не обнаружена за 90 сек (popup и все окна проверены)")
 
             # Страница для логина: найденная sign-in или текущий popup если уже на sign-in
             if signin_page is None and popup_page:
