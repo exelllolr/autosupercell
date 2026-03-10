@@ -397,6 +397,14 @@ async def _screenshot_full(page, name: str, folder: str = "screenshots") -> str:
 # ПОРЯДОК ВАЖЕН: сначала самые точные (специфичные для FastSpring), потом общие.
 # НЕ используем 'div:has-text("Google Pay")' — слишком широкий, матчит весь body.
 _GPAY_TAB_SELECTORS = [
+    # ── "Pay with G Pay" / "Pay with Google Pay" — часто на сервере/в iframe именно такая подпись вкладки ──
+    'button:has-text("Pay with G Pay")',
+    'button:has-text("Pay with Google Pay")',
+    '[role="tab"]:has-text("Pay with G Pay")',
+    '[role="tab"]:has-text("Pay with Google Pay")',
+    'div:has-text("Pay with G Pay")',
+    'label:has-text("Pay with G Pay")',
+    'li:has-text("Pay with G Pay")',
     # ── FastSpring: вкладка выглядит как кнопка/div с текстом "Google Pay" внутри платёжного переключателя ──
     # Точные селекторы для структуры FastSpring (store.supercell.com)
     '[data-fsc-item-path-value*="google"]',
@@ -443,6 +451,11 @@ _GPAY_TAB_SELECTORS = [
 # Селекторы кнопки оплаты после выбора G Pay вкладки
 # ВАЖНО: эти селекторы применяются ТОЛЬКО после клика по вкладке G Pay
 _GPAY_PAY_BUTTON_SELECTORS = [
+    # "Pay with G Pay" / "Pay with Google Pay" — может быть и вкладкой, и кнопкой подтверждения (сервер/разные локали)
+    'button:has-text("Pay with G Pay")',
+    'button:has-text("Pay with Google Pay")',
+    '[role="button"]:has-text("Pay with G Pay")',
+    '[role="button"]:has-text("Pay with Google Pay")',
     # FastSpring: "Place Your Order" — основная кнопка после выбора G Pay
     'button:has-text("Place Your Order")',
     'button:has-text("Place your order")',
@@ -874,12 +887,19 @@ async def _click_fastspring_gpay_tab(page_or_frame) -> bool:
                     .filter(n => n.nodeType === 3)
                     .map(n => n.textContent.trim())
                     .join('');
-                // Точный текст "Google Pay" или "G Pay" в своих текстовых узлах
-                if (ownText === 'Google Pay' || ownText === 'G Pay' ||
-                    text === 'Google Pay' || text === 'G Pay') {
+                // Точный текст вкладки: "Google Pay", "G Pay", "Pay with G Pay", "Pay with Google Pay"
+                const match = (
+                    ownText === 'Google Pay' || ownText === 'G Pay' ||
+                    ownText === 'Pay with G Pay' || ownText === 'Pay with Google Pay' ||
+                    text === 'Google Pay' || text === 'G Pay' ||
+                    text === 'Pay with G Pay' || text === 'Pay with Google Pay' ||
+                    (text.indexOf('Pay with G Pay') >= 0 && text.length < 80) ||
+                    (text.indexOf('Pay with Google Pay') >= 0 && text.length < 80)
+                );
+                if (match) {
                     const rect = node.getBoundingClientRect();
-                    // Не контейнер: элемент небольшой и кликабельный
-                    if (rect.width < 300 && rect.height < 200 && rect.width > 0) {
+                    // Не контейнер: ограничиваем размер (для "Pay with G Pay" ширина может быть больше)
+                    if (rect.width < 400 && rect.height < 200 && rect.width > 0) {
                         candidates.push(node);
                     }
                 }
@@ -1065,7 +1085,7 @@ async def select_gpay_tab_and_pay(page, timeout_ms: int = 90000) -> bool:
             logger.info("[ШАГ 3.3] Метод Claude AI: делаем скриншот и спрашиваем...")
             claude_tab_sel = await _claude_find_gpay_selector(
                 page,
-                context_hint="FastSpring checkout on store.supercell.com. 4 tabs: Card, PayPal, Google Pay, Amazon Pay. Return selector for Google Pay tab."
+                context_hint="FastSpring checkout on store.supercell.com. Tabs may be: Card, PayPal, Google Pay (or 'Pay with G Pay' / 'G Pay'), Amazon Pay. Return selector for the Google Pay tab/button."
             )
             logger.info(f"[ШАГ 3.3] Claude AI предложил: {claude_tab_sel!r}")
             if claude_tab_sel:
@@ -1087,6 +1107,7 @@ async def select_gpay_tab_and_pay(page, timeout_ms: int = 90000) -> bool:
         for wait_step in range(8):
             await page.wait_for_timeout(2000)
             for quick_sel in [
+                'button:has-text("Pay with G Pay")', 'button:has-text("Pay with Google Pay")',
                 'button:has-text("Pay $")', 'button:has-text("Place Your Order")',
                 'button:has-text("Place your order")', '.gpay-button',
             ]:
