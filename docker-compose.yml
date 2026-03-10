@@ -104,7 +104,8 @@ services:
       - 127.0.0.11
       - 8.8.8.8
       - 1.1.1.1
-    command: arq app.workers.arq_worker.WorkerSettings
+    # Xvfb + arq: worker использует браузерную автоматизацию (OrderProcessor), нужен headed Chrome
+    command: /app/scripts/start_worker_with_xvfb.sh
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379

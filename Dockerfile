@@ -64,8 +64,8 @@ COPY . .
 # но лучше иметь их в образе для случаев без volume-mount)
 RUN mkdir -p logs screenshots proofs videos
 
-# Make the Xvfb startup script executable
-RUN chmod +x /app/scripts/start_with_xvfb.sh
+# Make the Xvfb startup scripts executable
+RUN chmod +x /app/scripts/start_with_xvfb.sh /app/scripts/start_worker_with_xvfb.sh
 
 # Only the API port is exposed.
 EXPOSE 8000
