@@ -259,6 +259,101 @@ async def _try_click_claude_selector(frame_or_page, selector: str, label: str) -
     return False
 
 
+async def _claude_find_oplatit_button_coordinates(popup_page) -> tuple[int, int] | None:
+    """
+    Делает скриншот popup pay.google.com и спрашивает Claude Vision:
+    где находится центр кнопки «Оплатить»/Pay (в пикселях от левого верхнего угла изображения).
+    Возвращает (x, y) для mouse.click(x, y) или None.
+    Ключ берётся из settings.ANTHROPIC_API_KEY или .env (ANTHROPIC_API_KEY).
+    """
+    import json
+    import re as re_lib
+
+    anthropic_key = getattr(settings, "ANTHROPIC_API_KEY", "") or os.environ.get("ANTHROPIC_API_KEY", "")
+    model = getattr(settings, "CLAUDE_MODEL", "claude-3-5-sonnet-20241022") or "claude-3-5-sonnet-20241022"
+    if not anthropic_key:
+        logger.debug("ANTHROPIC_API_KEY не задан, пропускаем Claude AI поиск кнопки Оплатить")
+        return None
+
+    try:
+        import aiohttp
+
+        _ensure_dir("screenshots")
+        screenshot_path = "screenshots/claude_oplatit_button.png"
+        await popup_page.screenshot(path=screenshot_path, full_page=False)
+
+        with open(screenshot_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode()
+
+        prompt = """This is a screenshot of the Google Pay payment confirmation page (pay.google.com).
+Find the main payment button: blue button with text "Оплатить" (Russian) or "Pay" (English). It confirms the payment.
+
+Return ONLY a JSON object with the center coordinates of that button in pixels from the top-left corner of the image.
+Format: {"x": number, "y": number}
+Example: {"x": 540, "y": 720}
+
+Return nothing else — no markdown, no explanation, only the JSON object. If the button is not visible, return: {"x": -1, "y": -1}"""
+
+        payload = {
+            "model": model,
+            "max_tokens": 128,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": img_b64,
+                            },
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ],
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": anthropic_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=25),
+            ) as resp:
+                data = await resp.json()
+
+        text = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                text = block["text"].strip()
+                break
+
+        if not text:
+            return None
+        # Убираем markdown-обёртку если есть
+        text = re_lib.sub(r"^```(?:json)?\s*", "", text)
+        text = re_lib.sub(r"\s*```\s*$", "", text)
+        parsed = json.loads(text)
+        x, y = int(parsed.get("x", -1)), int(parsed.get("y", -1))
+        if x < 0 or y < 0:
+            logger.debug("Claude AI: кнопка Оплатить не найдена на скриншоте")
+            return None
+        logger.info("Claude AI определил координаты кнопки Оплатить: (%s, %s)", x, y)
+        return (x, y)
+    except json.JSONDecodeError as e:
+        logger.debug("Claude AI: не удалось распарсить JSON координат: %s", e)
+        return None
+    except Exception as e:
+        logger.debug("Claude AI поиск кнопки Оплатить по координатам: %s", e)
+        return None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Вспомогательные функции
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1643,10 +1738,171 @@ async def _login_google_in_popup(
 # Шаг 3: Подтверждение оплаты в popup Google Pay
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Кнопка "Оплатить"/Pay на pay.google.com часто находится ВНУТРИ IFRAME (см. Playwright issue #19776)
+_PAY_BUTTON_IFRAME_SELECTORS = [
+    'iframe#sM432dIframe',
+    'iframe[id*="Iframe"]',
+    'iframe[name*="Iframe"]:not([name="paymentsModalIframe"])',
+    'iframe[title*="pay"]',
+    'iframe',
+]
+
+
+async def _click_pay_button_inside_iframes(popup_page) -> bool:
+    """
+    Ищет кнопку Оплатить/Pay внутри iframe на странице pay.google.com.
+    По данным Playwright issue #19776, секция оплаты рендерится в отдельном iframe.
+    """
+    import re
+    for frame_sel in _PAY_BUTTON_IFRAME_SELECTORS:
+        try:
+            frame_loc = popup_page.frame_locator(frame_sel)
+            for btn_text in ["Оплатить", "Pay", "Continue", "Подтвердить"]:
+                try:
+                    btn = frame_loc.get_by_role("button", name=re.compile(re.escape(btn_text), re.I)).first
+                    if await btn.count() > 0:
+                        await btn.scroll_into_view_if_needed()
+                        await _delay(popup_page, 400, 800)
+                        await btn.click(timeout=15000)
+                        logger.info("Кнопка 'Оплатить'/'Pay' нажата внутри iframe (%s), текст: %s", frame_sel, btn_text)
+                        return True
+                except Exception:
+                    continue
+            try:
+                for sel in ['button:has-text("Оплатить")', 'button:has-text("Pay")', 'button[jsname="LgbsSe"]', 'button.VfPpkd-LgbsSe']:
+                    loc = frame_loc.locator(sel).first
+                    if await loc.count() > 0:
+                        await loc.scroll_into_view_if_needed()
+                        await _delay(popup_page, 400, 800)
+                        await loc.click(timeout=15000)
+                        logger.info("Кнопка 'Оплатить'/'Pay' нажата внутри iframe (%s): %s", frame_sel, sel)
+                        return True
+            except Exception:
+                continue
+        except Exception as e:
+            logger.debug("Поиск кнопки в iframe %s: %s", frame_sel, e)
+            continue
+    # Перебор всех фреймов страницы (frame.frames)
+    try:
+        for frame in popup_page.frames:
+            if frame == popup_page.main_frame:
+                continue
+            try:
+                for sel in ['button:has-text("Оплатить")', 'button:has-text("Pay")', 'button[jsname="LgbsSe"]']:
+                    loc = frame.locator(sel).first
+                    if await loc.count() > 0:
+                        await loc.scroll_into_view_if_needed()
+                        await _delay(popup_page, 400, 800)
+                        await loc.click(timeout=15000)
+                        logger.info("Кнопка 'Оплатить'/'Pay' нажата во фрейме (locator %s)", sel)
+                        return True
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug("Перебор frames: %s", e)
+
+    # Если один селектор (например iframe) совпадает с несколькими iframe — пробуем по индексу
+    try:
+        for i in range(5):
+            try:
+                fl = popup_page.frame_locator("iframe").nth(i)
+                btn = fl.get_by_role("button", name=re.compile(r"оплатить|pay|continue", re.I)).first
+                if await btn.count() > 0:
+                    await btn.scroll_into_view_if_needed()
+                    await _delay(popup_page, 400, 800)
+                    await btn.click(timeout=15000)
+                    logger.info("Кнопка 'Оплатить'/'Pay' нажата в iframe.nth(%s)", i)
+                    return True
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug("Перебор iframe по индексу: %s", e)
+    return False
+
+
+def _js_find_pay_button_rect():
+    """JavaScript: находит кнопку Оплатить/Pay (в т.ч. в shadow DOM), скроллит в вид, возвращает rect."""
+    return """
+        () => {
+            function findButtonInRoot(root) {
+                const byJsname = root.querySelector('button[jsname="LgbsSe"]');
+                if (byJsname) return byJsname;
+                const byClass = root.querySelector('button.VfPpkd-LgbsSe');
+                if (byClass) return byClass;
+                const buttons = root.querySelectorAll('button');
+                for (const b of buttons) {
+                    const t = (b.textContent || '').trim();
+                    if (t === 'Оплатить' || t === 'Pay' || t.includes('Оплатить')) return b;
+                }
+                const span = root.querySelector('span.VfPpkd-vQzf8d');
+                if (span && span.textContent && span.textContent.includes('Оплатить')) {
+                    const btn = span.closest('button');
+                    if (btn) return btn;
+                }
+                return null;
+            }
+            let el = findButtonInRoot(document);
+            if (!el) {
+                const all = document.querySelectorAll('*');
+                for (let i = 0; i < all.length; i++) {
+                    if (all[i].shadowRoot) {
+                        el = findButtonInRoot(all[i].shadowRoot);
+                        if (el) break;
+                    }
+                }
+            }
+            if (!el) return null;
+            el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            const r = el.getBoundingClientRect();
+            return { left: r.left, top: r.top, width: r.width, height: r.height };
+        }
+    """
+
+
+async def _click_pay_button_by_mouse_at_coords(popup_page) -> bool:
+    """
+    Находит кнопку Оплатить через JS (document + shadow DOM), получает её координаты,
+    выполняет клик мышью по центру кнопки (viewport coordinates).
+    """
+    try:
+        rect = await popup_page.evaluate(_js_find_pay_button_rect())
+        if not rect or rect.get("width", 0) <= 0 or rect.get("height", 0) <= 0:
+            return False
+        cx = rect["left"] + rect["width"] / 2
+        cy = rect["top"] + rect["height"] / 2
+        await popup_page.wait_for_timeout(300)
+        await popup_page.mouse.click(cx, cy)
+        logger.info("Кнопка 'Оплатить'/'Pay' нажата: мышь по координатам (%.0f, %.0f)", cx, cy)
+        return True
+    except Exception as e:
+        logger.debug("Клик мышью по координатам кнопки: %s", e)
+        return False
+
+
 async def _click_pay_button_once(popup_page, confirm_selectors, re_module) -> bool:
     """Одна попытка нажать кнопку Оплатить/Pay. Возвращает True если клик выполнен."""
-    # Даём странице время отрисовать кнопку (pay.google.com динамический)
     await popup_page.wait_for_timeout(3000)
+
+    # 0) Кнопка на pay.google.com часто внутри iframe (Playwright issue #19776)
+    if await _click_pay_button_inside_iframes(popup_page):
+        return True
+
+    # 0.5) Поиск кнопки «Оплатить» через Claude Vision: координаты центра → клик мышью
+    coords = await _claude_find_oplatit_button_coordinates(popup_page)
+    if coords:
+        x, y = coords
+        try:
+            await popup_page.mouse.click(x, y)
+            logger.info("Кнопка 'Оплатить'/'Pay' нажата: Claude AI координаты (%s, %s)", x, y)
+            return True
+        except Exception as e:
+            logger.debug("Клик по координатам Claude AI не удался: %s", e)
+
+    # 1) Клик мышью по координатам (JS ищет кнопку в document + shadow DOM)
+    if await _click_pay_button_by_mouse_at_coords(popup_page):
+        return True
+
+    # 2) Клик по локаторам Playwright + при необходимости bounding_box → mouse.click
     for _wait_step in range(10):
         for sel in confirm_selectors:
             try:
@@ -1654,6 +1910,13 @@ async def _click_pay_button_once(popup_page, confirm_selectors, re_module) -> bo
                 if await loc.count() > 0:
                     await loc.scroll_into_view_if_needed()
                     await _delay(popup_page, 300, 600)
+                    box = await loc.bounding_box()
+                    if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+                        cx = box["x"] + box["width"] / 2
+                        cy = box["y"] + box["height"] / 2
+                        await popup_page.mouse.click(cx, cy)
+                        logger.info(f"Кнопка 'Оплатить'/'Pay' нажата: мышь по bounding_box ({sel})")
+                        return True
                     try:
                         await loc.click(timeout=15000)
                     except Exception:
@@ -1664,12 +1927,20 @@ async def _click_pay_button_once(popup_page, confirm_selectors, re_module) -> bo
                 continue
         if _wait_step < 9:
             await popup_page.wait_for_timeout(2000)
+
     for name_pattern in [re_module.compile(r"оплатить|pay|confirm|continue|подтвердить", re_module.I)]:
         try:
             btn = popup_page.get_by_role("button", name=name_pattern).first
             if await btn.count() > 0:
                 await btn.scroll_into_view_if_needed()
                 await _delay(popup_page, 300, 600)
+                box = await btn.bounding_box()
+                if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+                    cx = box["x"] + box["width"] / 2
+                    cy = box["y"] + box["height"] / 2
+                    await popup_page.mouse.click(cx, cy)
+                    logger.info("Кнопка 'Оплатить'/'Pay' нажата: мышь по bounding_box (get_by_role)")
+                    return True
                 try:
                     await btn.click(timeout=15000)
                 except Exception:
@@ -1678,7 +1949,8 @@ async def _click_pay_button_once(popup_page, confirm_selectors, re_module) -> bo
                 return True
         except Exception:
             continue
-    # Запасной вариант: клик через JavaScript (кнопка может быть в shadow DOM или перекрыта)
+
+    # 3) JS: программный .click() по элементу (document + shadow DOM)
     try:
         clicked = await popup_page.evaluate("""
             () => {
@@ -1715,6 +1987,12 @@ async def _click_pay_button_once(popup_page, confirm_selectors, re_module) -> bo
             return True
     except Exception as e:
         logger.debug("JS клик по кнопке Оплатить: %s", e)
+
+    # 4) Повторный клик мышью по координатам (после того как JS мог отрисовать страницу)
+    await popup_page.wait_for_timeout(1500)
+    if await _click_pay_button_by_mouse_at_coords(popup_page):
+        return True
+
     return False
 
 
