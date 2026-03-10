@@ -9,19 +9,254 @@ Flow FastSpring:
 5. Ждём "Processing Payment" → "CONGRATULATIONS PURCHASE COMPLETE"
 6. Скриншот_1 в profs/, переход на /account, проверка Purchase history, скриншот_2, отвязка карт, выход из Google
 
-Если FastSpring не открывается — проверяем checkout Appcharge на основной странице:
-- Выбираем Google Pay, нажимаем "Buy with G Pay"
-- Откроется окно Sign in → вводим данные от аккаунта, заходим и оплачиваем
+Flow Appcharge (параллельно с FastSpring):
+- Обнаруживается сразу (powered by appcharge / "buy with g pay") ИЛИ если FastSpring не открылся
+- Каждые 5 сек во время ожидания FastSpring проверяем наличие Appcharge
+- Выбираем плашку Google Pay, ждём прогрузки формы, нажимаем "Place Your Order"
+- Откроется окно Sign in → вводим данные, оплачиваем
 - Дальше заходим в аккаунт, проверяем покупку и выходим из аккаунта как обычно
+
+Claude AI помощь:
+- Если стандартные CSS-селекторы не нашли вкладку G Pay — делаем скриншот и спрашиваем Claude
+- Если стандартные селекторы не нашли кнопку Place Your Order — делаем скриншот и спрашиваем Claude
+- Требуется ANTHROPIC_API_KEY в .env (AI_PROVIDER=claude)
 """
 
 import asyncio
+import base64
 import os
 import random
 from datetime import datetime
 from loguru import logger
 
 from app.config import settings
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Claude AI helper: определение вкладки Google Pay и помощь в оплате
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _claude_find_gpay_selector(page, context_hint: str = "") -> str | None:
+    """
+    Делает скриншот страницы и спрашивает Claude API, какой CSS-селектор
+    нажать для перехода к Google Pay. Возвращает найденный селектор или None.
+    """
+    anthropic_key = getattr(settings, "ANTHROPIC_API_KEY", "") or os.environ.get("ANTHROPIC_API_KEY", "")
+    model = getattr(settings, "CLAUDE_MODEL", "claude-3-5-sonnet-20241022") or "claude-3-5-sonnet-20241022"
+    if not anthropic_key:
+        logger.debug("ANTHROPIC_API_KEY не задан, пропускаем Claude AI поиск G Pay")
+        return None
+
+    try:
+        import aiohttp
+
+        # Скриншот текущего состояния страницы
+        _ensure_dir("screenshots")
+        screenshot_path = "screenshots/claude_gpay_analysis.png"
+        await page.screenshot(path=screenshot_path, full_page=False)
+
+        with open(screenshot_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode()
+
+        # Также получаем HTML для анализа
+        try:
+            html_snippet = await page.evaluate("""() => {
+                const body = document.body;
+                const clone = body.cloneNode(true);
+                // Убираем скрипты и стили для краткости
+                clone.querySelectorAll('script,style,noscript').forEach(e => e.remove());
+                return clone.innerHTML.slice(0, 8000);
+            }""")
+        except Exception:
+            html_snippet = ""
+
+        prompt = f"""You are analyzing a payment checkout page screenshot.
+{context_hint}
+
+Your task: Find the Google Pay tab/option/button on this page.
+
+Look for:
+- A tab labeled "G Pay", "Google Pay", or showing the Google Pay logo
+- A payment method selector or radio button for Google Pay
+- Any button or element to select Google Pay as payment method
+
+Based on the screenshot and the HTML snippet below, return ONLY a valid CSS selector string that I can use to click the Google Pay tab/option. 
+Return just the selector, nothing else. If you cannot find it, return: NOT_FOUND
+
+HTML snippet:
+{html_snippet[:4000]}
+"""
+
+        payload = {
+            "model": model,
+            "max_tokens": 256,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": img_b64,
+                            },
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ],
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": anthropic_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json()
+
+        selector = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                selector = block["text"].strip()
+                break
+
+        if not selector or selector == "NOT_FOUND" or len(selector) > 300:
+            logger.debug(f"Claude AI: G Pay селектор не найден (ответ: {selector[:80]})")
+            return None
+
+        logger.info(f"Claude AI предложил селектор G Pay: {selector}")
+        return selector
+
+    except Exception as e:
+        logger.debug(f"Claude AI поиск G Pay: ошибка {e}")
+        return None
+
+
+async def _claude_find_pay_button_selector(page, context_hint: str = "") -> str | None:
+    """
+    Делает скриншот после выбора Google Pay и спрашивает Claude,
+    какой селектор нажать для подтверждения оплаты ("Place Your Order" и т.п.).
+    """
+    anthropic_key = getattr(settings, "ANTHROPIC_API_KEY", "") or os.environ.get("ANTHROPIC_API_KEY", "")
+    model = getattr(settings, "CLAUDE_MODEL", "claude-3-5-sonnet-20241022") or "claude-3-5-sonnet-20241022"
+    if not anthropic_key:
+        return None
+
+    try:
+        import aiohttp
+
+        _ensure_dir("screenshots")
+        screenshot_path = "screenshots/claude_pay_button_analysis.png"
+        await page.screenshot(path=screenshot_path, full_page=False)
+
+        with open(screenshot_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode()
+
+        try:
+            html_snippet = await page.evaluate("""() => {
+                const body = document.body;
+                const clone = body.cloneNode(true);
+                clone.querySelectorAll('script,style,noscript').forEach(e => e.remove());
+                return clone.innerHTML.slice(0, 8000);
+            }""")
+        except Exception:
+            html_snippet = ""
+
+        prompt = f"""You are analyzing a Google Pay checkout page screenshot.
+{context_hint}
+
+Google Pay has been selected as payment method. Now find the button to CONFIRM/SUBMIT the payment.
+
+Look for:
+- "Place Your Order" button
+- "Pay" button with a price (e.g. "Pay $0.99")
+- "Buy with G Pay" button
+- "Place Order" button
+- Any primary action button to complete the payment
+
+Based on the screenshot and HTML snippet, return ONLY a valid CSS selector to click that button.
+Return just the selector, nothing else. If not found, return: NOT_FOUND
+
+HTML snippet:
+{html_snippet[:4000]}
+"""
+
+        payload = {
+            "model": model,
+            "max_tokens": 256,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": img_b64,
+                            },
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ],
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": anthropic_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json()
+
+        selector = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                selector = block["text"].strip()
+                break
+
+        if not selector or selector == "NOT_FOUND" or len(selector) > 300:
+            logger.debug(f"Claude AI: кнопка оплаты не найдена (ответ: {selector[:80]})")
+            return None
+
+        logger.info(f"Claude AI предложил селектор кнопки оплаты: {selector}")
+        return selector
+
+    except Exception as e:
+        logger.debug(f"Claude AI поиск кнопки оплаты: ошибка {e}")
+        return None
+
+
+async def _try_click_claude_selector(frame_or_page, selector: str, label: str) -> bool:
+    """Пробует кликнуть по селектору, предложенному Claude AI."""
+    if not selector:
+        return False
+    try:
+        loc = frame_or_page.locator(selector).first
+        count = await loc.count()
+        if count > 0:
+            visible = await loc.is_visible()
+            if visible:
+                await loc.scroll_into_view_if_needed()
+                await loc.click(timeout=8000)
+                logger.info(f"{label} [Claude AI]: {selector}")
+                return True
+    except Exception as e:
+        logger.debug(f"Claude AI клик не удался ({selector}): {e}")
+    return False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -63,37 +298,51 @@ async def _screenshot_full(page, name: str, folder: str = "screenshots") -> str:
 # Шаг 1: Найти FastSpring форму и кликнуть вкладку G Pay
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Селекторы вкладки G Pay в FastSpring и Appcharge
+# Селекторы вкладки G Pay / Google Pay в FastSpring и Appcharge.
+# ПОРЯДОК ВАЖЕН: сначала самые точные (специфичные для FastSpring), потом общие.
+# НЕ используем 'div:has-text("Google Pay")' — слишком широкий, матчит весь body.
 _GPAY_TAB_SELECTORS = [
-    # Текст "G Pay" (FastSpring использует именно это написание)
-    'button:has-text("G Pay")',
-    '[role="tab"]:has-text("G Pay")',
-    '[role="option"]:has-text("G Pay")',
-    'li:has-text("G Pay")',
-    'a:has-text("G Pay")',
-    'span:has-text("G Pay")',
-    'div:has-text("G Pay")',
-    # Текст "Google Pay"
-    'button:has-text("Google Pay")',
-    '[role="tab"]:has-text("Google Pay")',
-    '[role="option"]:has-text("Google Pay")',
-    'div:has-text("Google Pay")',
-    # Data-атрибуты FastSpring / платёжных систем
+    # ── FastSpring: вкладка выглядит как кнопка/div с текстом "Google Pay" внутри платёжного переключателя ──
+    # Точные селекторы для структуры FastSpring (store.supercell.com)
+    '[data-fsc-item-path-value*="google"]',
+    '[data-fsc-action*="google"]',
     '[data-method="googlepay"]',
     '[data-method="google_pay"]',
     '[data-payment-method="google_pay"]',
-    '[data-fsc-action*="google"]',
     '[id*="googlepay"]',
     '[id*="google-pay"]',
-    # Классы
-    '[class*="googlepay"]',
-    '[class*="google-pay"]',
-    '[class*="GooglePay"]',
-    # Изображение с alt Google Pay
+    '[id*="google_pay"]',
+    # Классы специфичные для Google Pay
+    '[class*="googlepay"]:not(body):not(html)',
+    '[class*="google-pay"]:not(body):not(html)',
+    '[class*="GooglePay"]:not(body):not(html)',
+    '[class*="gpay"]:not(body):not(html)',
+    # Кнопки с точным текстом
+    'button:has-text("Google Pay")',
+    'button:has-text("G Pay")',
+    # Роли вкладок/опций (radio-группа платёжных методов)
+    '[role="tab"]:has-text("Google Pay")',
+    '[role="tab"]:has-text("G Pay")',
+    '[role="radio"]:has-text("Google Pay")',
+    '[role="option"]:has-text("Google Pay")',
+    # li/a элементы меню выбора метода
+    'li:has-text("Google Pay")',
+    'li:has-text("G Pay")',
+    'a:has-text("Google Pay")',
+    'a:has-text("G Pay")',
+    # label (radio input + label — типичная структура FastSpring)
+    'label:has-text("Google Pay")',
+    'label:has-text("G Pay")',
+    # Изображение с alt Google Pay (иконка в вкладке)
     'img[alt*="Google Pay"]',
     'img[alt*="G Pay"]',
+    'img[src*="google-pay"]',
+    'img[src*="googlepay"]',
     # SVG title
     'button svg[title*="Google"]',
+    # span ТОЛЬКО внутри кнопок/лейблов (не весь body)
+    'button span:has-text("Google Pay")',
+    'label span:has-text("Google Pay")',
 ]
 
 # Селекторы кнопки оплаты после выбора G Pay вкладки
@@ -123,40 +372,94 @@ _GPAY_PAY_BUTTON_SELECTORS = [
 
 
 async def _try_click_in_frame(frame, selectors: list, label: str) -> bool:
-    """Пробует кликнуть по первому найденному селектору в frame."""
+    """
+    Пробует кликнуть по первому найденному селектору в frame.
+    Пропускает элементы-контейнеры (body, html, крупные div на всю страницу).
+    """
     for sel in selectors:
         try:
-            loc = frame.locator(sel).first
-            count = await loc.count()
-            if count > 0:
-                visible = await loc.is_visible()
-                if visible:
+            locs = frame.locator(sel)
+            count = await locs.count()
+            if count == 0:
+                continue
+            # Если несколько — перебираем, берём первый видимый и не-контейнер
+            for i in range(min(count, 5)):
+                loc = locs.nth(i)
+                try:
+                    visible = await loc.is_visible()
+                    if not visible:
+                        continue
+                    # Проверяем что это не огромный контейнер (body/wrapper)
+                    tag = await loc.evaluate("el => el.tagName.toLowerCase()")
+                    if tag in ("body", "html"):
+                        continue
+                    box = await loc.bounding_box()
+                    if box and box["width"] > 800 and box["height"] > 400:
+                        # Слишком большой элемент — это контейнер, пропускаем
+                        logger.debug(f"Пропуск контейнера {tag} ({box['width']}x{box['height']}): {sel}")
+                        continue
                     await loc.scroll_into_view_if_needed()
                     await loc.click(timeout=5000)
                     logger.info(f"{label}: {sel}")
                     return True
+                except Exception:
+                    continue
         except Exception:
             continue
     return False
 
 
+def _is_fastspring_url(url: str) -> bool:
+    """Возвращает True если URL относится к FastSpring checkout."""
+    url = (url or "").lower()
+    return (
+        "onfastspring.com/embedded-checkout" in url
+        or "onfastspring.com" in url
+        or "cloudfront.net/supercell/embedded-checkout" in url
+        or "fastspring.com" in url
+    )
+
+
+def _is_fastspring_checkout_page(page) -> bool:
+    """
+    Проверяет, что ТЕКУЩАЯ страница (не iframe) является FastSpring checkout.
+    Это происходит когда FastSpring открывается как отдельная страница/popup,
+    а не как embedded iframe.
+    """
+    try:
+        url = (page.url or "").lower()
+        # store.supercell.com/... с FastSpring формой на странице
+        if _is_fastspring_url(url):
+            return True
+        # Основная страница store.supercell.com — FastSpring рендерит форму прямо на ней
+        if "store.supercell.com" in url:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _get_fastspring_frames(page):
     """
-    Возвращает список кандидатов на FastSpring checkout iframe.
+    Возвращает список кандидатов на FastSpring checkout.
+    ВАЖНО: На скриншоте FastSpring рендерит форму прямо на странице store.supercell.com
+    (не в iframe). Поэтому сначала проверяем основную страницу, потом iframe.
     Скелетон (sbl.onfastspring.com/sbl/.../skeleton.html) — пропускаем.
     """
     candidates = []
     try:
+        # Проверяем основную страницу — FastSpring может рендериться прямо на ней
+        # (store.supercell.com с формой [Card][PayPal][Google Pay][Amazon Pay])
+        if _is_fastspring_checkout_page(page):
+            candidates.append(page.main_frame)
+
         for frame in page.frames:
+            if frame == page.main_frame:
+                continue
             url = frame.url or ""
             if "skeleton.html" in url or "sbl.onfastspring.com/sbl/" in url:
                 continue
-            if (
-                "onfastspring.com/embedded-checkout" in url
-                or "onfastspring.com" in url
-                or "cloudfront.net/supercell/embedded-checkout" in url
-                or "fastspring.com" in url
-            ):
+            if _is_fastspring_url(url):
                 candidates.append(frame)
     except Exception:
         pass
@@ -173,63 +476,90 @@ async def _is_appcharge_checkout(page) -> bool:
     try:
         text = (await page.evaluate("() => document.body.innerText")).lower()
         url = (page.url or "").lower()
-        return "appcharge" in text or "buy with g pay" in text or "appcharge" in url
+        return (
+            "powered by appcharge" in text
+            or "appcharge" in text
+            or "buy with g pay" in text
+            or "appcharge" in url
+        )
     except Exception:
         return False
 
 
 async def _wait_for_fastspring_loaded(page, timeout_ms: int = None) -> list:
     """
-    Ждёт пока FastSpring checkout iframe полностью загрузится.
+    Ждёт пока FastSpring checkout загрузится — либо в iframe, либо прямо на странице.
+    На скриншоте форма [Card][PayPal][Google Pay][Amazon Pay] рендерится прямо
+    на store.supercell.com, без отдельного iframe.
     Возвращает список загруженных FastSpring frame.
     """
     if timeout_ms is None:
         timeout_ms = _FASTSPRING_IFRAME_TIMEOUT_MS
-    logger.info("Ожидание загрузки FastSpring checkout iframe (таймаут %s сек)...", timeout_ms // 1000)
+    logger.info("Ожидание загрузки FastSpring checkout (таймаут %s сек)...", timeout_ms // 1000)
     deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
 
     while asyncio.get_event_loop().time() < deadline:
+        # ── Проверка 1: FastSpring форма прямо на текущей странице ───────────
+        # Признаки: кнопки [Card][PayPal][Google Pay][Amazon Pay] + цена + "Sold and fulfilled by FastSpring"
+        try:
+            has_fastspring_form = await page.evaluate("""() => {
+                const text = (document.body.innerText || '').toLowerCase();
+                const hasFastspring = text.includes('fastspring') || text.includes('sold and fulfilled');
+                const hasGooglePay = text.includes('google pay') || text.includes('g pay');
+                const hasPrice = !!document.body.innerText.match(/\\$[\\d.]+/);
+                const hasPaymentTabs = text.includes('card') && (text.includes('paypal') || text.includes('amazon pay'));
+                return (hasFastspring || hasPaymentTabs) && hasGooglePay && hasPrice;
+            }""")
+            if has_fastspring_form:
+                logger.info("FastSpring форма обнаружена прямо на странице (не в iframe): %s", page.url[:80])
+                return [page.main_frame]
+        except Exception:
+            pass
+
+        # ── Проверка 2: FastSpring embedded iframe ─────────────────────────
         frames = _get_fastspring_frames(page)
-        if not frames:
+        # Убираем main_frame из списка — уже проверили выше
+        iframe_frames = [f for f in frames if f != page.main_frame]
+
+        if iframe_frames:
+            loaded = []
+            for frame in iframe_frames:
+                try:
+                    has_content = await frame.evaluate("""() => {
+                        const btns = document.querySelectorAll('button');
+                        const inputs = document.querySelectorAll('input');
+                        const price = document.body.innerText.match(/\\$[\\d.]+/);
+                        return btns.length > 0 || inputs.length > 0 || price !== null;
+                    }""")
+                    if has_content:
+                        loaded.append(frame)
+                        logger.info(f"FastSpring iframe загружен: {frame.url[:80]}")
+                except Exception:
+                    continue
+            if loaded:
+                return loaded
+            logger.debug(f"FastSpring iframe найден ({len(iframe_frames)}), ждём контента...")
+        else:
             logger.debug("FastSpring iframe ещё не появился, ждём...")
-            await page.wait_for_timeout(2000)
-            continue
 
-        loaded = []
-        for frame in frames:
-            try:
-                has_content = await frame.evaluate("""() => {
-                    const btns = document.querySelectorAll('button');
-                    const inputs = document.querySelectorAll('input');
-                    const price = document.body.innerText.match(/\\$[\\d.]+/);
-                    return btns.length > 0 || inputs.length > 0 || price !== null;
-                }""")
-                if has_content:
-                    loaded.append(frame)
-                    logger.info(f"FastSpring iframe загружен: {frame.url[:80]}")
-            except Exception:
-                continue
-
-        if loaded:
-            return loaded
-
-        logger.debug(f"FastSpring iframe найден ({len(frames)}), ждём контента...")
         await page.wait_for_timeout(2000)
 
-    logger.warning("FastSpring iframe не загрузился за отведённое время")
+    logger.warning("FastSpring checkout не загрузился за отведённое время")
     return []
 
 
-# Селекторы кнопки "Buy with G Pay" (Appcharge на основной странице)
+# Селекторы кнопки оплаты Appcharge: "Pay $0.99" / "Place Your Order" (после выбора плашки Google Pay)
 _APPCHARGE_BUY_GPAY_SELECTORS = [
+    'button:has-text("Place Your Order")',
+    'button:has-text("Place your order")',
+    'button:has-text("Pay $")',
+    'button:has-text("Pay €")',
+    'button:has-text("Pay £")',
     'button:has-text("Buy with G Pay")',
     'button:has-text("Buy with Google Pay")',
     '[role="button"]:has-text("Buy with G Pay")',
     'button:has-text("Pay with G Pay")',
     'button:has-text("Pay with Google Pay")',
-    'button:has-text("Pay $")',
-    'button:has-text("Pay €")',
-    'button:has-text("Pay £")',
     '.gpay-button',
     '[class*="gpay-button"]',
     '[class*="google-pay-button"]',
@@ -239,11 +569,20 @@ _APPCHARGE_BUY_GPAY_SELECTORS = [
 
 async def select_gpay_and_buy_appcharge(page) -> bool:
     """
-    Checkout на основной странице или в iframe (Appcharge и др.): выбираем Google Pay, нажимаем "Buy with G Pay".
-    Используется, когда FastSpring не открывается. Ищет кнопки на главной странице и во всех iframe.
+    Checkout Appcharge (или на основной странице): выбираем плашку Google Pay,
+    ждём прогрузки, нажимаем "Place Your Order" / "Pay $X.XX".
+    Откроется окно Sign in → те же шаги, что FastSpring.
+    Используется при обнаружении Appcharge или когда FastSpring не открылся.
     Возвращает True, если кнопка оплаты нажата (откроется окно Sign in).
+
+    Flow:
+    1. Ищем плашку Google Pay стандартными селекторами
+    2. Если не нашли — спрашиваем Claude AI по скриншоту
+    3. После клика ждём прогрузки (до 12 сек)
+    4. Ищем кнопку Place Your Order стандартными селекторами
+    5. Если не нашли — спрашиваем Claude AI по скриншоту
     """
-    logger.info("Пробуем Google Pay на странице и во всех iframe: вкладка G Pay → Buy with G Pay...")
+    logger.info("Appcharge: выбор плашки Google Pay → ожидание загрузки → Place Your Order...")
     try:
         await page.evaluate("window.scrollTo(0, 0)")
         await page.wait_for_timeout(500)
@@ -253,7 +592,7 @@ async def select_gpay_and_buy_appcharge(page) -> bool:
     await _accept_cookies_on_page(page)
     await page.wait_for_timeout(2000)
 
-    # Собираем цели: главная страница + все iframe (чекaут может быть в любом из них)
+    # Собираем цели: главная страница + все iframe (checkout может быть в любом из них)
     targets = [page]
     try:
         for f in page.frames:
@@ -266,35 +605,103 @@ async def select_gpay_and_buy_appcharge(page) -> bool:
         is_main = target == page
         label = "main" if is_main else f"iframe_{idx}"
         try:
-            frame_url = getattr(target, "url", None) or (target.url if hasattr(target, "url") else "")
-            logger.info("Проверяем %s: %s", label, (frame_url or "")[:80])
+            frame_url = getattr(target, "url", None) or ""
+            logger.info("Appcharge: проверяем %s: %s", label, (frame_url or "")[:80])
         except Exception:
             pass
 
-        tab_clicked = await _try_click_in_frame(
-            target, _GPAY_TAB_SELECTORS,
-            f"Appcharge ({label}): выбрана вкладка Google Pay"
-        )
+        # ── Шаг 1: Клик на плашку Google Pay ─────────────────────────────────
+        # Метод 1: JS точный поиск текста "Google Pay"
+        tab_clicked = await _click_fastspring_gpay_tab(target if target != page else page)
+
+        # Метод 2: CSS-селекторы
+        if not tab_clicked:
+            tab_clicked = await _try_click_in_frame(
+                target, _GPAY_TAB_SELECTORS,
+                f"Appcharge ({label}): выбрана плашка Google Pay"
+            )
+
+        # Метод 3: Claude AI ищет вкладку G Pay по скриншоту
+        if not tab_clicked:
+            logger.info("Appcharge (%s): стандартные селекторы не нашли G Pay, спрашиваем Claude AI...", label)
+            claude_selector = await _claude_find_gpay_selector(
+                page,
+                context_hint="This is an Appcharge payment checkout page."
+            )
+            if claude_selector:
+                tab_clicked = await _try_click_claude_selector(
+                    target, claude_selector,
+                    f"Appcharge ({label}): клик по G Pay вкладке"
+                )
+                if not tab_clicked:
+                    # Попробуем на основной странице если искали в iframe
+                    tab_clicked = await _try_click_claude_selector(
+                        page, claude_selector,
+                        f"Appcharge (main fallback): клик по G Pay вкладке"
+                    )
+
         if not tab_clicked:
             continue
 
-        await page.wait_for_timeout(4000)
+        # ── Шаг 2: Ждём прогрузки формы Google Pay ───────────────────────────
+        logger.info("Appcharge: Google Pay выбран, ждём прогрузки формы...")
+        # Ждём появления кнопки Place Your Order (до 12 сек с проверкой каждые 2 сек)
+        pay_button_appeared = False
+        for wait_step in range(6):
+            await page.wait_for_timeout(2000)
+            # Быстрая проверка: появилась ли кнопка
+            for quick_sel in ['button:has-text("Place Your Order")', 'button:has-text("Place your order")',
+                               'button:has-text("Pay $")', 'button:has-text("Buy with G Pay")']:
+                try:
+                    loc = target.locator(quick_sel).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        pay_button_appeared = True
+                        logger.info("Appcharge: кнопка оплаты появилась на шаге %d", wait_step + 1)
+                        break
+                except Exception:
+                    continue
+            if pay_button_appeared:
+                break
+
+        if not pay_button_appeared:
+            logger.info("Appcharge: кнопка оплаты не появилась за 12 сек после выбора G Pay, продолжаем попытку...")
+
         await _screenshot(page, "appcharge_after_gpay_tab")
 
+        # ── Шаг 3: Нажимаем кнопку Place Your Order / Pay ────────────────────
         pay_clicked = await _try_click_in_frame(
             target, _APPCHARGE_BUY_GPAY_SELECTORS,
-            f"Appcharge ({label}): нажата кнопка Buy with G Pay"
+            f"Appcharge ({label}): нажата кнопка Pay / Place Your Order"
         )
         if not pay_clicked:
             pay_clicked = await _try_click_in_frame(
                 target, _GPAY_PAY_BUTTON_SELECTORS,
                 f"Appcharge ({label}): нажата кнопка оплаты (fallback)"
             )
+
+        # Fallback: Claude AI ищет кнопку оплаты по скриншоту
+        if not pay_clicked:
+            logger.info("Appcharge (%s): кнопка оплаты не найдена, спрашиваем Claude AI...", label)
+            claude_pay_selector = await _claude_find_pay_button_selector(
+                page,
+                context_hint="Google Pay tab is selected. Find the 'Place Your Order' or pay button."
+            )
+            if claude_pay_selector:
+                pay_clicked = await _try_click_claude_selector(
+                    target, claude_pay_selector,
+                    f"Appcharge ({label}): клик по кнопке оплаты"
+                )
+                if not pay_clicked:
+                    pay_clicked = await _try_click_claude_selector(
+                        page, claude_pay_selector,
+                        f"Appcharge (main fallback): клик по кнопке оплаты"
+                    )
+
         if pay_clicked:
             await _screenshot(page, "appcharge_buy_with_gpay_clicked")
             return True
 
-    logger.warning("Appcharge: вкладка Google Pay или кнопка Buy with G Pay не найдены ни на странице, ни в iframe")
+    logger.warning("Appcharge: плашка Google Pay или кнопка Pay/Place Your Order не найдены ни на странице, ни в iframe")
     await _screenshot(page, "appcharge_buy_gpay_not_found")
     return False
 
@@ -349,16 +756,84 @@ async def _accept_cookies_on_page(page) -> bool:
     return False
 
 
+async def _click_fastspring_gpay_tab(page_or_frame) -> bool:
+    """
+    Специальная функция для клика по вкладке Google Pay в форме FastSpring.
+    Использует JavaScript для точного поиска — находит элемент платёжного
+    переключателя содержащий текст 'Google Pay', но НЕ являющийся контейнером.
+    Возвращает True если клик выполнен.
+    """
+    try:
+        clicked = await page_or_frame.evaluate("""() => {
+            // Ищем все элементы содержащие текст "Google Pay" или "G Pay"
+            const walker = document.createTreeWalker(
+                document.body,
+                NodeFilter.SHOW_ELEMENT,
+                null
+            );
+            const candidates = [];
+            let node;
+            while (node = walker.nextNode()) {
+                const text = (node.textContent || '').trim();
+                const ownText = Array.from(node.childNodes)
+                    .filter(n => n.nodeType === 3)
+                    .map(n => n.textContent.trim())
+                    .join('');
+                // Точный текст "Google Pay" или "G Pay" в своих текстовых узлах
+                if (ownText === 'Google Pay' || ownText === 'G Pay' ||
+                    text === 'Google Pay' || text === 'G Pay') {
+                    const rect = node.getBoundingClientRect();
+                    // Не контейнер: элемент небольшой и кликабельный
+                    if (rect.width < 300 && rect.height < 200 && rect.width > 0) {
+                        candidates.push(node);
+                    }
+                }
+            }
+            // Кликаем по первому подходящему (кнопка/label/div-плашка)
+            for (const el of candidates) {
+                const tag = el.tagName.toLowerCase();
+                const style = window.getComputedStyle(el);
+                const isClickable = (
+                    tag === 'button' || tag === 'label' || tag === 'a' ||
+                    tag === 'li' || el.getAttribute('role') === 'tab' ||
+                    el.getAttribute('role') === 'option' ||
+                    el.getAttribute('role') === 'radio' ||
+                    style.cursor === 'pointer'
+                );
+                if (isClickable) {
+                    el.scrollIntoView({block: 'center'});
+                    el.click();
+                    return el.tagName + ':' + (el.textContent || '').trim().slice(0, 30);
+                }
+            }
+            // Fallback: кликаем по любому кандидату
+            if (candidates.length > 0) {
+                candidates[0].scrollIntoView({block: 'center'});
+                candidates[0].click();
+                return 'fallback:' + candidates[0].tagName;
+            }
+            return null;
+        }""")
+        if clicked:
+            logger.info(f"FastSpring Google Pay вкладка нажата через JS: {clicked}")
+            return True
+    except Exception as e:
+        logger.debug(f"JS клик по Google Pay вкладке: {e}")
+    return False
+
+
 async def select_gpay_tab_and_pay(page, timeout_ms: int = 90000) -> bool:
     """
-    Находит FastSpring форму в iframe, кликает вкладку G Pay,
-    затем кнопку "Place Your Order". Если FastSpring не открывается —
-    проверяет checkout Appcharge на основной странице: выбираем Google Pay,
-    нажимаем "Buy with G Pay" (откроется окно Sign in, вводим данные, оплачиваем,
-    затем заходим в аккаунт, проверяем покупку и выходим как обычно).
+    Основная функция: находит FastSpring форму (на странице или в iframe),
+    кликает вкладку Google Pay тремя методами (JS / CSS / Claude AI),
+    ждёт появления кнопки "Pay $X.XX" и нажимает её.
+    Параллельно проверяет Appcharge checkout.
     Возвращает True если кнопка оплаты нажата.
     """
-    logger.info("Ищем FastSpring форму и вкладку G Pay...")
+    logger.info("═══════════════════════════════════════════")
+    logger.info("═══ select_gpay_tab_and_pay START ═══")
+    logger.info(f"═══ URL: {page.url}")
+    logger.info("═══════════════════════════════════════════")
 
     try:
         await page.evaluate("window.scrollTo(0, 0)")
@@ -366,79 +841,217 @@ async def select_gpay_tab_and_pay(page, timeout_ms: int = 90000) -> bool:
     except Exception:
         pass
 
-    # Принимаем куки если баннер появился на checkout странице
     await _accept_cookies_on_page(page)
     await page.wait_for_timeout(500)
-
     await _screenshot(page, "gpay_checkout_start")
 
-    # Сначала ждём FastSpring с коротким таймаутом; если не открылся — пробуем Appcharge
+    # ── Диагностика страницы ───────────────────────────────────────────────────
+    try:
+        page_text_lower = (await page.evaluate("() => document.body.innerText")).lower()
+        frames_count = len(page.frames)
+        logger.info(f"[ДИАГНОСТИКА] Кол-во frames на странице: {frames_count}")
+        logger.info(f"[ДИАГНОСТИКА] Есть 'fastspring': {'fastspring' in page_text_lower}")
+        logger.info(f"[ДИАГНОСТИКА] Есть 'google pay': {'google pay' in page_text_lower}")
+        logger.info(f"[ДИАГНОСТИКА] Есть 'appcharge': {'appcharge' in page_text_lower}")
+        logger.info(f"[ДИАГНОСТИКА] Есть 'buy with g pay': {'buy with g pay' in page_text_lower}")
+        for i, f in enumerate(page.frames):
+            try:
+                logger.info(f"[FRAME {i}] url={f.url[:100]}")
+            except Exception:
+                pass
+    except Exception as diag_e:
+        logger.debug(f"[ДИАГНОСТИКА] ошибка: {diag_e}")
+
+    # ── Сразу проверяем Appcharge ──────────────────────────────────────────────
+    logger.info("[ШАГ 1] Проверяем Appcharge checkout...")
+    if await _is_appcharge_checkout(page):
+        logger.info("[ШАГ 1] ✓ Обнаружен checkout Appcharge → запускаем select_gpay_and_buy_appcharge")
+        appcharge_ok = await select_gpay_and_buy_appcharge(page)
+        if appcharge_ok:
+            logger.info("[ШАГ 1] ✓ Appcharge: кнопка оплаты нажата")
+            return True
+        logger.info("[ШАГ 1] ✗ Appcharge: кнопка не нажата, продолжаем поиск FastSpring...")
+    else:
+        logger.info("[ШАГ 1] Appcharge не обнаружен, продолжаем с FastSpring")
+
+    # ── Ожидание FastSpring + периодическая проверка Appcharge ────────────────
+    logger.info("[ШАГ 2] Ожидание FastSpring checkout...")
     fastspring_wait_ms = min(timeout_ms, _FASTSPRING_SHORT_TIMEOUT_MS)
-    loaded_frames = await _wait_for_fastspring_loaded(page, timeout_ms=fastspring_wait_ms)
+    check_interval_ms = 5000
+    elapsed_ms = 0
+    loaded_frames = []
+
+    while elapsed_ms < fastspring_wait_ms and not loaded_frames:
+        logger.info(f"[ШАГ 2] Итерация {elapsed_ms // 1000}с / {fastspring_wait_ms // 1000}с — вызываем _wait_for_fastspring_loaded...")
+        loaded_frames = await _wait_for_fastspring_loaded(page, timeout_ms=check_interval_ms)
+        if loaded_frames:
+            logger.info(f"[ШАГ 2] ✓ FastSpring загружен, frames: {len(loaded_frames)}")
+            break
+
+        logger.info(f"[ШАГ 2] FastSpring не найден, проверяем Appcharge (elapsed={elapsed_ms}ms)...")
+        if await _is_appcharge_checkout(page):
+            logger.info("[ШАГ 2] Appcharge обнаружен во время ожидания FastSpring")
+            appcharge_ok = await select_gpay_and_buy_appcharge(page)
+            if appcharge_ok:
+                return True
+
+        elapsed_ms += check_interval_ms
 
     if not loaded_frames:
-        logger.info("FastSpring не открылся за отведённое время, пробуем Google Pay на странице и в iframe (Appcharge/checkout)...")
-        # Всегда пробуем клик G Pay + Buy with G Pay (на основной странице и во всех iframe)
+        logger.warning(f"[ШАГ 2] ✗ FastSpring не открылся за {fastspring_wait_ms // 1000}с")
+        logger.info("[ШАГ 2] Финальная попытка Appcharge/прямой поиск G Pay...")
         appcharge_ok = await select_gpay_and_buy_appcharge(page)
         if appcharge_ok:
             return True
-        logger.info("Проверяем главную страницу на наличие G Pay (fallback)...")
+
+        logger.info("[ШАГ 2] Последний шанс — прямой локатор Google Pay на странице...")
         try:
             loc = page.locator('button:has-text("G Pay"), button:has-text("Google Pay")').first
-            if await loc.count() > 0:
-                loaded_frames = [page]
+            cnt = await loc.count()
+            logger.info(f"[ШАГ 2] Локатор Google Pay нашёл: {cnt} элементов")
+            if cnt > 0:
+                loaded_frames = [page.main_frame]
             else:
                 await _screenshot(page, "fastspring_gpay_not_found")
+                logger.error("[ШАГ 2] ✗ Google Pay не найден нигде — выходим")
                 return False
-        except Exception:
+        except Exception as e:
+            logger.error(f"[ШАГ 2] Исключение при поиске Google Pay: {e}")
             await _screenshot(page, "fastspring_gpay_not_found")
             return False
 
     await _screenshot(page, "fastspring_loaded")
+    logger.info(f"[ШАГ 3] FastSpring форма готова. Frames для обработки: {len(loaded_frames)}")
 
-    # Несколько попыток нажатия на элементы FastSpring iframe (iframe может догружаться)
+    # ── Клик по вкладке Google Pay ─────────────────────────────────────────────
     tab_click_max_attempts = 4
     pay_click_attempts = [(4000, "1"), (6000, "2"), (8000, "3"), (10000, "4")]
 
-    for frame in loaded_frames:
-        logger.info(f"Ищем G Pay вкладку в iframe: {frame.url[:80]}")
+    for fi, frame in enumerate(loaded_frames):
+        frame_url = getattr(frame, "url", None) or page.url
+        logger.info(f"[ШАГ 3] Обрабатываем frame[{fi}]: {(frame_url or '')[:80]}")
         tab_clicked = False
-        for attempt in range(1, tab_click_max_attempts + 1):
-            tab_clicked = await _try_click_in_frame(frame, _GPAY_TAB_SELECTORS, f"Нажата вкладка G Pay (попытка {attempt}/{tab_click_max_attempts})")
+
+        # Метод 1: JS TreeWalker — ищет точный текст "Google Pay" в DOM
+        logger.info(f"[ШАГ 3.1] Метод JS: _click_fastspring_gpay_tab (frame[{fi}])...")
+        tab_clicked = await _click_fastspring_gpay_tab(frame)
+        if tab_clicked:
+            logger.info(f"[ШАГ 3.1] ✓ JS клик по Google Pay вкладке выполнен (frame[{fi}])")
+        elif frame != page.main_frame:
+            logger.info(f"[ШАГ 3.1] JS не нашёл в iframe, пробуем на основной странице...")
+            tab_clicked = await _click_fastspring_gpay_tab(page)
             if tab_clicked:
-                break
-            if attempt < tab_click_max_attempts:
-                await page.wait_for_timeout(3000)
-                logger.debug(f"Повтор поиска вкладки G Pay через 3 сек, попытка {attempt + 1}")
+                logger.info("[ШАГ 3.1] ✓ JS клик по Google Pay вкладке выполнен (main page)")
+
+        # Метод 2: CSS-селекторы
+        if not tab_clicked:
+            logger.info(f"[ШАГ 3.2] Метод CSS: перебор _GPAY_TAB_SELECTORS ({len(_GPAY_TAB_SELECTORS)} шт)...")
+            for attempt in range(1, tab_click_max_attempts + 1):
+                logger.info(f"[ШАГ 3.2] CSS попытка {attempt}/{tab_click_max_attempts} в frame[{fi}]...")
+                tab_clicked = await _try_click_in_frame(
+                    frame, _GPAY_TAB_SELECTORS,
+                    f"[CSS] Google Pay вкладка (frame[{fi}], попытка {attempt})"
+                )
+                if not tab_clicked and frame != page.main_frame:
+                    logger.info(f"[ШАГ 3.2] CSS попытка {attempt} на main page...")
+                    tab_clicked = await _try_click_in_frame(
+                        page, _GPAY_TAB_SELECTORS,
+                        f"[CSS] Google Pay вкладка (main, попытка {attempt})"
+                    )
+                if tab_clicked:
+                    logger.info(f"[ШАГ 3.2] ✓ CSS клик по Google Pay вкладке (попытка {attempt})")
+                    break
+                if attempt < tab_click_max_attempts:
+                    logger.info(f"[ШАГ 3.2] Ждём 3 сек перед попыткой {attempt + 1}...")
+                    await page.wait_for_timeout(3000)
+
+        # Метод 3: Claude AI
+        if not tab_clicked:
+            logger.info("[ШАГ 3.3] Метод Claude AI: делаем скриншот и спрашиваем...")
+            claude_tab_sel = await _claude_find_gpay_selector(
+                page,
+                context_hint="FastSpring checkout on store.supercell.com. 4 tabs: Card, PayPal, Google Pay, Amazon Pay. Return selector for Google Pay tab."
+            )
+            logger.info(f"[ШАГ 3.3] Claude AI предложил: {claude_tab_sel!r}")
+            if claude_tab_sel:
+                tab_clicked = await _try_click_claude_selector(frame, claude_tab_sel, "[Claude] Google Pay вкладка frame")
+                if not tab_clicked:
+                    tab_clicked = await _try_click_claude_selector(page, claude_tab_sel, "[Claude] Google Pay вкладка main")
+                if tab_clicked:
+                    logger.info("[ШАГ 3.3] ✓ Claude AI клик выполнен")
 
         if not tab_clicked:
-            logger.debug(f"G Pay вкладка не найдена в {frame.url[:60]} после {tab_click_max_attempts} попыток")
+            logger.error(f"[ШАГ 3] ✗ Все методы не нашли Google Pay вкладку в frame[{fi}] — пропускаем")
             continue
 
-        logger.info("Вкладка G Pay выбрана, ждём появления кнопки 'Place Your Order'...")
-        await page.wait_for_timeout(8000)
+        logger.info(f"[ШАГ 3] ✓ Google Pay вкладка НАЖАТА в frame[{fi}] — ждём кнопку оплаты...")
+        await _screenshot(page, f"fastspring_gpay_tab_clicked_{fi}")
+
+        # ── Ждём кнопку оплаты ────────────────────────────────────────────────
+        pay_appeared = False
+        for wait_step in range(8):
+            await page.wait_for_timeout(2000)
+            for quick_sel in [
+                'button:has-text("Pay $")', 'button:has-text("Place Your Order")',
+                'button:has-text("Place your order")', '.gpay-button',
+            ]:
+                try:
+                    targets_check = ([frame, page] if frame != page.main_frame else [page])
+                    for t in targets_check:
+                        loc = t.locator(quick_sel).first
+                        if await loc.count() > 0 and await loc.is_visible():
+                            logger.info(f"[ШАГ 4] ✓ Кнопка оплаты появилась на шаге {wait_step+1}: {quick_sel!r}")
+                            pay_appeared = True
+                            break
+                    if pay_appeared:
+                        break
+                except Exception:
+                    continue
+            if pay_appeared:
+                break
+        if not pay_appeared:
+            logger.warning("[ШАГ 4] Кнопка оплаты не появилась за 16 сек, всё равно пробуем нажать...")
         await _screenshot(page, "fastspring_after_gpay_tab")
 
+        # ── Нажимаем кнопку оплаты ────────────────────────────────────────────
         pay_clicked = False
-        for wait_after_ms, label in pay_click_attempts:
-            pay_clicked = await _try_click_in_frame(frame, _GPAY_PAY_BUTTON_SELECTORS, f"Нажата кнопка Place Your Order (iframe {label})")
+        for wait_after_ms, lbl in pay_click_attempts:
+            logger.info(f"[ШАГ 4] Попытка {lbl} нажать кнопку оплаты (Pay/Place Your Order)...")
+            targets_to_try = ([frame, page] if frame != page.main_frame else [page])
+            for t in targets_to_try:
+                pay_clicked = await _try_click_in_frame(
+                    t, _GPAY_PAY_BUTTON_SELECTORS,
+                    f"[Pay] кнопка оплаты FastSpring (попытка {lbl})"
+                )
+                if pay_clicked:
+                    break
             if pay_clicked:
                 break
-            if not pay_clicked:
-                pay_clicked = await _try_click_in_frame(page, _GPAY_PAY_BUTTON_SELECTORS, f"Нажата кнопка Place Your Order (main {label})")
-            if pay_clicked:
-                break
-            logger.info("Кнопка оплаты не найдена, ждём %s сек перед следующей попыткой...", wait_after_ms // 1000)
+            logger.info(f"[ШАГ 4] Кнопка не найдена, ждём {wait_after_ms // 1000}с...")
             await page.wait_for_timeout(wait_after_ms)
-            await _screenshot(page, f"fastspring_gpay_retry_{label}")
+            await _screenshot(page, f"fastspring_gpay_retry_{lbl}")
+
+        if not pay_clicked:
+            logger.info("[ШАГ 4] Claude AI: ищем кнопку оплаты по скриншоту...")
+            claude_pay_sel = await _claude_find_pay_button_selector(
+                page,
+                context_hint="FastSpring checkout. Google Pay is selected. Find 'Pay $0.99' or 'Place Your Order' button."
+            )
+            logger.info(f"[ШАГ 4] Claude AI кнопка оплаты: {claude_pay_sel!r}")
+            if claude_pay_sel:
+                pay_clicked = await _try_click_claude_selector(frame, claude_pay_sel, "[Claude] Pay кнопка frame")
+                if not pay_clicked:
+                    pay_clicked = await _try_click_claude_selector(page, claude_pay_sel, "[Claude] Pay кнопка main")
 
         if pay_clicked:
             await _screenshot(page, "fastspring_gpay_pay_clicked")
+            logger.info(f"[ШАГ 4] ✓ Кнопка оплаты НАЖАТА — frame[{fi}]")
             return True
 
-        logger.warning("Кнопка оплаты после выбора G Pay не найдена после всех попыток")
+        logger.error(f"[ШАГ 4] ✗ Кнопка оплаты не найдена в frame[{fi}] после всех попыток")
 
     await _screenshot(page, "fastspring_gpay_not_found")
+    logger.error("[ИТОГ] ✗ select_gpay_tab_and_pay: не удалось нажать Google Pay и кнопку оплаты")
     return False
 
 
@@ -666,17 +1279,54 @@ async def _login_google_in_popup(
 
                 await popup_page.wait_for_timeout(12000)
 
+                # ── Диагностика страницы после "Try another way" ──────────────
+                try:
+                    _diag_url = popup_page.url
+                    _diag_text = (await popup_page.evaluate("() => document.body.innerText")).lower()
+                    logger.info(f"[backup-select] URL после Try another way: {_diag_url[:80]}")
+                    logger.info(f"[backup-select] Есть 'backup': {'backup' in _diag_text}")
+                    logger.info(f"[backup-select] Есть '8-digit': {'8-digit' in _diag_text}")
+                    logger.info(f"[backup-select] Есть 'резервн': {'резервн' in _diag_text}")
+                    # Логируем весь кликабельный текст на странице для диагностики
+                    _clickable = await popup_page.evaluate("""() => {
+                        const els = document.querySelectorAll('a, button, [role="option"], [role="listitem"], li, div[tabindex]');
+                        return Array.from(els).map(e => e.tagName + ':' + (e.textContent || '').trim().slice(0, 60)).filter(t => t.length > 2);
+                    }""")
+                    logger.info(f"[backup-select] Кликабельные элементы: {_clickable[:15]}")
+                except Exception as _de:
+                    logger.debug(f"[backup-select] диагностика: {_de}")
+
                 # Выбор входа по 8-значному резервному коду (после "Try another way")
+                # Google показывает список методов — карточки/опции с текстом
                 backup_option_selectors = [
+                    # Точные — специфичные для Google UI
+                    '[data-challengetype="12"]',          # Google challengetype для backup code
+                    '[data-challengetype="13"]',
+                    'li:has-text("Enter one of your 8-digit backup codes")',
+                    'li:has-text("backup code")',
+                    'li:has-text("Backup code")',
+                    '[role="link"]:has-text("Enter one of your 8-digit backup codes")',
+                    '[role="link"]:has-text("backup code")',
+                    '[role="option"]:has-text("backup code")',
+                    '[role="option"]:has-text("Backup code")',
+                    '[role="listitem"]:has-text("backup code")',
+                    'div[tabindex]:has-text("backup code")',
+                    'div[tabindex]:has-text("Backup code")',
+                    # Ссылки и span
                     'a:has-text("Enter one of your 8-digit backup codes")',
                     'a:has-text("8-digit backup code")',
-                    'span:has-text("Enter one of your 8-digit backup codes")',
-                    'div:has-text("Enter one of your 8-digit backup codes")',
-                    'a:has-text("Use a backup code")',
-                    '[role="option"]:has-text("backup code")',
                     'a:has-text("backup code")',
+                    'a:has-text("Backup code")',
+                    'span:has-text("Enter one of your 8-digit backup codes")',
+                    'span:has-text("8-digit backup code")',
                     'span:has-text("backup code")',
+                    # Другие тексты Google
+                    'a:has-text("Use a backup code")',
+                    '[role="option"]:has-text("Use a backup code")',
+                    # Русские варианты
                     'a:has-text("Введите один из резервных кодов")',
+                    'li:has-text("резервн")',
+                    'div[tabindex]:has-text("резервн")',
                     'span:has-text("Введите один из резервных кодов")',
                     'a:has-text("Резервный код")',
                     'span:has-text("Резервный код")',
@@ -693,30 +1343,174 @@ async def _login_google_in_popup(
                                 await _delay(popup_page, 400, 800)
                                 await loc.click(timeout=25000)
                                 backup_option_clicked = True
-                                logger.info("Выбран вход по 8-значному резервному коду")
+                                logger.info(f"Выбран вход по 8-значному резервному коду: {sel}")
                                 break
                         except Exception:
                             continue
                     if backup_option_clicked:
                         break
-                    await popup_page.wait_for_timeout(2000)
-                if not backup_option_clicked:
-                    try:
-                        for text in [
-                            "Enter one of your 8-digit backup codes", "8-digit backup code", "Use a backup code",
-                            "Введите один из резервных кодов", "Резервный код", "8-значн",
-                        ]:
-                            el = popup_page.get_by_text(text, exact=False).first
-                            if await el.count() > 0 and await el.is_visible():
-                                await el.scroll_into_view_if_needed()
-                                await el.click(timeout=25000)
+                    # get_by_text fallback
+                    if not backup_option_clicked:
+                        try:
+                            for text in [
+                                "Enter one of your 8-digit backup codes", "8-digit backup code",
+                                "Use a backup code", "backup code", "Backup code",
+                                "Введите один из резервных кодов", "Резервный код", "8-значн",
+                            ]:
+                                el = popup_page.get_by_text(text, exact=False).first
+                                if await el.count() > 0 and await el.is_visible():
+                                    await el.scroll_into_view_if_needed()
+                                    await el.click(timeout=25000)
+                                    backup_option_clicked = True
+                                    logger.info(f"Выбран вход по 8-значному коду (get_by_text): {text!r}")
+                                    break
+                        except Exception:
+                            pass
+                    if backup_option_clicked:
+                        break
+                    # JS fallback — ищем по тексту в DOM напрямую
+                    if not backup_option_clicked:
+                        try:
+                            js_clicked = await popup_page.evaluate("""() => {
+                                const keywords = ['backup code', 'backup codes', '8-digit', 'резервн', '8-значн'];
+                                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+                                let node;
+                                while (node = walker.nextNode()) {
+                                    const text = (node.textContent || '').toLowerCase().trim();
+                                    const tag = node.tagName.toLowerCase();
+                                    const rect = node.getBoundingClientRect();
+                                    if (rect.width === 0 || rect.height === 0) continue;
+                                    const isClickable = (
+                                        tag === 'a' || tag === 'button' || tag === 'li' ||
+                                        node.getAttribute('role') === 'option' ||
+                                        node.getAttribute('role') === 'link' ||
+                                        node.getAttribute('role') === 'listitem' ||
+                                        node.getAttribute('tabindex') !== null
+                                    );
+                                    if (!isClickable) continue;
+                                    for (const kw of keywords) {
+                                        if (text.includes(kw) && text.length < 200) {
+                                            node.click();
+                                            return tag + ': ' + text.slice(0, 60);
+                                        }
+                                    }
+                                }
+                                return null;
+                            }""")
+                            if js_clicked:
                                 backup_option_clicked = True
-                                logger.info("Выбран вход по 8-значному коду (get_by_text)")
-                                break
-                    except Exception:
-                        pass
+                                logger.info(f"Выбран вход по 8-значному коду (JS): {js_clicked}")
+                        except Exception as _je:
+                            logger.debug(f"JS backup option click: {_je}")
+                    if backup_option_clicked:
+                        break
+                    logger.debug(f"backup option: попытка {wait_attempt + 1}/8 не удалась, ждём 2 сек...")
+                    await popup_page.wait_for_timeout(2000)
 
-                await popup_page.wait_for_timeout(12000)
+                # ── Ждём страницу "Enter one of your 8-digit backup codes" и вводим код ──
+                # Эта страница появляется ПОСЛЕ клика по опции "8-digit backup code"
+                if backup_option_clicked and backup_code:
+                    logger.info("Ожидание страницы ввода резервного кода...")
+                    _bcode_input_selectors = [
+                        'input[type="tel"]',
+                        'input[name="backupCode"]',
+                        'input[type="number"]',
+                        'input[inputmode="numeric"]',
+                        'input[autocomplete="one-time-code"]',
+                        'input[aria-label*="backup"]',
+                        'input[aria-label*="Backup"]',
+                        'input[placeholder*="backup"]',
+                        'input[placeholder*="code"]',
+                        'input[id*="backup"]',
+                        'input[id*="code"]',
+                        'input[type="text"]',
+                    ]
+                    backup_input_el = None
+                    # Ждём до 20 сек появления поля ввода кода
+                    for _bi in range(10):
+                        await popup_page.wait_for_timeout(2000)
+                        try:
+                            body_now = (await popup_page.evaluate("() => document.body.innerText")).lower()
+                            is_backup_input_page = (
+                                "enter one of your 8-digit" in body_now
+                                or "backup code" in body_now
+                                or "8-digit" in body_now
+                                or "резервн" in body_now
+                                or ("введите" in body_now and "код" in body_now)
+                            )
+                            if is_backup_input_page:
+                                logger.info(f"Страница ввода резервного кода обнаружена (шаг {_bi + 1})")
+                                for bsel in _bcode_input_selectors:
+                                    try:
+                                        el = popup_page.locator(bsel).first
+                                        if await el.count() > 0 and await el.is_visible():
+                                            backup_input_el = el
+                                            logger.info(f"Поле ввода резервного кода: {bsel}")
+                                            break
+                                    except Exception:
+                                        continue
+                                if backup_input_el:
+                                    break
+                        except Exception as _be:
+                            logger.debug(f"backup-wait шаг {_bi + 1}: {_be}")
+
+                    if backup_input_el:
+                        await backup_input_el.click()
+                        await _delay(popup_page, 400, 700)
+                        await popup_page.keyboard.type(
+                            backup_code,
+                            delay=random.randint(type_delay_min, type_delay_max),
+                        )
+                        await _delay(popup_page, 500, 1000)
+                        logger.info("Введён 8-значный резервный код (после Try another way)")
+                        # Нажимаем Next/Verify
+                        _next_sels = [
+                            'button:has-text("Next")', 'button:has-text("Verify")',
+                            'button:has-text("Далее")', 'button:has-text("Подтвердить")',
+                            'button[type="submit"]', '#identifierNext',
+                            '[role="button"]:has-text("Next")', '[role="button"]:has-text("Verify")',
+                        ]
+                        for _ns in _next_sels:
+                            try:
+                                _nloc = popup_page.locator(_ns).first
+                                if await _nloc.count() > 0 and await _nloc.is_visible():
+                                    await _nloc.scroll_into_view_if_needed()
+                                    await _nloc.click(timeout=15000)
+                                    logger.info(f"Next/Verify нажат после ввода резервного кода: {_ns}")
+                                    break
+                            except Exception:
+                                continue
+                        await popup_page.wait_for_timeout(8000)
+                        # Ждём редирект на pay.google.com и кнопку "Оплатить"
+                        logger.info("Ожидание экрана оплаты (pay.google.com) после ввода резервного кода...")
+                        pay_screen_seen = False
+                        for _pi in range(30):
+                            await popup_page.wait_for_timeout(1000)
+                            try:
+                                current_url = (popup_page.url or "").lower()
+                                _body = (await popup_page.evaluate("() => document.body.innerText")).lower()
+                                is_pay_screen = (
+                                    "pay.google.com" in current_url
+                                    or "оплатить" in _body
+                                    or "total" in _body and ("mastercard" in _body or "visa" in _body or "pay" in _body)
+                                    or "place order" in _body
+                                )
+                                if is_pay_screen:
+                                    pay_screen_seen = True
+                                    logger.info(f"Экран оплаты pay.google.com появился (шаг {_pi + 1}), URL: {popup_page.url[:80]}")
+                                    await popup_page.wait_for_timeout(2000)
+                                    await _screenshot(popup_page, "google_pay_ready_to_confirm")
+                                    await _confirm_payment_in_popup(popup_page)
+                                    break
+                            except Exception:
+                                pass
+                        if not pay_screen_seen:
+                            logger.warning("Экран оплаты не появился за 30 сек после ввода резервного кода")
+                    else:
+                        logger.warning("Поле ввода резервного кода не найдено за 20 сек — продолжаем к fallback")
+                        await popup_page.wait_for_timeout(5000)
+                else:
+                    await popup_page.wait_for_timeout(12000)
         except Exception as e:
             logger.debug("Шаг 2-Step Verification (Try another way): %s", e)
 
@@ -849,70 +1643,170 @@ async def _login_google_in_popup(
 # Шаг 3: Подтверждение оплаты в popup Google Pay
 # ──────────────────────────────────────────────────────────────────────────────
 
+async def _click_pay_button_once(popup_page, confirm_selectors, re_module) -> bool:
+    """Одна попытка нажать кнопку Оплатить/Pay. Возвращает True если клик выполнен."""
+    # Даём странице время отрисовать кнопку (pay.google.com динамический)
+    await popup_page.wait_for_timeout(3000)
+    for _wait_step in range(10):
+        for sel in confirm_selectors:
+            try:
+                loc = popup_page.locator(sel).first
+                if await loc.count() > 0:
+                    await loc.scroll_into_view_if_needed()
+                    await _delay(popup_page, 300, 600)
+                    try:
+                        await loc.click(timeout=15000)
+                    except Exception:
+                        await loc.click(timeout=10000, force=True)
+                    logger.info(f"Кнопка 'Оплатить'/'Pay' нажата: {sel}")
+                    return True
+            except Exception:
+                continue
+        if _wait_step < 9:
+            await popup_page.wait_for_timeout(2000)
+    for name_pattern in [re_module.compile(r"оплатить|pay|confirm|continue|подтвердить", re_module.I)]:
+        try:
+            btn = popup_page.get_by_role("button", name=name_pattern).first
+            if await btn.count() > 0:
+                await btn.scroll_into_view_if_needed()
+                await _delay(popup_page, 300, 600)
+                try:
+                    await btn.click(timeout=15000)
+                except Exception:
+                    await btn.click(timeout=10000, force=True)
+                logger.info("Кнопка 'Оплатить'/'Pay' нажата: get_by_role(button)")
+                return True
+        except Exception:
+            continue
+    # Запасной вариант: клик через JavaScript (кнопка может быть в shadow DOM или перекрыта)
+    try:
+        clicked = await popup_page.evaluate("""
+            () => {
+                function findAndClickInRoot(root) {
+                    const byJsname = root.querySelector('button[jsname="LgbsSe"]');
+                    if (byJsname) { byJsname.click(); return true; }
+                    const byClass = root.querySelector('button.VfPpkd-LgbsSe');
+                    if (byClass) { byClass.click(); return true; }
+                    const buttons = root.querySelectorAll('button');
+                    for (const b of buttons) {
+                        const t = (b.textContent || '').trim();
+                        if (t === 'Оплатить' || t === 'Pay' || t.includes('Оплатить')) {
+                            b.click();
+                            return true;
+                        }
+                    }
+                    const span = root.querySelector('span.VfPpkd-vQzf8d');
+                    if (span && span.textContent && span.textContent.includes('Оплатить')) {
+                        const btn = span.closest('button');
+                        if (btn) { btn.click(); return true; }
+                    }
+                    return false;
+                }
+                if (findAndClickInRoot(document)) return true;
+                const all = document.querySelectorAll('*');
+                for (let i = 0; i < all.length; i++) {
+                    if (all[i].shadowRoot && findAndClickInRoot(all[i].shadowRoot)) return true;
+                }
+                return false;
+            }
+        """)
+        if clicked:
+            logger.info("Кнопка 'Оплатить'/'Pay' нажата: JavaScript click")
+            return True
+    except Exception as e:
+        logger.debug("JS клик по кнопке Оплатить: %s", e)
+    return False
+
+
+async def _payment_page_has_error_async(popup_page) -> bool:
+    """Проверяет, есть ли на странице ошибка после нажатия (например REQUEST_TIMEOUT)."""
+    try:
+        body = (await popup_page.evaluate("() => document.body.innerText")).lower()
+    except Exception:
+        return False
+    # Конкретные сообщения Google Pay при сбое оплаты
+    errors = ("request_timeout", "request timeout", "connection error", "something went wrong")
+    return any(e in body for e in errors)
+
+
 async def _confirm_payment_in_popup(popup_page) -> bool:
-    """Нажимает кнопку подтверждения оплаты в popup Google Pay."""
-    import re
+    """
+    Нажимает кнопку подтверждения оплаты в popup Google Pay.
+    Экран: pay.google.com — кнопка "Оплатить" / "Pay".
+    При появлении ошибки (например REQUEST_TIMEOUT) перезагружает страницу и повторяет до 3 попыток.
+    """
+    import re as re_module
     logger.info("Подтверждение оплаты в Google Pay popup...")
 
     try:
-        await popup_page.wait_for_load_state("domcontentloaded", timeout=60000)
+        await popup_page.wait_for_load_state("domcontentloaded", timeout=30000)
     except Exception:
         pass
 
-    await popup_page.wait_for_timeout(6000)
+    logger.info(f"URL перед подтверждением: {popup_page.url[:80]}")
     await _screenshot(popup_page, "google_pay_confirm_popup")
 
+    # Кнопка "Оплатить" на pay.google.com — Material Design: jsname="LgbsSe", span с текстом "Оплатить"
     confirm_selectors = [
+        'button[jsname="LgbsSe"]',
+        'button.VfPpkd-LgbsSe',
+        'button:has(span:has-text("Оплатить"))',
+        'button:has(span.VfPpkd-vQzf8d:has-text("Оплатить"))',
+        'button:has-text("Оплатить")',
+        'button:has-text("Pay")',
+        '[role="button"]:has-text("Оплатить")',
+        '[role="button"]:has-text("Pay")',
         'button:has-text("Pay with G Pay")',
         'button:has-text("Pay with Google Pay")',
-        'button:has-text("Pay")',
         'button:has-text("Continue")',
         'button:has-text("Confirm")',
         'button:has-text("Place order")',
         'button:has-text("Buy")',
-        'button:has-text("Оплатить")',
         'button:has-text("Подтвердить")',
         'button:has-text("Оплатить с G Pay")',
         '[class*="pay-button"]',
         '[class*="payButton"]',
-        '[class*="confirm"]',
+        '[class*="VfPpkd-LgbsSe"]',
+        '[jsname*="pay"]',
+        '[data-value*="pay"]',
         'button[type="submit"]',
-        '[role="button"]:has-text("Pay")',
-        '[role="button"]:has-text("Confirm")',
-        '[role="button"]:has-text("Continue")',
+        '[class*="confirm"]',
         '[data-testid*="pay"]',
         '[data-testid*="confirm"]',
         'div[role="button"]:has-text("Pay")',
         'span[role="button"]:has-text("Pay")',
     ]
 
-    for sel in confirm_selectors:
-        try:
-            loc = popup_page.locator(sel).first
-            if await loc.count() > 0 and await loc.is_visible():
-                await loc.scroll_into_view_if_needed()
-                await _delay(popup_page, 800, 1500)
-                await loc.click(timeout=15000)
-                logger.info(f"Оплата подтверждена: {sel}")
-                return True
-        except Exception:
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            logger.info("Перезагрузка страницы Google Pay перед повторной попыткой нажатия 'Оплатить' (%s/3)...", attempt)
+            try:
+                await popup_page.reload(wait_until="domcontentloaded", timeout=60000)
+                await popup_page.wait_for_timeout(5000)
+            except Exception as e:
+                logger.warning("Ошибка перезагрузки popup: %s", e)
+            await _screenshot(popup_page, f"google_pay_confirm_retry_{attempt}")
+
+        clicked = await _click_pay_button_once(popup_page, confirm_selectors, re_module)
+        if not clicked:
+            if attempt == max_attempts:
+                await _screenshot(popup_page, "google_pay_confirm_failed")
+                logger.warning("Кнопка подтверждения оплаты ('Оплатить'/'Pay') не найдена после %s попыток", max_attempts)
+                return False
             continue
 
-    # Fallback: get_by_role по подстроке (Pay, Confirm, Continue, Оплатить)
-    for name_pattern in [re.compile(r"pay|confirm|continue|оплатить|подтвердить", re.I)]:
-        try:
-            btn = popup_page.get_by_role("button", name=name_pattern).first
-            if await btn.count() > 0 and await btn.is_visible():
-                await btn.scroll_into_view_if_needed()
-                await _delay(popup_page, 500, 1000)
-                await btn.click(timeout=15000)
-                logger.info("Оплата подтверждена: get_by_role(button)")
-                return True
-        except Exception:
-            continue
+        await popup_page.wait_for_timeout(6000)
+        if await _payment_page_has_error_async(popup_page):
+            logger.warning(
+                "После нажатия 'Оплатить' обнаружена ошибка (например REQUEST_TIMEOUT), попытка %s/%s",
+                attempt, max_attempts,
+            )
+            if attempt < max_attempts:
+                continue
+        return True
 
-    logger.warning("Кнопка подтверждения оплаты не найдена")
-    return False
+    return True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1192,6 +2086,11 @@ async def handle_google_pay(
 ) -> dict:
     """
     Полный flow оплаты через Google Pay (FastSpring или Appcharge checkout).
+
+    Appcharge обрабатывается параллельно с FastSpring:
+    - Проверяется немедленно при старте
+    - Периодически (каждые 5 сек) во время ожидания FastSpring
+    - При неудаче стандартных селекторов — Claude AI анализирует скриншот
 
     Returns:
         dict: success, google_pay_clicked, payment_confirmed, payment_verified,
