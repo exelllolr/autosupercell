@@ -375,23 +375,57 @@ async def _try_click_in_frame(frame, selectors: list, label: str) -> bool:
     return False
 
 
+def _is_fastspring_url(url: str) -> bool:
+    """Возвращает True если URL относится к FastSpring checkout."""
+    url = (url or "").lower()
+    return (
+        "onfastspring.com/embedded-checkout" in url
+        or "onfastspring.com" in url
+        or "cloudfront.net/supercell/embedded-checkout" in url
+        or "fastspring.com" in url
+    )
+
+
+def _is_fastspring_checkout_page(page) -> bool:
+    """
+    Проверяет, что ТЕКУЩАЯ страница (не iframe) является FastSpring checkout.
+    Это происходит когда FastSpring открывается как отдельная страница/popup,
+    а не как embedded iframe.
+    """
+    try:
+        url = (page.url or "").lower()
+        # store.supercell.com/... с FastSpring формой на странице
+        if _is_fastspring_url(url):
+            return True
+        # Основная страница store.supercell.com — FastSpring рендерит форму прямо на ней
+        if "store.supercell.com" in url:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _get_fastspring_frames(page):
     """
-    Возвращает список кандидатов на FastSpring checkout iframe.
+    Возвращает список кандидатов на FastSpring checkout.
+    ВАЖНО: На скриншоте FastSpring рендерит форму прямо на странице store.supercell.com
+    (не в iframe). Поэтому сначала проверяем основную страницу, потом iframe.
     Скелетон (sbl.onfastspring.com/sbl/.../skeleton.html) — пропускаем.
     """
     candidates = []
     try:
+        # Проверяем основную страницу — FastSpring может рендериться прямо на ней
+        # (store.supercell.com с формой [Card][PayPal][Google Pay][Amazon Pay])
+        if _is_fastspring_checkout_page(page):
+            candidates.append(page.main_frame)
+
         for frame in page.frames:
+            if frame == page.main_frame:
+                continue
             url = frame.url or ""
             if "skeleton.html" in url or "sbl.onfastspring.com/sbl/" in url:
                 continue
-            if (
-                "onfastspring.com/embedded-checkout" in url
-                or "onfastspring.com" in url
-                or "cloudfront.net/supercell/embedded-checkout" in url
-                or "fastspring.com" in url
-            ):
+            if _is_fastspring_url(url):
                 candidates.append(frame)
     except Exception:
         pass
@@ -420,43 +454,63 @@ async def _is_appcharge_checkout(page) -> bool:
 
 async def _wait_for_fastspring_loaded(page, timeout_ms: int = None) -> list:
     """
-    Ждёт пока FastSpring checkout iframe полностью загрузится.
+    Ждёт пока FastSpring checkout загрузится — либо в iframe, либо прямо на странице.
+    На скриншоте форма [Card][PayPal][Google Pay][Amazon Pay] рендерится прямо
+    на store.supercell.com, без отдельного iframe.
     Возвращает список загруженных FastSpring frame.
     """
     if timeout_ms is None:
         timeout_ms = _FASTSPRING_IFRAME_TIMEOUT_MS
-    logger.info("Ожидание загрузки FastSpring checkout iframe (таймаут %s сек)...", timeout_ms // 1000)
+    logger.info("Ожидание загрузки FastSpring checkout (таймаут %s сек)...", timeout_ms // 1000)
     deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
 
     while asyncio.get_event_loop().time() < deadline:
+        # ── Проверка 1: FastSpring форма прямо на текущей странице ───────────
+        # Признаки: кнопки [Card][PayPal][Google Pay][Amazon Pay] + цена + "Sold and fulfilled by FastSpring"
+        try:
+            has_fastspring_form = await page.evaluate("""() => {
+                const text = (document.body.innerText || '').toLowerCase();
+                const hasFastspring = text.includes('fastspring') || text.includes('sold and fulfilled');
+                const hasGooglePay = text.includes('google pay') || text.includes('g pay');
+                const hasPrice = !!document.body.innerText.match(/\\$[\\d.]+/);
+                const hasPaymentTabs = text.includes('card') && (text.includes('paypal') || text.includes('amazon pay'));
+                return (hasFastspring || hasPaymentTabs) && hasGooglePay && hasPrice;
+            }""")
+            if has_fastspring_form:
+                logger.info("FastSpring форма обнаружена прямо на странице (не в iframe): %s", page.url[:80])
+                return [page.main_frame]
+        except Exception:
+            pass
+
+        # ── Проверка 2: FastSpring embedded iframe ─────────────────────────
         frames = _get_fastspring_frames(page)
-        if not frames:
+        # Убираем main_frame из списка — уже проверили выше
+        iframe_frames = [f for f in frames if f != page.main_frame]
+
+        if iframe_frames:
+            loaded = []
+            for frame in iframe_frames:
+                try:
+                    has_content = await frame.evaluate("""() => {
+                        const btns = document.querySelectorAll('button');
+                        const inputs = document.querySelectorAll('input');
+                        const price = document.body.innerText.match(/\\$[\\d.]+/);
+                        return btns.length > 0 || inputs.length > 0 || price !== null;
+                    }""")
+                    if has_content:
+                        loaded.append(frame)
+                        logger.info(f"FastSpring iframe загружен: {frame.url[:80]}")
+                except Exception:
+                    continue
+            if loaded:
+                return loaded
+            logger.debug(f"FastSpring iframe найден ({len(iframe_frames)}), ждём контента...")
+        else:
             logger.debug("FastSpring iframe ещё не появился, ждём...")
-            await page.wait_for_timeout(2000)
-            continue
 
-        loaded = []
-        for frame in frames:
-            try:
-                has_content = await frame.evaluate("""() => {
-                    const btns = document.querySelectorAll('button');
-                    const inputs = document.querySelectorAll('input');
-                    const price = document.body.innerText.match(/\\$[\\d.]+/);
-                    return btns.length > 0 || inputs.length > 0 || price !== null;
-                }""")
-                if has_content:
-                    loaded.append(frame)
-                    logger.info(f"FastSpring iframe загружен: {frame.url[:80]}")
-            except Exception:
-                continue
-
-        if loaded:
-            return loaded
-
-        logger.debug(f"FastSpring iframe найден ({len(frames)}), ждём контента...")
         await page.wait_for_timeout(2000)
 
-    logger.warning("FastSpring iframe не загрузился за отведённое время")
+    logger.warning("FastSpring checkout не загрузился за отведённое время")
     return []
 
 
@@ -696,31 +750,19 @@ async def select_gpay_tab_and_pay(page, timeout_ms: int = 90000) -> bool:
         logger.info("Appcharge: кнопка оплаты не нажата с первой попытки, продолжаем поиск FastSpring...")
 
     # ── Параллельное ожидание FastSpring + периодическая проверка Appcharge ───
+    # _wait_for_fastspring_loaded уже умеет находить форму и на основной странице,
+    # и в iframe. Запускаем с коротким таймаутом, периодически проверяя Appcharge.
     fastspring_wait_ms = min(timeout_ms, _FASTSPRING_SHORT_TIMEOUT_MS)
-    check_interval_ms = 5000  # проверяем Appcharge каждые 5 сек пока ждём FastSpring
+    check_interval_ms = 5000  # шаг проверки Appcharge
     elapsed_ms = 0
     loaded_frames = []
 
-    while elapsed_ms < fastspring_wait_ms:
-        # Проверяем FastSpring
-        frames = _get_fastspring_frames(page)
-        if frames:
-            # Проверяем загружены ли
-            for frame in frames:
-                try:
-                    has_content = await frame.evaluate("""() => {
-                        const btns = document.querySelectorAll('button');
-                        const inputs = document.querySelectorAll('input');
-                        const price = document.body.innerText.match(/\\$[\\d.]+/);
-                        return btns.length > 0 || inputs.length > 0 || price !== null;
-                    }""")
-                    if has_content:
-                        loaded_frames.append(frame)
-                except Exception:
-                    continue
-            if loaded_frames:
-                logger.info("FastSpring iframe загружен, переходим к клику G Pay")
-                break
+    while elapsed_ms < fastspring_wait_ms and not loaded_frames:
+        # Быстрая проверка FastSpring (одна итерация без ожидания)
+        loaded_frames = await _wait_for_fastspring_loaded(page, timeout_ms=check_interval_ms)
+        if loaded_frames:
+            logger.info("FastSpring checkout обнаружен и загружен")
+            break
 
         # Параллельно проверяем Appcharge (могло появиться после редиректа)
         if await _is_appcharge_checkout(page):
@@ -729,9 +771,8 @@ async def select_gpay_tab_and_pay(page, timeout_ms: int = 90000) -> bool:
             if appcharge_ok:
                 return True
 
-        await page.wait_for_timeout(check_interval_ms)
         elapsed_ms += check_interval_ms
-        logger.debug("Ожидание FastSpring: %d / %d мс...", elapsed_ms, fastspring_wait_ms)
+        logger.debug("Ожидание FastSpring/Appcharge: %d / %d мс...", elapsed_ms, fastspring_wait_ms)
 
     if not loaded_frames:
         logger.info("FastSpring не открылся за %d сек, финальная попытка Appcharge/G Pay...", fastspring_wait_ms // 1000)
@@ -759,7 +800,8 @@ async def select_gpay_tab_and_pay(page, timeout_ms: int = 90000) -> bool:
     pay_click_attempts = [(4000, "1"), (6000, "2"), (8000, "3"), (10000, "4")]
 
     for frame in loaded_frames:
-        logger.info(f"Ищем G Pay вкладку в iframe: {frame.url[:80]}")
+        frame_url = getattr(frame, "url", None) or page.url
+        logger.info(f"Ищем G Pay вкладку: {(frame_url or '')[:80]}")
         tab_clicked = False
         for attempt in range(1, tab_click_max_attempts + 1):
             tab_clicked = await _try_click_in_frame(
@@ -785,31 +827,54 @@ async def select_gpay_tab_and_pay(page, timeout_ms: int = 90000) -> bool:
                     tab_clicked = await _try_click_claude_selector(page, claude_tab_sel, "FastSpring G Pay вкладка (main)")
 
         if not tab_clicked:
-            logger.debug(f"G Pay вкладка не найдена в {frame.url[:60]}")
+            frame_url_str = getattr(frame, "url", None) or page.url
+            logger.debug(f"G Pay вкладка не найдена в {(frame_url_str or '')[:60]}")
             continue
 
-        logger.info("Вкладка G Pay выбрана, ждём появления кнопки 'Place Your Order'...")
-        await page.wait_for_timeout(8000)
+        logger.info("Вкладка Google Pay выбрана, ждём появления кнопки оплаты...")
+        # После клика Google Pay на FastSpring форма перезагружается и появляется кнопка "Pay $X.XX"
+        # Ждём до 15 сек с проверкой каждые 2 сек
+        pay_appeared = False
+        for _ in range(8):
+            await page.wait_for_timeout(2000)
+            for quick_sel in [
+                'button:has-text("Pay $")', 'button:has-text("Place Your Order")',
+                'button:has-text("Place your order")', '.gpay-button',
+            ]:
+                try:
+                    # Проверяем и в frame и на основной странице
+                    for target in ([frame, page] if frame != page.main_frame else [page]):
+                        loc = target.locator(quick_sel).first
+                        if await loc.count() > 0 and await loc.is_visible():
+                            pay_appeared = True
+                            break
+                    if pay_appeared:
+                        break
+                except Exception:
+                    continue
+            if pay_appeared:
+                logger.info("Кнопка оплаты появилась после выбора Google Pay")
+                break
+        if not pay_appeared:
+            logger.info("Кнопка оплаты не появилась за 16 сек, всё равно пробуем...")
         await _screenshot(page, "fastspring_after_gpay_tab")
 
         pay_clicked = False
-        for wait_after_ms, label in pay_click_attempts:
-            pay_clicked = await _try_click_in_frame(
-                frame, _GPAY_PAY_BUTTON_SELECTORS,
-                f"Нажата кнопка Place Your Order FastSpring (iframe {label})"
-            )
-            if pay_clicked:
-                break
-            if not pay_clicked:
+        for wait_after_ms, lbl in pay_click_attempts:
+            # Ищем сначала в frame (если это iframe), потом на основной странице
+            targets_to_try = ([frame, page] if frame != page.main_frame else [page, page])
+            for t in targets_to_try:
                 pay_clicked = await _try_click_in_frame(
-                    page, _GPAY_PAY_BUTTON_SELECTORS,
-                    f"Нажата кнопка Place Your Order FastSpring (main {label})"
+                    t, _GPAY_PAY_BUTTON_SELECTORS,
+                    f"Нажата кнопка Place Your Order/Pay FastSpring ({lbl})"
                 )
+                if pay_clicked:
+                    break
             if pay_clicked:
                 break
             logger.info("Кнопка оплаты не найдена, ждём %s сек...", wait_after_ms // 1000)
             await page.wait_for_timeout(wait_after_ms)
-            await _screenshot(page, f"fastspring_gpay_retry_{label}")
+            await _screenshot(page, f"fastspring_gpay_retry_{lbl}")
 
         # Fallback FastSpring: Claude AI ищет кнопку Place Your Order
         if not pay_clicked:
