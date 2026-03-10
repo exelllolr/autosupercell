@@ -1738,26 +1738,81 @@ async def _login_google_in_popup(
 # Шаг 3: Подтверждение оплаты в popup Google Pay
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Кнопка "Оплатить"/Pay на pay.google.com часто находится ВНУТРИ IFRAME (см. Playwright issue #19776)
+# Кнопка "Оплатить"/Pay на pay.google.com часто находится ВНУТРИ IFRAME (Playwright issue #19776).
+# Вариант 1: явный iframe#sM432dIframe + iframe[name$="Iframe"] (BT-Portman), затем перебор по индексу.
 _PAY_BUTTON_IFRAME_SELECTORS = [
-    'iframe#sM432dIframe',
+    'iframe#sM432dIframe',  # из комментария maximkoshelenko (issue #19776)
+    'iframe[name$="Iframe"]:not([name="paymentsModalIframe"])',  # BT-Portman: name оканчивается на Iframe
     'iframe[id*="Iframe"]',
     'iframe[name*="Iframe"]:not([name="paymentsModalIframe"])',
     'iframe[title*="pay"]',
     'iframe',
 ]
 
+# Тексты кнопки подтверждения оплаты в iframe (порядок по issue #19776: Continue часто на en)
+_PAY_BUTTON_TEXTS = ["Continue", "Pay", "Оплатить", "Подтвердить"]
+
+# Ожидание загрузки страницы с кнопкой «Оплатить» (pay.google.com и iframe рендерятся с задержкой)
+_PAY_PAGE_LOAD_WAIT_MS = 10_000
+
+# Вариант 2 (BT-Portman): селектор iframe по имени (оканчивается на "Iframe", не paymentsModalIframe)
+_PAY_IFRAME_V2_SELECTOR = 'iframe[name$="Iframe"]:not([name="paymentsModalIframe"])'
+_PAY_IFRAME_V2_POLL_MS = 12_000   # сколько ждать появления iframe с кнопкой
+_PAY_IFRAME_V2_INTERVAL_MS = 1000 # проверять каждую секунду
+
 
 async def _click_pay_button_inside_iframes(popup_page) -> bool:
     """
     Ищет кнопку Оплатить/Pay внутри iframe на странице pay.google.com.
-    По данным Playwright issue #19776, секция оплаты рендерится в отдельном iframe.
+    Вариант 1: iframe#sM432dIframe и др. Вариант 2 (BT-Portman): цикл ожидания iframe[name$="Iframe"] + Pay exact.
     """
     import re
+
+    # Ожидание перехода на pay.google.com (как в issue #19776)
+    try:
+        await popup_page.wait_for_url(
+            lambda u: "pay.google.com" in (u or "") and "/pay" in (u or ""),
+            timeout=15000,
+        )
+    except Exception:
+        pass
+    # Даём время загрузиться iframe с кнопкой «Оплатить» (половина основного таймаута)
+    await popup_page.wait_for_timeout(_PAY_PAGE_LOAD_WAIT_MS // 2)
+
+    # ─── Вариант 2 (BT-Portman): цикл ожидания — iframe по имени + кнопка "Pay" exact ───
+    # Iframe может появиться с задержкой; перебираем каждую секунду в течение _PAY_IFRAME_V2_POLL_MS
+    logger.info("Вариант 2: ожидание iframe [name$=Iframe] и кнопки Pay (exact), до %s сек", _PAY_IFRAME_V2_POLL_MS // 1000)
+    deadline = asyncio.get_running_loop().time() + (_PAY_IFRAME_V2_POLL_MS / 1000.0)
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            frame_loc = popup_page.frame_locator(_PAY_IFRAME_V2_SELECTOR)
+            pay_btn = frame_loc.get_by_role("button", name="Pay", exact=True).first
+            if await pay_btn.count() > 0:
+                await pay_btn.scroll_into_view_if_needed()
+                await _delay(popup_page, 400, 800)
+                await pay_btn.click(timeout=15000)
+                logger.info("Кнопка 'Pay' (exact) нажата — Вариант 2 (iframe name$=Iframe)")
+                return True
+        except Exception:
+            pass
+        await popup_page.wait_for_timeout(_PAY_IFRAME_V2_INTERVAL_MS)
+    logger.debug("Вариант 2: iframe с кнопкой Pay не найден за отведённое время")
+
     for frame_sel in _PAY_BUTTON_IFRAME_SELECTORS:
         try:
             frame_loc = popup_page.frame_locator(frame_sel)
-            for btn_text in ["Оплатить", "Pay", "Continue", "Подтвердить"]:
+            # Сначала точное совпадение "Pay" (как у BT-Portman: getByRole("button", { name: "Pay", exact: true }))
+            try:
+                btn_exact = frame_loc.get_by_role("button", name="Pay", exact=True).first
+                if await btn_exact.count() > 0:
+                    await btn_exact.scroll_into_view_if_needed()
+                    await _delay(popup_page, 400, 800)
+                    await btn_exact.click(timeout=15000)
+                    logger.info("Кнопка 'Pay' (exact) нажата внутри iframe (%s)", frame_sel)
+                    return True
+            except Exception:
+                pass
+            for btn_text in _PAY_BUTTON_TEXTS:
                 try:
                     btn = frame_loc.get_by_role("button", name=re.compile(re.escape(btn_text), re.I)).first
                     if await btn.count() > 0:
@@ -1768,27 +1823,28 @@ async def _click_pay_button_inside_iframes(popup_page) -> bool:
                         return True
                 except Exception:
                     continue
-            try:
-                for sel in ['button:has-text("Оплатить")', 'button:has-text("Pay")', 'button[jsname="LgbsSe"]', 'button.VfPpkd-LgbsSe']:
+            for sel in ['button:has-text("Оплатить")', 'button:has-text("Pay")', 'button:has-text("Continue")', 'button[jsname="LgbsSe"]', 'button.VfPpkd-LgbsSe']:
+                try:
                     loc = frame_loc.locator(sel).first
                     if await loc.count() > 0:
                         await loc.scroll_into_view_if_needed()
                         await _delay(popup_page, 400, 800)
                         await loc.click(timeout=15000)
-                        logger.info("Кнопка 'Оплатить'/'Pay' нажата внутри iframe (%s): %s", frame_sel, sel)
+                        logger.info("Кнопка нажата внутри iframe (%s): %s", frame_sel, sel)
                         return True
-            except Exception:
-                continue
+                except Exception:
+                    continue
         except Exception as e:
             logger.debug("Поиск кнопки в iframe %s: %s", frame_sel, e)
             continue
+
     # Перебор всех фреймов страницы (frame.frames)
     try:
         for frame in popup_page.frames:
             if frame == popup_page.main_frame:
                 continue
             try:
-                for sel in ['button:has-text("Оплатить")', 'button:has-text("Pay")', 'button[jsname="LgbsSe"]']:
+                for sel in ['button:has-text("Оплатить")', 'button:has-text("Pay")', 'button:has-text("Continue")', 'button[jsname="LgbsSe"]']:
                     loc = frame.locator(sel).first
                     if await loc.count() > 0:
                         await loc.scroll_into_view_if_needed()
@@ -1801,17 +1857,27 @@ async def _click_pay_button_inside_iframes(popup_page) -> bool:
     except Exception as e:
         logger.debug("Перебор frames: %s", e)
 
-    # Если один селектор (например iframe) совпадает с несколькими iframe — пробуем по индексу
+    # Перебор iframe по индексу (если селектор "iframe" совпадает с несколькими)
     try:
-        for i in range(5):
+        for i in range(6):
             try:
                 fl = popup_page.frame_locator("iframe").nth(i)
-                btn = fl.get_by_role("button", name=re.compile(r"оплатить|pay|continue", re.I)).first
+                btn = fl.get_by_role("button", name=re.compile(r"pay|оплатить|continue", re.I)).first
                 if await btn.count() > 0:
                     await btn.scroll_into_view_if_needed()
                     await _delay(popup_page, 400, 800)
                     await btn.click(timeout=15000)
                     logger.info("Кнопка 'Оплатить'/'Pay' нажата в iframe.nth(%s)", i)
+                    return True
+            except Exception:
+                continue
+            try:
+                btn = fl.get_by_role("button", name="Pay", exact=True).first
+                if await btn.count() > 0:
+                    await btn.scroll_into_view_if_needed()
+                    await _delay(popup_page, 400, 800)
+                    await btn.click(timeout=15000)
+                    logger.info("Кнопка Pay (exact) нажата в iframe.nth(%s)", i)
                     return True
             except Exception:
                 continue
@@ -1881,7 +1947,8 @@ async def _click_pay_button_by_mouse_at_coords(popup_page) -> bool:
 
 async def _click_pay_button_once(popup_page, confirm_selectors, re_module) -> bool:
     """Одна попытка нажать кнопку Оплатить/Pay. Возвращает True если клик выполнен."""
-    await popup_page.wait_for_timeout(3000)
+    # Небольшая пауза перед поиском (основное ожидание — в _confirm_payment_in_popup)
+    await popup_page.wait_for_timeout(2000)
 
     # 0) Кнопка на pay.google.com часто внутри iframe (Playwright issue #19776)
     if await _click_pay_button_inside_iframes(popup_page):
@@ -2020,6 +2087,10 @@ async def _confirm_payment_in_popup(popup_page) -> bool:
         await popup_page.wait_for_load_state("domcontentloaded", timeout=30000)
     except Exception:
         pass
+
+    # Таймаут: даём странице с кнопкой «Оплатить» полностью загрузиться (pay.google.com + iframe)
+    logger.info("Ожидание загрузки страницы с кнопкой Оплатить (%s сек)...", _PAY_PAGE_LOAD_WAIT_MS // 1000)
+    await popup_page.wait_for_timeout(_PAY_PAGE_LOAD_WAIT_MS)
 
     logger.info(f"URL перед подтверждением: {popup_page.url[:80]}")
     await _screenshot(popup_page, "google_pay_confirm_popup")
