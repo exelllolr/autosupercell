@@ -318,6 +318,26 @@ docker compose logs -f
 
 ---
 
+## 7. Запуск на сервере как локально (Chrome в Docker)
+
+Чтобы браузерная автоматизация (Supercell, Google Pay) работала в контейнере так же, как локально, в `docker-compose.yml` для сервисов **app** и **worker** заданы настройки по рекомендациям Playwright и практикам запуска Chrome в Docker:
+
+| Настройка   | Назначение |
+|------------|------------|
+| **ipc: host** | Общий IPC namespace с хостом — Chromium не падает с ошибками рендерера (см. [Playwright Docker](https://playwright.dev/docs/docker), Cypress/Chrome issues). |
+| **shm_size: "1gb"** | Увеличенный `/dev/shm` (по умолчанию 64MB). Chrome/Chromium требуют больше shared memory для рендеринга. |
+| **init: true** | Корректная обработка процессов с PID 1, меньше «зомби»-процессов. |
+| **DISPLAY=:99** | Виртуальный дисплей Xvfb (скрипт `start_with_xvfb.sh`). Headed Chrome обходит Cloudflare Turnstile. |
+| **BROWSER_HEADLESS=false** | В контейнере с Xvfb браузер запускается в headed-режиме. |
+
+**Если хостинг не разрешает `ipc: host`** (например, некоторые managed Kubernetes): закомментируйте в `docker-compose.yml` строку `ipc: host` у `app` и `worker`, оставьте `shm_size` и `init`. Запуск может быть менее стабильным.
+
+**Дополнительно в коде:** в Docker к аргументам Chrome добавляются `--disable-gpu` и уже есть `--no-sandbox`, `--disable-dev-shm-usage` для работы в контейнере.
+
+**Ожидание Xvfb:** на медленном сервере виртуальный дисплей может подниматься дольше. По умолчанию скрипт ждёт до 20 сек (`XVFB_MAX_WAIT=20`). Можно увеличить: в `docker-compose.yml` для `app` добавить `environment: XVFB_MAX_WAIT: "30"`.
+
+---
+
 ## См. также
 
 - [docs/plan.md](plan.md) — общий план развёртывания на VPS, переменные окружения, Claude Vision.

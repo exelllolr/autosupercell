@@ -242,6 +242,10 @@ class BrowserAutomation:
                             "Headed режим (локально): убраны Docker-специфичные флаги для лучшей имитации."
                         )
 
+                # В Docker отключаем GPU — в контейнере нет GPU, иначе Chrome может падать (см. best practices)
+                if is_docker and "--disable-gpu" not in browser_args:
+                    browser_args.append("--disable-gpu")
+
                 use_persistent = getattr(
                     settings, "BROWSER_USE_PERSISTENT_PROFILE", True
                 )

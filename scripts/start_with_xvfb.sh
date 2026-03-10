@@ -63,8 +63,8 @@ Xvfb "${DISPLAY_VAL}" \
 
 XVFB_PID=$!
 
-# ── Ждём готовности Xvfb ─────────────────────────────────────────────────────
-MAX_WAIT=10
+# ── Ждём готовности Xvfb (на сервере может быть дольше) ───────────────────────
+MAX_WAIT="${XVFB_MAX_WAIT:-20}"
 for i in $(seq 1 $MAX_WAIT); do
     if xdpyinfo -display "${DISPLAY_VAL}" &>/dev/null 2>&1; then
         echo "[INFO] Xvfb готов (PID=${XVFB_PID}, ждали ${i} сек)"

@@ -2,6 +2,11 @@ services:
   app:
     build: .
     container_name: autosupercell-app
+    # Chromium в Docker (как локально): ipc=host + shm_size — Playwright/Cypress best practices.
+    # Если хостинг не разрешает ipc: host — закомментируйте ipc, оставьте shm_size и init.
+    ipc: host
+    shm_size: "1gb"
+    init: true
     dns:
       - 8.8.8.8
       - 8.8.4.4
@@ -92,6 +97,9 @@ services:
   worker:
     build: .
     container_name: autosupercell-worker
+    ipc: host
+    shm_size: "1gb"
+    init: true
     dns:
       - 127.0.0.11
       - 8.8.8.8
