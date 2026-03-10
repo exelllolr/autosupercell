@@ -298,37 +298,51 @@ async def _screenshot_full(page, name: str, folder: str = "screenshots") -> str:
 # Шаг 1: Найти FastSpring форму и кликнуть вкладку G Pay
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Селекторы вкладки G Pay в FastSpring и Appcharge
+# Селекторы вкладки G Pay / Google Pay в FastSpring и Appcharge.
+# ПОРЯДОК ВАЖЕН: сначала самые точные (специфичные для FastSpring), потом общие.
+# НЕ используем 'div:has-text("Google Pay")' — слишком широкий, матчит весь body.
 _GPAY_TAB_SELECTORS = [
-    # Текст "G Pay" (FastSpring использует именно это написание)
-    'button:has-text("G Pay")',
-    '[role="tab"]:has-text("G Pay")',
-    '[role="option"]:has-text("G Pay")',
-    'li:has-text("G Pay")',
-    'a:has-text("G Pay")',
-    'span:has-text("G Pay")',
-    'div:has-text("G Pay")',
-    # Текст "Google Pay"
-    'button:has-text("Google Pay")',
-    '[role="tab"]:has-text("Google Pay")',
-    '[role="option"]:has-text("Google Pay")',
-    'div:has-text("Google Pay")',
-    # Data-атрибуты FastSpring / платёжных систем
+    # ── FastSpring: вкладка выглядит как кнопка/div с текстом "Google Pay" внутри платёжного переключателя ──
+    # Точные селекторы для структуры FastSpring (store.supercell.com)
+    '[data-fsc-item-path-value*="google"]',
+    '[data-fsc-action*="google"]',
     '[data-method="googlepay"]',
     '[data-method="google_pay"]',
     '[data-payment-method="google_pay"]',
-    '[data-fsc-action*="google"]',
     '[id*="googlepay"]',
     '[id*="google-pay"]',
-    # Классы
-    '[class*="googlepay"]',
-    '[class*="google-pay"]',
-    '[class*="GooglePay"]',
-    # Изображение с alt Google Pay
+    '[id*="google_pay"]',
+    # Классы специфичные для Google Pay
+    '[class*="googlepay"]:not(body):not(html)',
+    '[class*="google-pay"]:not(body):not(html)',
+    '[class*="GooglePay"]:not(body):not(html)',
+    '[class*="gpay"]:not(body):not(html)',
+    # Кнопки с точным текстом
+    'button:has-text("Google Pay")',
+    'button:has-text("G Pay")',
+    # Роли вкладок/опций (radio-группа платёжных методов)
+    '[role="tab"]:has-text("Google Pay")',
+    '[role="tab"]:has-text("G Pay")',
+    '[role="radio"]:has-text("Google Pay")',
+    '[role="option"]:has-text("Google Pay")',
+    # li/a элементы меню выбора метода
+    'li:has-text("Google Pay")',
+    'li:has-text("G Pay")',
+    'a:has-text("Google Pay")',
+    'a:has-text("G Pay")',
+    # label (radio input + label — типичная структура FastSpring)
+    'label:has-text("Google Pay")',
+    'label:has-text("G Pay")',
+    # Изображение с alt Google Pay (иконка в вкладке)
     'img[alt*="Google Pay"]',
     'img[alt*="G Pay"]',
+    'img[src*="google-pay"]',
+    'img[src*="googlepay"]',
     # SVG title
     'button svg[title*="Google"]',
+    # span ТОЛЬКО внутри кнопок/лейблов (не весь body)
+    'button span:has-text("Google Pay")',
+    'label span:has-text("Google Pay")',
 ]
 
 # Селекторы кнопки оплаты после выбора G Pay вкладки
@@ -358,18 +372,38 @@ _GPAY_PAY_BUTTON_SELECTORS = [
 
 
 async def _try_click_in_frame(frame, selectors: list, label: str) -> bool:
-    """Пробует кликнуть по первому найденному селектору в frame."""
+    """
+    Пробует кликнуть по первому найденному селектору в frame.
+    Пропускает элементы-контейнеры (body, html, крупные div на всю страницу).
+    """
     for sel in selectors:
         try:
-            loc = frame.locator(sel).first
-            count = await loc.count()
-            if count > 0:
-                visible = await loc.is_visible()
-                if visible:
+            locs = frame.locator(sel)
+            count = await locs.count()
+            if count == 0:
+                continue
+            # Если несколько — перебираем, берём первый видимый и не-контейнер
+            for i in range(min(count, 5)):
+                loc = locs.nth(i)
+                try:
+                    visible = await loc.is_visible()
+                    if not visible:
+                        continue
+                    # Проверяем что это не огромный контейнер (body/wrapper)
+                    tag = await loc.evaluate("el => el.tagName.toLowerCase()")
+                    if tag in ("body", "html"):
+                        continue
+                    box = await loc.bounding_box()
+                    if box and box["width"] > 800 and box["height"] > 400:
+                        # Слишком большой элемент — это контейнер, пропускаем
+                        logger.debug(f"Пропуск контейнера {tag} ({box['width']}x{box['height']}): {sel}")
+                        continue
                     await loc.scroll_into_view_if_needed()
                     await loc.click(timeout=5000)
                     logger.info(f"{label}: {sel}")
                     return True
+                except Exception:
+                    continue
         except Exception:
             continue
     return False
@@ -577,12 +611,17 @@ async def select_gpay_and_buy_appcharge(page) -> bool:
             pass
 
         # ── Шаг 1: Клик на плашку Google Pay ─────────────────────────────────
-        tab_clicked = await _try_click_in_frame(
-            target, _GPAY_TAB_SELECTORS,
-            f"Appcharge ({label}): выбрана плашка Google Pay"
-        )
+        # Метод 1: JS точный поиск текста "Google Pay"
+        tab_clicked = await _click_fastspring_gpay_tab(target if target != page else page)
 
-        # Fallback: Claude AI ищет вкладку G Pay по скриншоту
+        # Метод 2: CSS-селекторы
+        if not tab_clicked:
+            tab_clicked = await _try_click_in_frame(
+                target, _GPAY_TAB_SELECTORS,
+                f"Appcharge ({label}): выбрана плашка Google Pay"
+            )
+
+        # Метод 3: Claude AI ищет вкладку G Pay по скриншоту
         if not tab_clicked:
             logger.info("Appcharge (%s): стандартные селекторы не нашли G Pay, спрашиваем Claude AI...", label)
             claude_selector = await _claude_find_gpay_selector(
@@ -717,7 +756,70 @@ async def _accept_cookies_on_page(page) -> bool:
     return False
 
 
-async def select_gpay_tab_and_pay(page, timeout_ms: int = 90000) -> bool:
+async def _click_fastspring_gpay_tab(page_or_frame) -> bool:
+    """
+    Специальная функция для клика по вкладке Google Pay в форме FastSpring.
+    Использует JavaScript для точного поиска — находит элемент платёжного
+    переключателя содержащий текст 'Google Pay', но НЕ являющийся контейнером.
+    Возвращает True если клик выполнен.
+    """
+    try:
+        clicked = await page_or_frame.evaluate("""() => {
+            // Ищем все элементы содержащие текст "Google Pay" или "G Pay"
+            const walker = document.createTreeWalker(
+                document.body,
+                NodeFilter.SHOW_ELEMENT,
+                null
+            );
+            const candidates = [];
+            let node;
+            while (node = walker.nextNode()) {
+                const text = (node.textContent || '').trim();
+                const ownText = Array.from(node.childNodes)
+                    .filter(n => n.nodeType === 3)
+                    .map(n => n.textContent.trim())
+                    .join('');
+                // Точный текст "Google Pay" или "G Pay" в своих текстовых узлах
+                if (ownText === 'Google Pay' || ownText === 'G Pay' ||
+                    text === 'Google Pay' || text === 'G Pay') {
+                    const rect = node.getBoundingClientRect();
+                    // Не контейнер: элемент небольшой и кликабельный
+                    if (rect.width < 300 && rect.height < 200 && rect.width > 0) {
+                        candidates.push(node);
+                    }
+                }
+            }
+            // Кликаем по первому подходящему (кнопка/label/div-плашка)
+            for (const el of candidates) {
+                const tag = el.tagName.toLowerCase();
+                const style = window.getComputedStyle(el);
+                const isClickable = (
+                    tag === 'button' || tag === 'label' || tag === 'a' ||
+                    tag === 'li' || el.getAttribute('role') === 'tab' ||
+                    el.getAttribute('role') === 'option' ||
+                    el.getAttribute('role') === 'radio' ||
+                    style.cursor === 'pointer'
+                );
+                if (isClickable) {
+                    el.scrollIntoView({block: 'center'});
+                    el.click();
+                    return el.tagName + ':' + (el.textContent || '').trim().slice(0, 30);
+                }
+            }
+            // Fallback: кликаем по любому кандидату
+            if (candidates.length > 0) {
+                candidates[0].scrollIntoView({block: 'center'});
+                candidates[0].click();
+                return 'fallback:' + candidates[0].tagName;
+            }
+            return null;
+        }""")
+        if clicked:
+            logger.info(f"FastSpring Google Pay вкладка нажата через JS: {clicked}")
+            return True
+    except Exception as e:
+        logger.debug(f"JS клик по Google Pay вкладке: {e}")
+    return False
     """
     Находит FastSpring форму в iframe, кликает вкладку G Pay,
     затем кнопку "Place Your Order". Если FastSpring не открывается —
@@ -803,28 +905,42 @@ async def select_gpay_tab_and_pay(page, timeout_ms: int = 90000) -> bool:
         frame_url = getattr(frame, "url", None) or page.url
         logger.info(f"Ищем G Pay вкладку: {(frame_url or '')[:80]}")
         tab_clicked = False
-        for attempt in range(1, tab_click_max_attempts + 1):
-            tab_clicked = await _try_click_in_frame(
-                frame, _GPAY_TAB_SELECTORS,
-                f"Нажата вкладка G Pay FastSpring (попытка {attempt}/{tab_click_max_attempts})"
-            )
-            if tab_clicked:
-                break
-            if attempt < tab_click_max_attempts:
-                await page.wait_for_timeout(3000)
-                logger.debug(f"Повтор поиска вкладки G Pay через 3 сек, попытка {attempt + 1}")
 
-        # Fallback FastSpring: Claude AI ищет вкладку G Pay
+        # ── Метод 1: JS-поиск точного текста "Google Pay" в DOM (самый надёжный) ─
+        tab_clicked = await _click_fastspring_gpay_tab(frame)
+        if not tab_clicked and frame != page.main_frame:
+            # Если это iframe — попробуем также на основной странице
+            tab_clicked = await _click_fastspring_gpay_tab(page)
+
+        # ── Метод 2: CSS-селекторы (если JS не сработал) ──────────────────────
         if not tab_clicked:
-            logger.info("FastSpring: стандартные селекторы не нашли G Pay, спрашиваем Claude AI...")
+            for attempt in range(1, tab_click_max_attempts + 1):
+                tab_clicked = await _try_click_in_frame(
+                    frame, _GPAY_TAB_SELECTORS,
+                    f"Нажата вкладка G Pay FastSpring CSS (попытка {attempt}/{tab_click_max_attempts})"
+                )
+                if not tab_clicked and frame != page.main_frame:
+                    tab_clicked = await _try_click_in_frame(
+                        page, _GPAY_TAB_SELECTORS,
+                        f"Нажата вкладка G Pay FastSpring CSS main (попытка {attempt})"
+                    )
+                if tab_clicked:
+                    break
+                if attempt < tab_click_max_attempts:
+                    await page.wait_for_timeout(3000)
+                    logger.debug(f"Повтор поиска вкладки G Pay через 3 сек, попытка {attempt + 1}")
+
+        # ── Метод 3: Claude AI (последний резерв) ─────────────────────────────
+        if not tab_clicked:
+            logger.info("FastSpring: JS и CSS не нашли G Pay вкладку, спрашиваем Claude AI...")
             claude_tab_sel = await _claude_find_gpay_selector(
                 page,
-                context_hint="This is a FastSpring embedded checkout. Find the G Pay / Google Pay tab."
+                context_hint="This is a FastSpring checkout on store.supercell.com. There are 4 payment tabs: Card, PayPal, Google Pay, Amazon Pay. Find the Google Pay tab selector."
             )
             if claude_tab_sel:
-                tab_clicked = await _try_click_claude_selector(frame, claude_tab_sel, "FastSpring G Pay вкладка")
+                tab_clicked = await _try_click_claude_selector(frame, claude_tab_sel, "FastSpring G Pay вкладка Claude")
                 if not tab_clicked:
-                    tab_clicked = await _try_click_claude_selector(page, claude_tab_sel, "FastSpring G Pay вкладка (main)")
+                    tab_clicked = await _try_click_claude_selector(page, claude_tab_sel, "FastSpring G Pay вкладка Claude (main)")
 
         if not tab_clicked:
             frame_url_str = getattr(frame, "url", None) or page.url
