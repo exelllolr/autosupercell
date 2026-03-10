@@ -1753,12 +1753,12 @@ _PAY_BUTTON_IFRAME_SELECTORS = [
 _PAY_BUTTON_TEXTS = ["Continue", "Pay", "Оплатить", "Подтвердить"]
 
 # Ожидание загрузки страницы с кнопкой «Оплатить» (pay.google.com и iframe рендерятся с задержкой)
-_PAY_PAGE_LOAD_WAIT_MS = 10_000
+_PAY_PAGE_LOAD_WAIT_MS = 20_000  # 20 сек
 
 # Вариант 2 (BT-Portman): селектор iframe по имени (оканчивается на "Iframe", не paymentsModalIframe)
 _PAY_IFRAME_V2_SELECTOR = 'iframe[name$="Iframe"]:not([name="paymentsModalIframe"])'
-_PAY_IFRAME_V2_POLL_MS = 12_000   # сколько ждать появления iframe с кнопкой
-_PAY_IFRAME_V2_INTERVAL_MS = 1000 # проверять каждую секунду
+_PAY_IFRAME_V2_POLL_MS = 25_000   # сколько ждать появления iframe с кнопкой (25 сек)
+_PAY_IFRAME_V2_INTERVAL_MS = 1500 # проверять каждые 1.5 сек
 
 
 async def _click_pay_button_inside_iframes(popup_page) -> bool:
@@ -1772,7 +1772,7 @@ async def _click_pay_button_inside_iframes(popup_page) -> bool:
     try:
         await popup_page.wait_for_url(
             lambda u: "pay.google.com" in (u or "") and "/pay" in (u or ""),
-            timeout=15000,
+            timeout=30_000,
         )
     except Exception:
         pass
@@ -1790,7 +1790,7 @@ async def _click_pay_button_inside_iframes(popup_page) -> bool:
             if await pay_btn.count() > 0:
                 await pay_btn.scroll_into_view_if_needed()
                 await _delay(popup_page, 400, 800)
-                await pay_btn.click(timeout=15000)
+                await pay_btn.click(timeout=25_000)
                 logger.info("Кнопка 'Pay' (exact) нажата — Вариант 2 (iframe name$=Iframe)")
                 return True
         except Exception:
@@ -1807,7 +1807,7 @@ async def _click_pay_button_inside_iframes(popup_page) -> bool:
                 if await btn_exact.count() > 0:
                     await btn_exact.scroll_into_view_if_needed()
                     await _delay(popup_page, 400, 800)
-                    await btn_exact.click(timeout=15000)
+                    await btn_exact.click(timeout=25_000)
                     logger.info("Кнопка 'Pay' (exact) нажата внутри iframe (%s)", frame_sel)
                     return True
             except Exception:
@@ -1818,7 +1818,7 @@ async def _click_pay_button_inside_iframes(popup_page) -> bool:
                     if await btn.count() > 0:
                         await btn.scroll_into_view_if_needed()
                         await _delay(popup_page, 400, 800)
-                        await btn.click(timeout=15000)
+                        await btn.click(timeout=25_000)
                         logger.info("Кнопка 'Оплатить'/'Pay' нажата внутри iframe (%s), текст: %s", frame_sel, btn_text)
                         return True
                 except Exception:
@@ -1829,7 +1829,7 @@ async def _click_pay_button_inside_iframes(popup_page) -> bool:
                     if await loc.count() > 0:
                         await loc.scroll_into_view_if_needed()
                         await _delay(popup_page, 400, 800)
-                        await loc.click(timeout=15000)
+                        await loc.click(timeout=25_000)
                         logger.info("Кнопка нажата внутри iframe (%s): %s", frame_sel, sel)
                         return True
                 except Exception:
@@ -1849,7 +1849,7 @@ async def _click_pay_button_inside_iframes(popup_page) -> bool:
                     if await loc.count() > 0:
                         await loc.scroll_into_view_if_needed()
                         await _delay(popup_page, 400, 800)
-                        await loc.click(timeout=15000)
+                        await loc.click(timeout=25_000)
                         logger.info("Кнопка 'Оплатить'/'Pay' нажата во фрейме (locator %s)", sel)
                         return True
             except Exception:
@@ -1866,7 +1866,7 @@ async def _click_pay_button_inside_iframes(popup_page) -> bool:
                 if await btn.count() > 0:
                     await btn.scroll_into_view_if_needed()
                     await _delay(popup_page, 400, 800)
-                    await btn.click(timeout=15000)
+                    await btn.click(timeout=25_000)
                     logger.info("Кнопка 'Оплатить'/'Pay' нажата в iframe.nth(%s)", i)
                     return True
             except Exception:
@@ -1876,7 +1876,7 @@ async def _click_pay_button_inside_iframes(popup_page) -> bool:
                 if await btn.count() > 0:
                     await btn.scroll_into_view_if_needed()
                     await _delay(popup_page, 400, 800)
-                    await btn.click(timeout=15000)
+                    await btn.click(timeout=25_000)
                     logger.info("Кнопка Pay (exact) нажата в iframe.nth(%s)", i)
                     return True
             except Exception:
@@ -1947,8 +1947,8 @@ async def _click_pay_button_by_mouse_at_coords(popup_page) -> bool:
 
 async def _click_pay_button_once(popup_page, confirm_selectors, re_module) -> bool:
     """Одна попытка нажать кнопку Оплатить/Pay. Возвращает True если клик выполнен."""
-    # Небольшая пауза перед поиском (основное ожидание — в _confirm_payment_in_popup)
-    await popup_page.wait_for_timeout(2000)
+    # Пауза перед поиском (основное ожидание — в _confirm_payment_in_popup)
+    await popup_page.wait_for_timeout(4000)
 
     # 0) Кнопка на pay.google.com часто внутри iframe (Playwright issue #19776)
     if await _click_pay_button_inside_iframes(popup_page):
@@ -2084,7 +2084,7 @@ async def _confirm_payment_in_popup(popup_page) -> bool:
     logger.info("Подтверждение оплаты в Google Pay popup...")
 
     try:
-        await popup_page.wait_for_load_state("domcontentloaded", timeout=30000)
+        await popup_page.wait_for_load_state("domcontentloaded", timeout=45_000)
     except Exception:
         pass
 
@@ -2131,8 +2131,8 @@ async def _confirm_payment_in_popup(popup_page) -> bool:
         if attempt > 1:
             logger.info("Перезагрузка страницы Google Pay перед повторной попыткой нажатия 'Оплатить' (%s/3)...", attempt)
             try:
-                await popup_page.reload(wait_until="domcontentloaded", timeout=60000)
-                await popup_page.wait_for_timeout(5000)
+                await popup_page.reload(wait_until="domcontentloaded", timeout=60_000)
+                await popup_page.wait_for_timeout(8000)
             except Exception as e:
                 logger.warning("Ошибка перезагрузки popup: %s", e)
             await _screenshot(popup_page, f"google_pay_confirm_retry_{attempt}")
@@ -2145,7 +2145,7 @@ async def _confirm_payment_in_popup(popup_page) -> bool:
                 return False
             continue
 
-        await popup_page.wait_for_timeout(6000)
+        await popup_page.wait_for_timeout(10_000)
         if await _payment_page_has_error_async(popup_page):
             logger.warning(
                 "После нажатия 'Оплатить' обнаружена ошибка (например REQUEST_TIMEOUT), попытка %s/%s",
