@@ -500,6 +500,7 @@ async def _try_click_in_frame(frame, selectors: list, label: str) -> bool:
     """
     Пробует кликнуть по первому найденному селектору в frame.
     Пропускает элементы-контейнеры (body, html, крупные div на всю страницу).
+    На сервере (headless) часто нужны force=True и больший таймаут — overlay/viewport.
     """
     for sel in selectors:
         try:
@@ -507,29 +508,38 @@ async def _try_click_in_frame(frame, selectors: list, label: str) -> bool:
             count = await locs.count()
             if count == 0:
                 continue
-            # Если несколько — перебираем, берём первый видимый и не-контейнер
             for i in range(min(count, 5)):
                 loc = locs.nth(i)
                 try:
                     visible = await loc.is_visible()
                     if not visible:
                         continue
-                    # Проверяем что это не огромный контейнер (body/wrapper)
                     tag = await loc.evaluate("el => el.tagName.toLowerCase()")
                     if tag in ("body", "html"):
                         continue
                     box = await loc.bounding_box()
                     if box and box["width"] > 800 and box["height"] > 400:
-                        # Слишком большой элемент — это контейнер, пропускаем
                         logger.debug(f"Пропуск контейнера {tag} ({box['width']}x{box['height']}): {sel}")
                         continue
                     await loc.scroll_into_view_if_needed()
-                    await loc.click(timeout=5000)
+                    await frame.wait_for_timeout(300)
+                    # Сначала обычный клик; на сервере/headless часто перехватывает overlay — пробуем force
+                    try:
+                        await loc.click(timeout=15_000)
+                    except Exception as click_err:
+                        logger.debug("[GPAY] Обычный клик не удался (%s), пробуем force=True: %s", sel[:50], click_err)
+                        try:
+                            await loc.click(timeout=10_000, force=True)
+                        except Exception as force_err:
+                            logger.debug("[GPAY] force=True не удался: %s", force_err)
+                            continue
                     logger.info(f"{label}: {sel}")
                     return True
-                except Exception:
+                except Exception as e:
+                    logger.debug("[GPAY] _try_click_in_frame элемент %s: %s", sel[:40], e)
                     continue
-        except Exception:
+        except Exception as e:
+            logger.debug("[GPAY] _try_click_in_frame селектор %s: %s", sel[:40], e)
             continue
     return False
 
@@ -965,6 +975,11 @@ async def select_gpay_tab_and_pay(page, timeout_ms: int = 90000) -> bool:
     logger.info("═══════════════════════════════════════════")
     logger.info("═══ select_gpay_tab_and_pay START ═══")
     logger.info(f"═══ URL: {page.url}")
+    try:
+        headless = getattr(settings, "BROWSER_HEADLESS", True)
+        logger.info("[GPAY] BROWSER_HEADLESS=%s (на сервере true — клики через force при необходимости)", headless)
+    except Exception:
+        pass
     logger.info("═══════════════════════════════════════════")
 
     try:
@@ -1054,6 +1069,23 @@ async def select_gpay_tab_and_pay(page, timeout_ms: int = 90000) -> bool:
 
     await _screenshot(page, "fastspring_loaded")
     logger.info(f"[ШАГ 3] FastSpring форма готова. Frames для обработки: {len(loaded_frames)}")
+
+    # Диагностика для сервера/headless: viewport и прокрутка iframe в зону видимости
+    try:
+        viewport = await page.evaluate("() => ({ w: window.innerWidth, h: window.innerHeight })")
+        logger.info("[GPAY] Viewport (inner): %sx%s", viewport.get("w"), viewport.get("h"))
+    except Exception:
+        pass
+    try:
+        for idx in range(8):
+            ifr = page.locator("iframe").nth(idx)
+            if await ifr.count() == 0:
+                break
+            await ifr.scroll_into_view_if_needed()
+            await page.wait_for_timeout(200)
+        logger.info("[GPAY] Iframe(s) прокручены в зону видимости (для headless/сервера)")
+    except Exception as scroll_e:
+        logger.debug("[GPAY] Прокрутка iframe: %s", scroll_e)
 
     # ── Клик по вкладке Google Pay ─────────────────────────────────────────────
     tab_click_max_attempts = 4
