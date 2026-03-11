@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Tuple
 from loguru import logger
 
 from app.config import settings
+from app.core.automation_log import log_automation
 from app.core.proxy_manager import proxy_manager
 
 # Типы и драйвер: Patchright совместим с API Playwright
@@ -573,6 +574,7 @@ class BrowserAutomation:
                     await self._enable_browsec_vpn_region()
 
                 logger.info("Браузер успешно запущен с улучшенным stealth режимом")
+                log_automation("Браузер запущен (stealth)")
                 
                 # Начальная диагностика
                 await self._log_diagnostics("after_browser_start")
@@ -1139,6 +1141,7 @@ class BrowserAutomation:
             logger.warning(f"Карточка магазина не найдена, переход по URL: {url}")
             try:
                 # Используем "commit" (первый байт ответа) — быстрее, затем ждём domcontentloaded
+                log_automation("Навигация: %s", url[:80])
                 await self.page.goto(url, wait_until="commit", timeout=60000)
                 await self.page.wait_for_load_state("domcontentloaded", timeout=30000)
             except Exception as e:
@@ -1326,6 +1329,7 @@ class BrowserAutomation:
 
         url = "https://store.supercell.com"
         logger.info(f"Переход на {url}")
+        log_automation("Навигация: %s", url)
 
         try:
             response = await self.page.goto(

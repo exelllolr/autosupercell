@@ -169,7 +169,12 @@ class Settings(BaseSettings):
     # Logging
     LOG_LEVEL: str = "INFO"
     LOG_FILE: str = "logs/autosupercell.log"
-    
+    # Отдельный файл только для действий автоматизации (клики, навигация, шаги оплаты)
+    LOG_AUTOMATION_FILE: str = "logs/automation.log"
+
+    # Задержка перед/при клике мышью (мс), чтобы курсор был виден на записи экрана
+    BROWSER_CLICK_DELAY_MS: int = 150
+
     # Browser Diagnostics (network and console logging)
     BROWSER_NETWORK_LOG: bool = True
     BROWSER_CONSOLE_LOG: bool = True

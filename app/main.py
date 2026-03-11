@@ -20,6 +20,19 @@ logger.add(
     format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
 )
 
+# Отдельный файл только для действий автоматизации (клики, навигация, шаги оплаты)
+def _automation_filter(record):
+    return record["extra"].get("automation") is True
+
+logger.add(
+    settings.LOG_AUTOMATION_FILE,
+    rotation="5 MB",
+    retention="7 days",
+    level="INFO",
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
+    filter=_automation_filter,
+)
+
 # ─── Эндпоинты, которые не требуют API-ключа ────────────────────────────────
 _PUBLIC_PATHS = {
     "/",

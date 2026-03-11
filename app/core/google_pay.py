@@ -30,6 +30,7 @@ from datetime import datetime
 from loguru import logger
 
 from app.config import settings
+from app.core.automation_log import log_automation
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -364,6 +365,19 @@ def _ensure_dir(path: str) -> None:
 
 async def _delay(page, min_ms: int = 300, max_ms: int = 800):
     await page.wait_for_timeout(random.randint(min_ms, max_ms))
+
+
+def _click_delay_ms() -> int:
+    """Задержка при клике мышью (мс), чтобы курсор был виден на записи экрана."""
+    return getattr(settings, "BROWSER_CLICK_DELAY_MS", 150)
+
+
+async def _mouse_click_with_delay(page, x: float, y: float, delay_ms: int | None = None) -> None:
+    """Клик мышью с паузой до/после, чтобы на видео было видно куда кликает."""
+    d = delay_ms if delay_ms is not None else _click_delay_ms()
+    await page.wait_for_timeout(max(80, d // 2))
+    await page.mouse.click(x, y, delay=d)
+    await page.wait_for_timeout(max(50, d // 3))
 
 
 async def _screenshot(page, name: str, folder: str = "screenshots") -> str:
@@ -1966,8 +1980,9 @@ async def _click_pay_button_by_mouse_at_coords(popup_page) -> bool:
         cx = rect["left"] + rect["width"] / 2
         cy = rect["top"] + rect["height"] / 2
         await popup_page.wait_for_timeout(300)
-        await popup_page.mouse.click(cx, cy)
+        await _mouse_click_with_delay(popup_page, cx, cy)
         logger.info("Кнопка 'Оплатить'/'Pay' нажата: мышь по координатам (%.0f, %.0f)", cx, cy)
+        log_automation("Клик: Оплатить/Pay по координатам (%.0f, %.0f)", cx, cy)
         return True
     except Exception as e:
         logger.debug("Клик мышью по координатам кнопки: %s", e)
@@ -1988,8 +2003,9 @@ async def _click_pay_button_once(popup_page, confirm_selectors, re_module) -> bo
     if coords:
         x, y = coords
         try:
-            await popup_page.mouse.click(x, y)
+            await _mouse_click_with_delay(popup_page, x, y)
             logger.info("Кнопка 'Оплатить'/'Pay' нажата: Claude AI координаты (%s, %s)", x, y)
+            log_automation("Клик: Оплатить/Pay (Claude AI координаты)")
             return True
         except Exception as e:
             logger.debug("Клик по координатам Claude AI не удался: %s", e)
@@ -2010,8 +2026,9 @@ async def _click_pay_button_once(popup_page, confirm_selectors, re_module) -> bo
                     if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
                         cx = box["x"] + box["width"] / 2
                         cy = box["y"] + box["height"] / 2
-                        await popup_page.mouse.click(cx, cy)
+                        await _mouse_click_with_delay(popup_page, cx, cy)
                         logger.info(f"Кнопка 'Оплатить'/'Pay' нажата: мышь по bounding_box ({sel})")
+                        log_automation("Клик: кнопка по bounding_box (%s)", sel[:60])
                         return True
                     try:
                         await loc.click(timeout=15000)
@@ -2034,8 +2051,9 @@ async def _click_pay_button_once(popup_page, confirm_selectors, re_module) -> bo
                 if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
                     cx = box["x"] + box["width"] / 2
                     cy = box["y"] + box["height"] / 2
-                    await popup_page.mouse.click(cx, cy)
+                    await _mouse_click_with_delay(popup_page, cx, cy)
                     logger.info("Кнопка 'Оплатить'/'Pay' нажата: мышь по bounding_box (get_by_role)")
+                    log_automation("Клик: Оплатить/Pay (get_by_role)")
                     return True
                 try:
                     await btn.click(timeout=15000)
@@ -2111,6 +2129,7 @@ async def _confirm_payment_in_popup(popup_page) -> bool:
     """
     import re as re_module
     logger.info("Подтверждение оплаты в Google Pay popup...")
+    logger.info("[GPAY_FLOW] Попытка нажать Оплатить/Pay, URL popup: %s", (popup_page.url or "")[:90])
 
     try:
         await popup_page.wait_for_load_state("domcontentloaded", timeout=45_000)
@@ -2121,11 +2140,20 @@ async def _confirm_payment_in_popup(popup_page) -> bool:
     logger.info("Ожидание загрузки страницы с кнопкой Оплатить (%s сек)...", _PAY_PAGE_LOAD_WAIT_MS // 1000)
     await popup_page.wait_for_timeout(_PAY_PAGE_LOAD_WAIT_MS)
 
+    log_automation("Подтверждение оплаты в popup, URL: %s", (popup_page.url or "")[:80])
     logger.info(f"URL перед подтверждением: {popup_page.url[:80]}")
     await _screenshot(popup_page, "google_pay_confirm_popup")
 
+    # На pay.fastspring.com сначала пробуем именно "Pay with G Pay" / "Pay with Google Pay"
+    current_url = (popup_page.url or "").lower()
+    gpay_first = [
+        'button:has-text("Pay with G Pay")',
+        'button:has-text("Pay with Google Pay")',
+        '[role="button"]:has-text("Pay with G Pay")',
+        '[role="button"]:has-text("Pay with Google Pay")',
+    ]
     # Кнопка "Оплатить" на pay.google.com — Material Design: jsname="LgbsSe", span с текстом "Оплатить"
-    confirm_selectors = [
+    confirm_selectors_base = [
         'button[jsname="LgbsSe"]',
         'button.VfPpkd-LgbsSe',
         'button:has(span:has-text("Оплатить"))',
@@ -2154,6 +2182,11 @@ async def _confirm_payment_in_popup(popup_page) -> bool:
         'div[role="button"]:has-text("Pay")',
         'span[role="button"]:has-text("Pay")',
     ]
+    if "fastspring.com" in current_url:
+        confirm_selectors = gpay_first + [s for s in confirm_selectors_base if s not in gpay_first]
+        log_automation("FastSpring popup: сначала ищем кнопку Pay with G Pay")
+    else:
+        confirm_selectors = confirm_selectors_base
 
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
@@ -2166,13 +2199,25 @@ async def _confirm_payment_in_popup(popup_page) -> bool:
                 logger.warning("Ошибка перезагрузки popup: %s", e)
             await _screenshot(popup_page, f"google_pay_confirm_retry_{attempt}")
 
+        url_before_click = (popup_page.url or "").strip()
         clicked = await _click_pay_button_once(popup_page, confirm_selectors, re_module)
         if not clicked:
+            log_automation("Кнопка Оплатить/Pay не найдена (попытка %s)", attempt)
             if attempt == max_attempts:
                 await _screenshot(popup_page, "google_pay_confirm_failed")
                 logger.warning("Кнопка подтверждения оплаты ('Оплатить'/'Pay') не найдена после %s попыток", max_attempts)
                 return False
             continue
+
+        log_automation("Кнопка Оплатить/Pay нажата (попытка %s), проверка смены экрана...", attempt)
+        await popup_page.wait_for_timeout(2000)
+        url_after_click = (popup_page.url or "").strip()
+        if url_before_click and url_after_click and "fastspring.com" in url_before_click.lower():
+            if "accounts.google.com" in url_after_click.lower() or ("pay.google.com" in url_after_click.lower() and "fastspring" not in url_after_click.lower()):
+                log_automation("Экран сменился после клика: %s", url_after_click[:70])
+            elif url_before_click == url_after_click or "fastspring.com" in url_after_click.lower():
+                logger.warning("[GPAY_FLOW] Клик по Pay/Оплатить не привёл к смене экрана (остались на %s)", url_after_click[:80])
+                log_automation("ВНИМАНИЕ: клик не привёл к смене экрана, URL без изменений")
 
         await popup_page.wait_for_timeout(10_000)
         if await _payment_page_has_error_async(popup_page):
@@ -2491,7 +2536,8 @@ async def handle_google_pay(
         return result
 
     try:
-        logger.info(f"Google Pay flow начат. URL: {page.url}")
+        logger.info("[GPAY_FLOW] START — Google Pay flow начат. URL: %s", page.url)
+        log_automation("GPAY START — URL: %s", (page.url or "")[:80])
         await _screenshot(page, "gpay_start")
 
         # ── Шаг 1: Кликнуть вкладку G Pay и кнопку "Place Your Order" ─────────
@@ -2502,7 +2548,8 @@ async def handle_google_pay(
                 clicked = await select_gpay_tab_and_pay(page, timeout_ms=180000)
             if clicked:
                 popup_page = await popup_info.value
-                logger.info(f"Открылся popup Google Pay: {popup_page.url}")
+                logger.info("[GPAY_FLOW] POPUP ОТКРЫТ: %s", (popup_page.url or "")[:100])
+                log_automation("GPAY POPUP ОТКРЫТ: %s", (popup_page.url or "")[:80])
         except Exception as e:
             logger.info(f"Popup не открылся или таймаут ({type(e).__name__})")
             # clicked сохраняет значение из select_gpay_tab_and_pay
@@ -2544,7 +2591,8 @@ async def handle_google_pay(
                             timeout=60_000,
                         )
                         signin_page = popup_page
-                        logger.info("Открылась страница входа Google в том же popup (wait_for_url)")
+                        logger.info("[GPAY_FLOW] ДОШЛИ ДО SIGN-IN: страница входа Google открылась (wait_for_url), URL=%s", (popup_page.url or "")[:80])
+                        log_automation("GPAY ДОШЛИ ДО SIGN-IN (popup), URL: %s", (popup_page.url or "")[:60])
                     except Exception:
                         pass
                     # Дополнительно: опрос popup и всех окон (до 90 сек), если sign-in ещё не найден (новое окно или задержка)
@@ -2568,7 +2616,8 @@ async def handle_google_pay(
                                         u = (p.url or "").lower()
                                         if "accounts.google.com" in u or ("signin" in u and "google" in u):
                                             signin_page = p
-                                            logger.info("Найдена страница входа Google в новом окне: %s", p.url[:80])
+                                            logger.info("[GPAY_FLOW] ДОШЛИ ДО SIGN-IN: страница входа в новом окне, URL=%s", (p.url or "")[:80])
+                                            log_automation("GPAY ДОШЛИ ДО SIGN-IN (новое окно)")
                                             break
                                     except Exception:
                                         continue
@@ -2592,6 +2641,8 @@ async def handle_google_pay(
                 try:
                     target_url = (login_page.url or "").lower()
                     if "accounts.google.com" in target_url or "signin" in target_url:
+                        logger.info("[GPAY_FLOW] ВЫПОЛНЯЕМ ЛОГИН: страница sign-in обнаружена, вводим email/пароль")
+                        log_automation("GPAY ВЫПОЛНЯЕМ ЛОГИН (email/пароль)")
                         backup_codes = getattr(settings, "GOOGLE_BACKUP_CODES", "") or ""
                         try:
                             logged_in, login_msg = await _login_google_in_popup(
@@ -2617,19 +2668,31 @@ async def handle_google_pay(
             target_page = signin_page if signin_page else target_page
 
             # Шаг 3: Подтверждение оплаты (второй экран после логина или если логин не требовался)
+            logger.info("[GPAY_FLOW] ШАГ ОПЛАТЫ: ищем и нажимаем кнопку Оплатить/Pay в popup...")
+            log_automation("GPAY ШАГ ОПЛАТЫ: нажимаем Оплатить/Pay в popup")
             try:
                 confirmed = await _confirm_payment_in_popup(target_page)
                 result["payment_confirmed"] = confirmed
+                logger.info("[GPAY_FLOW] ПОДТВЕРЖДЕНИЕ ОПЛАТЫ: %s", "успех" if confirmed else "кнопка не нажата")
+                log_automation("GPAY ПОДТВЕРЖДЕНИЕ ОПЛАТЫ: %s", "успех" if confirmed else "кнопка не нажата")
             except Exception as e:
                 logger.debug(f"Подтверждение оплаты в popup: {e}")
                 result["payment_confirmed"] = False
+                logger.warning("[GPAY_FLOW] ПОДТВЕРЖДЕНИЕ ОПЛАТЫ: исключение — %s", e)
+                log_automation("GPAY ПОДТВЕРЖДЕНИЕ ОПЛАТЫ: исключение — %s", str(e)[:80])
 
         else:
+            logger.info("[GPAY_FLOW] ШАГ ОПЛАТЫ (без popup): ищем кнопку Оплатить/Pay...")
+            log_automation("GPAY ШАГ ОПЛАТЫ (без popup)")
             confirmed = await _confirm_payment_in_popup(target_page)
             result["payment_confirmed"] = confirmed
+            logger.info("[GPAY_FLOW] ПОДТВЕРЖДЕНИЕ ОПЛАТЫ: %s", "успех" if confirmed else "кнопка не нажата")
+            log_automation("GPAY ПОДТВЕРЖДЕНИЕ ОПЛАТЫ: %s", "успех" if confirmed else "кнопка не нажата")
 
         if not result["payment_confirmed"]:
             result["error"] = "Не удалось подтвердить оплату в Google Pay popup"
+            logger.warning("[GPAY_FLOW] ОПЛАТА НЕ ПОДТВЕРЖДЕНА: кнопка Оплатить не найдена или не сработала")
+            log_automation("GPAY ОПЛАТА НЕ ПОДТВЕРЖДЕНА")
             return result
 
         # Ждём закрытия popup
