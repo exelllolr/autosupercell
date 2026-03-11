@@ -273,7 +273,10 @@ async def _claude_find_oplatit_button_coordinates(popup_page) -> tuple[int, int]
     anthropic_key = getattr(settings, "ANTHROPIC_API_KEY", "") or os.environ.get("ANTHROPIC_API_KEY", "")
     model = getattr(settings, "CLAUDE_MODEL", "claude-3-5-sonnet-20241022") or "claude-3-5-sonnet-20241022"
     if not anthropic_key:
-        logger.debug("ANTHROPIC_API_KEY не задан, пропускаем Claude AI поиск кнопки Оплатить")
+        logger.warning(
+            "ANTHROPIC_API_KEY не задан — Claude AI fallback для поиска кнопки «Оплатить» недоступен. "
+            "Задайте ключ в .env для автоматического поиска кнопки по скриншоту."
+        )
         return None
 
     try:
@@ -1787,8 +1790,11 @@ _PAY_BUTTON_IFRAME_SELECTORS = [
 # Тексты кнопки подтверждения оплаты в iframe (порядок по issue #19776: Continue часто на en)
 _PAY_BUTTON_TEXTS = ["Continue", "Pay", "Оплатить", "Подтвердить"]
 
-# Ожидание загрузки страницы с кнопкой «Оплатить» (pay.google.com и iframe рендерятся с задержкой)
-_PAY_PAGE_LOAD_WAIT_MS = 20_000  # 20 сек
+# Ожидание загрузки страницы с кнопкой «Оплатить» (pay.google.com и iframe рендерятся с задержкой).
+# Берётся из settings.GOOGLE_PAY_POPUP_LOAD_WAIT_SEC, fallback 25 сек.
+def _get_pay_page_load_wait_ms() -> int:
+    sec = getattr(settings, "GOOGLE_PAY_POPUP_LOAD_WAIT_SEC", 25) or 25
+    return max(15, min(60, int(sec))) * 1000
 
 # Вариант 2 (BT-Portman): селектор iframe по имени (оканчивается на "Iframe", не paymentsModalIframe)
 _PAY_IFRAME_V2_SELECTOR = 'iframe[name$="Iframe"]:not([name="paymentsModalIframe"])'
@@ -1820,7 +1826,7 @@ async def _click_pay_button_inside_iframes(popup_page) -> bool:
     except Exception:
         pass
     # Даём время загрузиться iframe с кнопкой «Оплатить» (половина основного таймаута)
-    await popup_page.wait_for_timeout(_PAY_PAGE_LOAD_WAIT_MS // 2)
+    await popup_page.wait_for_timeout(_get_pay_page_load_wait_ms() // 2)
 
     # ─── Вариант 2 (BT-Portman): цикл ожидания — iframe по имени + кнопка "Pay" exact ───
     # Iframe может появиться с задержкой; перебираем каждую секунду в течение _PAY_IFRAME_V2_POLL_MS
@@ -1839,7 +1845,7 @@ async def _click_pay_button_inside_iframes(popup_page) -> bool:
         except Exception:
             pass
         await popup_page.wait_for_timeout(_PAY_IFRAME_V2_INTERVAL_MS)
-    logger.debug("Вариант 2: iframe с кнопкой Pay не найден за отведённое время")
+    logger.info("Вариант 2: iframe [name$=Iframe] с кнопкой Pay не найден за %s сек", _PAY_IFRAME_V2_POLL_MS // 1000)
 
     for frame_sel in _PAY_BUTTON_IFRAME_SELECTORS:
         try:
@@ -1878,7 +1884,7 @@ async def _click_pay_button_inside_iframes(popup_page) -> bool:
                 except Exception:
                     continue
         except Exception as e:
-            logger.debug("Поиск кнопки в iframe %s: %s", frame_sel, e)
+            logger.info("Поиск кнопки в iframe %s: не найден (%s)", frame_sel, e)
             continue
 
     # Перебор всех фреймов страницы (frame.frames)
@@ -1898,7 +1904,7 @@ async def _click_pay_button_inside_iframes(popup_page) -> bool:
             except Exception:
                 continue
     except Exception as e:
-        logger.debug("Перебор frames: %s", e)
+        logger.info("Перебор frames popup_page.frames: %s", e)
 
     # Перебор iframe по индексу (если селектор "iframe" совпадает с несколькими)
     try:
@@ -1925,7 +1931,8 @@ async def _click_pay_button_inside_iframes(popup_page) -> bool:
             except Exception:
                 continue
     except Exception as e:
-        logger.debug("Перебор iframe по индексу: %s", e)
+        logger.info("Перебор iframe по индексу: %s", e)
+    logger.warning("Кнопка «Оплатить»/Pay не найдена ни в одном iframe на pay.google.com")
     return False
 
 
@@ -2012,6 +2019,7 @@ async def _click_pay_button_once(popup_page, confirm_selectors, re_module) -> bo
 
     # 1) Клик мышью по координатам (JS ищет кнопку в document + shadow DOM)
     if await _click_pay_button_by_mouse_at_coords(popup_page):
+        logger.info("Кнопка «Оплатить» нажата: метод JS + mouse.click")
         return True
 
     # 2) Клик по локаторам Playwright + при необходимости bounding_box → mouse.click
@@ -2105,8 +2113,13 @@ async def _click_pay_button_once(popup_page, confirm_selectors, re_module) -> bo
     # 4) Повторный клик мышью по координатам (после того как JS мог отрисовать страницу)
     await popup_page.wait_for_timeout(1500)
     if await _click_pay_button_by_mouse_at_coords(popup_page):
+        logger.info("Кнопка «Оплатить» нажата: метод JS + mouse.click (повтор)")
         return True
 
+    logger.warning(
+        "Кнопка «Оплатить»/Pay не найдена: все методы провалились "
+        "(iframe, Claude AI, JS+shadow DOM, Playwright locators, get_by_role)"
+    )
     return False
 
 
@@ -2137,12 +2150,28 @@ async def _confirm_payment_in_popup(popup_page) -> bool:
         pass
 
     # Таймаут: даём странице с кнопкой «Оплатить» полностью загрузиться (pay.google.com + iframe)
-    logger.info("Ожидание загрузки страницы с кнопкой Оплатить (%s сек)...", _PAY_PAGE_LOAD_WAIT_MS // 1000)
-    await popup_page.wait_for_timeout(_PAY_PAGE_LOAD_WAIT_MS)
+    pay_wait_ms = _get_pay_page_load_wait_ms()
+    logger.info("Ожидание загрузки страницы с кнопкой Оплатить (%s сек)...", pay_wait_ms // 1000)
+    await popup_page.wait_for_timeout(pay_wait_ms)
 
     log_automation("Подтверждение оплаты в popup, URL: %s", (popup_page.url or "")[:80])
     logger.info(f"URL перед подтверждением: {popup_page.url[:80]}")
     await _screenshot(popup_page, "google_pay_confirm_popup")
+
+    # B1: Диагностика — URL, frames, блокировка Google
+    try:
+        frames_count = len(popup_page.frames)
+        logger.info("Google Pay popup: URL=%s, frames=%s", popup_page.url[:100], frames_count)
+        body_text = await popup_page.evaluate("() => document.body.innerText")
+        if _is_google_block_page(body_text):
+            logger.warning(
+                "Google Pay popup: обнаружена блокировка «This browser or app may not be secure». "
+                "Используйте headed режим (BROWSER_HEADLESS=false) и Xvfb на сервере."
+            )
+            await _screenshot(popup_page, "google_pay_block_page")
+            return False
+    except Exception as diag_e:
+        logger.debug("Диагностика popup: %s", diag_e)
 
     # На pay.fastspring.com сначала пробуем именно "Pay with G Pay" / "Pay with Google Pay"
     current_url = (popup_page.url or "").lower()

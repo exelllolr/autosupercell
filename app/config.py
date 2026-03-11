@@ -137,6 +137,9 @@ class Settings(BaseSettings):
     # Payment — Google Pay
     GOOGLE_PAY_ENABLED: bool = True
     PAYMENT_TIMEOUT: int = 300  # секунд на вход в Google и подтверждение оплаты
+    # Ожидание загрузки popup pay.google.com с кнопкой «Оплатить» (секунды).
+    # На сервере с медленной сетью/прокси увеличьте до 30–40.
+    GOOGLE_PAY_POPUP_LOAD_WAIT_SEC: int = 25
     # Google аккаунт для оплаты (App Password: myaccount.google.com/apppasswords)
     GOOGLE_EMAIL: str = ""
     GOOGLE_APP_PASSWORD: str = ""
