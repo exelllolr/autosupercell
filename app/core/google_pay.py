@@ -1219,24 +1219,56 @@ def _parse_first_backup_code(backup_codes_str: str) -> str | None:
     return None
 
 
+async def _find_login_target(popup_page, timeout_ms: int = 12000):
+    """
+    Находит, где форма Google Sign-in: в основном документе или в iframe (overlay).
+    Возвращает (target, label): target — page или frame с формой, label для логов.
+    """
+    email_selectors = ['input[type="email"]', 'input[name="identifier"]', '#identifierId']
+    # 1) Основной документ
+    for sel in email_selectors:
+        try:
+            el = await popup_page.wait_for_selector(sel, timeout=min(8000, timeout_ms))
+            if el and await el.is_visible():
+                logger.info("[GPAY] Sign-in форма в основном документе (overlay DOM): %s", sel)
+                return (popup_page, "main")
+        except Exception:
+            continue
+    # 2) Все iframe — overlay часто рендерится в iframe (accounts.google.com)
+    try:
+        for frame in popup_page.frames:
+            if frame == popup_page.main_frame:
+                continue
+            frame_url = (frame.url or "").lower()
+            for sel in email_selectors:
+                try:
+                    loc = frame.locator(sel).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        logger.info("[GPAY] Sign-in форма в iframe: %s (селектор %s)", frame_url[:80], sel)
+                        return (frame, "iframe")
+                except Exception:
+                    continue
+    except Exception as e:
+        logger.debug("[GPAY] Поиск формы в frames: %s", e)
+    return (None, None)
+
+
 async def _login_google_in_popup(
     popup_page, email: str, app_password: str, backup_codes: str = ""
 ) -> tuple[bool, str | None]:
     """
     Входит в Google в popup-окне Google Pay.
+    Поддерживает sign-in в overlay того же окна (DOM или iframe).
     Использует App Password (обходит 2FA). При запросе 8-значного кода — вводит первый из GOOGLE_BACKUP_CODES.
-    Ввод email/пароля/кода — посимвольно с задержкой, чтобы снизить детект автоматизации.
     """
     logger.info("Вход в Google в popup окне...")
 
-    # FIX[server]: активируем окно sign-in перед вводом данных
     try:
         await popup_page.bring_to_front()
         await popup_page.wait_for_timeout(300)
     except Exception:
         pass
 
-    # Увеличенные таймауты на каждом этапе авторизации Google — ждём до последнего
     try:
         await popup_page.wait_for_load_state("domcontentloaded", timeout=60000)
     except Exception:
@@ -1245,58 +1277,60 @@ async def _login_google_in_popup(
     current_url = popup_page.url
     logger.info(f"URL popup Google: {current_url}")
 
-    if "accounts.google.com" not in current_url and "signin" not in current_url:
-        logger.info("Google логин не требуется (уже залогинен или другая страница)")
-        return True, None
+    # Sign-in может быть в overlay — URL страницы при этом не меняется (остаётся fastspring/pay)
+    # Проверяем наличие формы в DOM или iframe
+    login_target, target_label = await _find_login_target(popup_page, timeout_ms=15000)
+    if login_target is None:
+        if "accounts.google.com" not in (current_url or "") and "signin" not in (current_url or "").lower():
+            logger.info("Google логин не требуется (уже залогинен или другая страница)")
+            return True, None
+        logger.warning("Поле email не найдено ни в документе, ни в iframe (overlay Sign-in)")
+        return False, "Форма входа Google не найдена (overlay/iframe)"
 
     await _screenshot(popup_page, "google_login_popup")
 
-    # Проверка: уже показана блокировка «This browser may not be secure»
     try:
         body_text = await popup_page.evaluate("() => document.body.innerText")
         if _is_google_block_page(body_text):
             msg = (
                 "Google: «This browser or app may not be secure». "
-                "Войдите в Google вручную в том же профиле браузера до запуска скрипта (store.supercell.com → тот же Chrome), "
-                "или в popup нажмите «Try again» и войдите вручную."
+                "Войдите в Google вручную в том же профиле браузера до запуска скрипта."
             )
             logger.warning(msg)
             return False, msg
     except Exception:
         pass
 
-    # Задержка между нажатиями клавиш (мс) — имитация человека, меньше детект
     type_delay_min, type_delay_max = 80, 180
-
-    # ── Email ─────────────────────────────────────────────────────────────────
     email_selectors = ['input[type="email"]', 'input[name="identifier"]', '#identifierId']
+
+    # ── Email (в main или в найденном frame) ───────────────────────────────────
     email_entered = False
     for sel in email_selectors:
         try:
-            el = await popup_page.wait_for_selector(sel, timeout=45000)
-            if el:
-                await el.click()
+            loc = login_target.locator(sel).first
+            if await loc.count() > 0:
+                await loc.click()
                 await _delay(popup_page, 400, 800)
-                # Посимвольный ввод с задержкой вместо fill() — меньше шанс блокировки
                 await popup_page.keyboard.type(
                     email,
                     delay=random.randint(type_delay_min, type_delay_max),
                 )
                 await _delay(popup_page, 500, 1000)
                 email_entered = True
-                logger.info(f"Email введён ({sel})")
+                logger.info(f"Email введён ({target_label}, {sel})")
                 break
         except Exception:
             continue
 
     if not email_entered:
-        logger.warning("Поле email не найдено в popup Google")
+        logger.warning("Поле email не найдено в контексте %s", target_label)
         return False, None
 
     await _delay(popup_page, 600, 1200)
     for sel in ['#identifierNext', 'button:has-text("Next")', 'button[type="submit"]']:
         try:
-            loc = popup_page.locator(sel).first
+            loc = login_target.locator(sel).first
             if await loc.count() > 0:
                 await loc.click(timeout=15000)
                 logger.info("Next после email нажат")
@@ -1319,15 +1353,15 @@ async def _login_google_in_popup(
     except Exception:
         pass
 
-    # ── Пароль (App Password) ─────────────────────────────────────────────────
+    # ── Пароль (App Password) — в том же контексте (main/iframe) ───────────────
     pw_selectors = ['input[type="password"]', 'input[name="password"]', '#password input']
     pw_entered = False
     password_clean = app_password.replace(" ", "")
     for sel in pw_selectors:
         try:
-            el = await popup_page.wait_for_selector(sel, timeout=45000)
-            if el:
-                await el.click()
+            loc = login_target.locator(sel).first
+            if await loc.count() > 0:
+                await loc.click()
                 await _delay(popup_page, 400, 800)
                 await popup_page.keyboard.type(
                     password_clean,
@@ -1335,19 +1369,19 @@ async def _login_google_in_popup(
                 )
                 await _delay(popup_page, 500, 1000)
                 pw_entered = True
-                logger.info("App Password введён")
+                logger.info("App Password введён (%s)", target_label)
                 break
         except Exception:
             continue
 
     if not pw_entered:
-        logger.warning("Поле пароля не найдено в popup Google")
+        logger.warning("Поле пароля не найдено в контексте %s", target_label)
         return False, None
 
     await _delay(popup_page, 600, 1200)
     for sel in ['#passwordNext', 'button:has-text("Next")', 'button[type="submit"]']:
         try:
-            loc = popup_page.locator(sel).first
+            loc = login_target.locator(sel).first
             if await loc.count() > 0:
                 await loc.click(timeout=15000)
                 logger.info("Next после пароля нажат")
@@ -2929,7 +2963,24 @@ async def handle_google_pay(
                 log_automation("GPAY ПОДТВЕРЖДЕНИЕ ОПЛАТЫ: исключение — %s", str(e)[:80])
 
         else:
-            logger.info("[GPAY_FLOW] ШАГ ОПЛАТЫ (без popup): ищем кнопку Оплатить/Pay...")
+            # Popup не открылся — Sign-In может быть overlay в том же окне (основная страница)
+            logger.info("[GPAY_FLOW] ШАГ ОПЛАТЫ (без popup): ищем Sign-In overlay на странице, затем кнопку Pay...")
+            if clicked and email and app_password:
+                login_ctx, _ = await _find_login_target(page, 12000)
+                if login_ctx is not None:
+                    logger.info("[GPAY_FLOW] Sign-In overlay на основной странице — выполняем логин")
+                    log_automation("GPAY SIGN-IN overlay (то же окно)")
+                    try:
+                        backup_codes = getattr(settings, "GOOGLE_BACKUP_CODES", "") or ""
+                        logged_in, login_msg = await _login_google_in_popup(
+                            page, email, app_password, backup_codes=backup_codes
+                        )
+                        if logged_in:
+                            await asyncio.sleep(5)
+                        elif login_msg:
+                            result["error"] = login_msg
+                    except Exception as e:
+                        logger.warning("Логин в overlay на основной странице: %s", e)
             log_automation("GPAY ШАГ ОПЛАТЫ (без popup)")
             confirmed = await _confirm_payment_in_popup(target_page)
             result["payment_confirmed"] = confirmed
