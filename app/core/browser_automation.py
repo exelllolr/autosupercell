@@ -1564,97 +1564,121 @@ class BrowserAutomation:
             await self.take_screenshot("login_error.png")
             raise
 
-    async def _setup_network_logging(self) -> None:
-        """Настройка логирования сетевых запросов."""
-        if not self.page or not self.network_log_enabled:
+    def _append_network_log_file(self, line: str) -> None:
+        """Дописать строку в файл логов сети/консоли (для просмотра на сервере как DevTools)."""
+        path = (getattr(settings, "BROWSER_SAVE_NETWORK_LOG_PATH", "") or "").strip()
+        if not path:
             return
+        try:
+            log_path = Path(path)
+            if not log_path.is_absolute():
+                log_path = (Path(__file__).resolve().parent.parent.parent / path).resolve()
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line.rstrip() + "\n")
+        except Exception as e:
+            logger.debug("Запись в BROWSER_SAVE_NETWORK_LOG_PATH: %s", e)
 
-        # Фильтр для шумных запросов (fonts, analytics, ads)
+    async def _attach_network_and_console_logging(self, page, page_label: str = "main") -> None:
+        """
+        Вешает логирование запросов и консоли на страницу (в т.ч. popup).
+        При BROWSER_SAVE_NETWORK_LOG_PATH ошибки дописываются в файл — на сервере можно смотреть как DevTools.
+        """
+        if not page:
+            return
+        log_path = (getattr(settings, "BROWSER_SAVE_NETWORK_LOG_PATH", "") or "").strip()
         noise_patterns = [
-            r'\.woff2?$', r'\.ttf$', r'\.eot$',  # fonts
-            r'google-analytics\.com', r'googletagmanager\.com',  # analytics
-            r'doubleclick\.net', r'googlesyndication\.com',  # ads
-            r'facebook\.com/tr', r'connect\.facebook\.net',  # facebook pixel
-            r'\.png$', r'\.jpg$', r'\.jpeg$', r'\.gif$', r'\.svg$', r'\.ico$',  # images (опционально)
+            r"\.woff2?$", r"\.ttf$", r"\.eot$",
+            r"google-analytics\.com", r"googletagmanager\.com",
+            r"doubleclick\.net", r"googlesyndication\.com",
+            r"facebook\.com/tr", r"connect\.facebook\.net",
+            r"\.png$", r"\.jpg$", r"\.jpeg$", r"\.gif$", r"\.svg$", r"\.ico$",
         ]
-        
+
         def is_noise(url: str) -> bool:
-            return any(re.search(pattern, url, re.I) for pattern in noise_patterns)
+            return any(re.search(p, url, re.I) for p in noise_patterns)
+
+        def log_line(msg: str, level: str = "error") -> None:
+            from datetime import datetime
+            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            line = f"[{ts}] [{page_label}] {msg}"
+            if level == "error":
+                logger.error(msg)
+            elif level == "warning":
+                logger.warning(msg)
+            else:
+                logger.debug(msg)
+            if "FAILED" in msg or "ERROR" in msg or "CLIENT ERROR" in msg or "SERVER ERROR" in msg or "CONSOLE ERROR" in msg or "PAGE ERROR" in msg:
+                self._append_network_log_file(line)
 
         async def on_request(request):
-            """Логирование исходящих запросов."""
-            if is_noise(request.url):
+            if not self.network_log_enabled or is_noise(request.url):
                 return
             self.request_count += 1
-            method = request.method
-            url = request.url
-            logger.debug(f"→ [{method}] {url}")
+            logger.debug(f"→ [{request.method}] {request.url}")
 
         async def on_response(response):
-            """Логирование ответов."""
-            if is_noise(response.url):
+            if not self.network_log_enabled or is_noise(response.url):
                 return
             status = response.status
             url = response.url
             method = response.request.method
-            
-            # Логируем по уровням
             if 200 <= status < 300:
                 logger.debug(f"← [{status}] {method} {url}")
             elif 300 <= status < 400:
                 logger.warning(f"← [{status}] REDIRECT {method} {url}")
-            elif 400 <= status < 500:
-                logger.error(f"← [{status}] CLIENT ERROR {method} {url}")
-                self.failed_requests.append({"url": url, "status": status, "method": method})
-            elif status >= 500:
-                logger.error(f"← [{status}] SERVER ERROR {method} {url}")
+            else:
+                log_line(f"← [{status}] {method} {url}", "error")
                 self.failed_requests.append({"url": url, "status": status, "method": method})
 
         async def on_request_failed(request):
-            """Логирование failed requests (network errors)."""
-            if is_noise(request.url):
+            if not self.network_log_enabled or is_noise(request.url):
                 return
-            failure = request.failure
-            url = request.url
-            method = request.method
-            error_text = failure if failure else "Unknown error"
-            logger.error(f"✗ [{method}] FAILED {url} - {error_text}")
-            self.failed_requests.append({"url": url, "error": error_text, "method": method})
-
-        self.page.on("request", on_request)
-        self.page.on("response", on_response)
-        self.page.on("requestfailed", on_request_failed)
-        logger.info("Network logging enabled")
-
-    async def _setup_console_logging(self) -> None:
-        """Настройка логирования console messages и errors."""
-        if not self.page or not self.console_log_enabled:
-            return
+            err = request.failure or "Unknown error"
+            log_line(f"✗ [{request.method}] FAILED {request.url} - {err}", "error")
+            self.failed_requests.append({"url": request.url, "error": str(err), "method": request.method})
 
         async def on_console(msg):
-            """Логирование console messages."""
-            msg_type = msg.type
-            text = msg.text
-            
-            # Фильтруем шум
-            noise_keywords = ['favicon', 'DevTools', 'Autofill', 'Download the React DevTools']
-            if any(keyword in text for keyword in noise_keywords):
+            if not self.console_log_enabled:
                 return
-            
-            if msg_type == "error":
-                logger.error(f"CONSOLE ERROR: {text}")
-            elif msg_type == "warning":
-                logger.warning(f"CONSOLE WARNING: {text}")
-            elif msg_type in ("log", "info"):
+            text = msg.text or ""
+            if any(k in text for k in ["favicon", "DevTools", "Autofill", "Download the React DevTools"]):
+                return
+            if msg.type == "error":
+                log_line(f"CONSOLE ERROR: {text}", "error")
+            elif msg.type == "warning":
+                log_line(f"CONSOLE WARNING: {text}", "warning")
+            else:
                 logger.debug(f"CONSOLE: {text}")
 
-        async def on_page_error(error):
-            """Логирование uncaught exceptions на странице."""
-            logger.error(f"PAGE ERROR (uncaught exception): {error}")
+        async def on_page_error(err):
+            log_line(f"PAGE ERROR (uncaught): {err}", "error")
 
-        self.page.on("console", on_console)
-        self.page.on("pageerror", on_page_error)
-        logger.info("Console logging enabled")
+        page.on("request", on_request)
+        page.on("response", on_response)
+        page.on("requestfailed", on_request_failed)
+        page.on("console", on_console)
+        page.on("pageerror", on_page_error)
+        logger.info("Network/console logging attached to page: %s", page_label)
+
+    async def _setup_network_logging(self) -> None:
+        """Настройка логирования сети и консоли для основной страницы и всех popup (в т.ч. G Pay)."""
+        if not self.page or not self.context:
+            return
+        await self._attach_network_and_console_logging(self.page, "main")
+        # Логировать также все новые страницы (popup G Pay и др.) — на сервере видно, какой запрос не прошёл
+        def on_new_page(page):
+            try:
+                asyncio.create_task(self._attach_network_and_console_logging(page, "popup"))
+            except Exception as e:
+                logger.debug("Attach logging to popup: %s", e)
+        self.context.on("page", on_new_page)
+        if (getattr(settings, "BROWSER_SAVE_NETWORK_LOG_PATH", "") or "").strip():
+            logger.info("Ошибки сети/консоли пишутся в %s", settings.BROWSER_SAVE_NETWORK_LOG_PATH.strip())
+
+    async def _setup_console_logging(self) -> None:
+        """Обработчики консоли вешаются в _attach_network_and_console_logging (вместе с сетью)."""
+        pass
 
     async def _check_viewport_consistency(self, action_name: str = "") -> None:
         """Проверка соответствия viewport заданному разрешению."""

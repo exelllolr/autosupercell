@@ -181,6 +181,9 @@ class Settings(BaseSettings):
     # Browser Diagnostics (network and console logging)
     BROWSER_NETWORK_LOG: bool = True
     BROWSER_CONSOLE_LOG: bool = True
+    # Путь к файлу для сохранения ошибок сети и консоли (как DevTools на сервере).
+    # Пример: logs/network_console.log — после прогона смотреть cat logs/network_console.log
+    BROWSER_SAVE_NETWORK_LOG_PATH: str = ""
 
     # Order Configuration
     MAX_ORDER_TTL: int = 600
