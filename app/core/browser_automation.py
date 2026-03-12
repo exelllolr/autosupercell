@@ -135,7 +135,13 @@ class BrowserAutomation:
                     "--disable-dev-shm-usage",
                     "--no-sandbox",  # Требуется для Docker
                     "--disable-setuid-sandbox",  # Требуется для Docker
-                    "--disable-features=IsolateOrigins,site-per-process",
+                    # [FIX-FedCM] Chrome 117+ использует FedCM (Federated Credential Management)
+                    # для Google Sign-In вместо window.open() → popup.
+                    # FedCM вызывает нативный браузерный диалог, который Playwright не видит:
+                    # expect_page/context.pages ничего не ловят, URL popup не меняется.
+                    # --disable-features=FedCm возвращает старый поток: window.open → accounts.google.com.
+                    # Refs: github.com/microsoft/playwright/issues/19776
+                    "--disable-features=IsolateOrigins,site-per-process,FedCm,WebAuthenticationPasskeysInSettings",
                     "--disable-site-isolation-trials",
                     "--disable-infobars",
                     f"--window-size={self.current_viewport['width']},{self.current_viewport['height']}",
@@ -153,6 +159,8 @@ class BrowserAutomation:
                     "--exclude-switches=enable-automation",  # Важно: скрывает автоматизацию
                     "--enable-features=NetworkService,NetworkServiceInProcess",
                     "--disable-component-extensions-with-background-pages",
+                    # [FIX-POPUP] Разрешаем popup без user gesture (window.open из Google Pay)
+                    "--disable-popup-blocking",
                 ]
                 if getattr(settings, "BROWSER_INCOGNITO", False):
                     browser_args.append("--incognito")
@@ -490,6 +498,9 @@ class BrowserAutomation:
                             "--no-sandbox",
                             "--disable-setuid-sandbox",
                             "--disable-dev-shm-usage",
+                            # [FIX-FedCM] Отключаем FedCM для Patchright тоже
+                            "--disable-features=FedCm,WebAuthenticationPasskeysInSettings",
+                            "--disable-popup-blocking",
                         ]
                     if use_chrome:
                         launch_options["channel"] = "chrome"
@@ -532,6 +543,41 @@ class BrowserAutomation:
                 )  # 60 сек на действия (селекторы и т.д.)
 
                 self.page = await self.context.new_page()
+
+                # FIX[server]: скрываем navigator.webdriver для всех страниц контекста,
+                # включая popup Google Sign-In. Без этого Google блокирует вход.
+                try:
+                    await self.context.add_init_script(
+                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                    )
+                    logger.debug("[FIX] navigator.webdriver скрыт через context.add_init_script")
+                except Exception as e:
+                    logger.debug(f"context.add_init_script (webdriver): {e}")
+
+                # FIX[FedCM]: Перехватываем navigator.credentials.get для диагностики.
+                # Chrome 117+ Google Sign-In использует FedCM вместо window.open().
+                # Этот скрипт пишет в консоль '[FedCM-INTERCEPT]' — видно в логах.
+                # Если --disable-features=FedCm сработало, скрипт не понадобится.
+                try:
+                    await self.context.add_init_script("""
+(function() {
+  if (navigator.credentials && navigator.credentials.get) {
+    var _orig = navigator.credentials.get.bind(navigator.credentials);
+    navigator.credentials.get = function(opts) {
+      var isIdentity = opts && opts.identity;
+      if (isIdentity) {
+        window._fedcmCalled = true;
+        window._fedcmOpts = opts;
+        console.log('[FedCM-INTERCEPT] FedCM identity request! Google Sign-In via FedCM (not popup). opts=' + JSON.stringify(opts).slice(0,200));
+      }
+      return _orig(opts);
+    };
+  }
+})();
+""")
+                    logger.debug("[FIX-FedCM] navigator.credentials.get перехвачен (диагностика)")
+                except Exception as e:
+                    logger.debug(f"context.add_init_script (FedCM): {e}")
 
                 # Настройка логирования сети и консоли
                 await self._setup_network_logging()

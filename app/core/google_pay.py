@@ -1219,56 +1219,24 @@ def _parse_first_backup_code(backup_codes_str: str) -> str | None:
     return None
 
 
-async def _find_login_target(popup_page, timeout_ms: int = 12000):
-    """
-    Находит, где форма Google Sign-in: в основном документе или в iframe (overlay).
-    Возвращает (target, label): target — page или frame с формой, label для логов.
-    """
-    email_selectors = ['input[type="email"]', 'input[name="identifier"]', '#identifierId']
-    # 1) Основной документ
-    for sel in email_selectors:
-        try:
-            el = await popup_page.wait_for_selector(sel, timeout=min(8000, timeout_ms))
-            if el and await el.is_visible():
-                logger.info("[GPAY] Sign-in форма в основном документе (overlay DOM): %s", sel)
-                return (popup_page, "main")
-        except Exception:
-            continue
-    # 2) Все iframe — overlay часто рендерится в iframe (accounts.google.com)
-    try:
-        for frame in popup_page.frames:
-            if frame == popup_page.main_frame:
-                continue
-            frame_url = (frame.url or "").lower()
-            for sel in email_selectors:
-                try:
-                    loc = frame.locator(sel).first
-                    if await loc.count() > 0 and await loc.is_visible():
-                        logger.info("[GPAY] Sign-in форма в iframe: %s (селектор %s)", frame_url[:80], sel)
-                        return (frame, "iframe")
-                except Exception:
-                    continue
-    except Exception as e:
-        logger.debug("[GPAY] Поиск формы в frames: %s", e)
-    return (None, None)
-
-
 async def _login_google_in_popup(
     popup_page, email: str, app_password: str, backup_codes: str = ""
 ) -> tuple[bool, str | None]:
     """
     Входит в Google в popup-окне Google Pay.
-    Поддерживает sign-in в overlay того же окна (DOM или iframe).
     Использует App Password (обходит 2FA). При запросе 8-значного кода — вводит первый из GOOGLE_BACKUP_CODES.
+    Ввод email/пароля/кода — посимвольно с задержкой, чтобы снизить детект автоматизации.
     """
     logger.info("Вход в Google в popup окне...")
 
+    # FIX[server]: активируем окно sign-in перед вводом данных
     try:
         await popup_page.bring_to_front()
         await popup_page.wait_for_timeout(300)
     except Exception:
         pass
 
+    # Увеличенные таймауты на каждом этапе авторизации Google — ждём до последнего
     try:
         await popup_page.wait_for_load_state("domcontentloaded", timeout=60000)
     except Exception:
@@ -1277,60 +1245,58 @@ async def _login_google_in_popup(
     current_url = popup_page.url
     logger.info(f"URL popup Google: {current_url}")
 
-    # Sign-in может быть в overlay — URL страницы при этом не меняется (остаётся fastspring/pay)
-    # Проверяем наличие формы в DOM или iframe
-    login_target, target_label = await _find_login_target(popup_page, timeout_ms=15000)
-    if login_target is None:
-        if "accounts.google.com" not in (current_url or "") and "signin" not in (current_url or "").lower():
-            logger.info("Google логин не требуется (уже залогинен или другая страница)")
-            return True, None
-        logger.warning("Поле email не найдено ни в документе, ни в iframe (overlay Sign-in)")
-        return False, "Форма входа Google не найдена (overlay/iframe)"
+    if "accounts.google.com" not in current_url and "signin" not in current_url:
+        logger.info("Google логин не требуется (уже залогинен или другая страница)")
+        return True, None
 
     await _screenshot(popup_page, "google_login_popup")
 
+    # Проверка: уже показана блокировка «This browser may not be secure»
     try:
         body_text = await popup_page.evaluate("() => document.body.innerText")
         if _is_google_block_page(body_text):
             msg = (
                 "Google: «This browser or app may not be secure». "
-                "Войдите в Google вручную в том же профиле браузера до запуска скрипта."
+                "Войдите в Google вручную в том же профиле браузера до запуска скрипта (store.supercell.com → тот же Chrome), "
+                "или в popup нажмите «Try again» и войдите вручную."
             )
             logger.warning(msg)
             return False, msg
     except Exception:
         pass
 
+    # Задержка между нажатиями клавиш (мс) — имитация человека, меньше детект
     type_delay_min, type_delay_max = 80, 180
-    email_selectors = ['input[type="email"]', 'input[name="identifier"]', '#identifierId']
 
-    # ── Email (в main или в найденном frame) ───────────────────────────────────
+    # ── Email ─────────────────────────────────────────────────────────────────
+    email_selectors = ['input[type="email"]', 'input[name="identifier"]', '#identifierId']
     email_entered = False
     for sel in email_selectors:
         try:
-            loc = login_target.locator(sel).first
-            if await loc.count() > 0:
-                await loc.click()
+            el = await popup_page.wait_for_selector(sel, timeout=45000)
+            if el:
+                await el.click()
                 await _delay(popup_page, 400, 800)
+                # Посимвольный ввод с задержкой вместо fill() — меньше шанс блокировки
                 await popup_page.keyboard.type(
                     email,
                     delay=random.randint(type_delay_min, type_delay_max),
                 )
                 await _delay(popup_page, 500, 1000)
                 email_entered = True
-                logger.info(f"Email введён ({target_label}, {sel})")
+                logger.info(f"Email введён ({sel})")
                 break
         except Exception:
             continue
 
     if not email_entered:
-        logger.warning("Поле email не найдено в контексте %s", target_label)
+        logger.warning("Поле email не найдено в popup Google")
         return False, None
 
     await _delay(popup_page, 600, 1200)
     for sel in ['#identifierNext', 'button:has-text("Next")', 'button[type="submit"]']:
         try:
-            loc = login_target.locator(sel).first
+            loc = popup_page.locator(sel).first
             if await loc.count() > 0:
                 await loc.click(timeout=15000)
                 logger.info("Next после email нажат")
@@ -1353,15 +1319,15 @@ async def _login_google_in_popup(
     except Exception:
         pass
 
-    # ── Пароль (App Password) — в том же контексте (main/iframe) ───────────────
+    # ── Пароль (App Password) ─────────────────────────────────────────────────
     pw_selectors = ['input[type="password"]', 'input[name="password"]', '#password input']
     pw_entered = False
     password_clean = app_password.replace(" ", "")
     for sel in pw_selectors:
         try:
-            loc = login_target.locator(sel).first
-            if await loc.count() > 0:
-                await loc.click()
+            el = await popup_page.wait_for_selector(sel, timeout=45000)
+            if el:
+                await el.click()
                 await _delay(popup_page, 400, 800)
                 await popup_page.keyboard.type(
                     password_clean,
@@ -1369,19 +1335,19 @@ async def _login_google_in_popup(
                 )
                 await _delay(popup_page, 500, 1000)
                 pw_entered = True
-                logger.info("App Password введён (%s)", target_label)
+                logger.info("App Password введён")
                 break
         except Exception:
             continue
 
     if not pw_entered:
-        logger.warning("Поле пароля не найдено в контексте %s", target_label)
+        logger.warning("Поле пароля не найдено в popup Google")
         return False, None
 
     await _delay(popup_page, 600, 1200)
     for sel in ['#passwordNext', 'button:has-text("Next")', 'button[type="submit"]']:
         try:
-            loc = login_target.locator(sel).first
+            loc = popup_page.locator(sel).first
             if await loc.count() > 0:
                 await loc.click(timeout=15000)
                 logger.info("Next после пароля нажат")
@@ -2774,18 +2740,42 @@ async def handle_google_pay(
                     except Exception:
                         pass
 
-                    # FastSpring: после клика Pay with G Pay Sign-In открывается в ОДНОМ из 4 вариантов.
-                    # По данным логов (network_console.log, март 2026):
-                    #   - URL popup остаётся pay.fastspring.com — новое окно НЕ открывается
-                    #   - pagead/1p-conversion отправляется → покупка проходит успешно
-                    #   - ВЫВОД: Sign-In = оверлей/iframe внутри popup (не window.open)
+                    # FastSpring: после клика Pay with G Pay Sign-In открывается в ОДНОМ из вариантов:
                     #
-                    # Алгоритм: запускаем expect_page параллельно с кликом (на случай window.open),
-                    # но сразу после клика сканируем ВСЕ 4 варианта с коротким timeout (15 сек).
-                    # Если ничего не нашли — Google уже авторизован (cached session), оплата идёт фоново.
-                    logger.info("[GPAY_FLOW] FastSpring: клик + параллельный поиск Sign-In (4 варианта)")
+                    # КЛЮЧЕВАЯ ПРИЧИНА (из исследования GitHub + Google Docs):
+                    # Chrome 117+ использует FedCM (Federated Credential Management) для Google Sign-In.
+                    # FedCM НЕ открывает popup window.open() — вместо этого браузер показывает
+                    # нативный диалог (не веб-страницу), которым Playwright НЕ может управлять.
+                    # При этом URL в popup не меняется, context.pages не получает новую страницу.
+                    #
+                    # РЕШЕНИЯ (по приоритету):
+                    # 1. --disable-features=FedCm в Chrome args (уже добавлено в browser_automation.py)
+                    #    → принудительно возвращает старый popup-поток (window.open к accounts.google.com)
+                    # 2. Если FedCM всё равно срабатывает — перехватываем console.log '[FedCM-INTERCEPT]'
+                    #    и ждём когда Google One Tap авторизует сам (silent auth / cached session)
+                    # 3. Мониторим все 4 варианта: DOM overlay, iframe, навигация, context.pages
+                    # 4. Если ничего — предполагаем cached session и ждём завершения оплаты
+                    #
+                    # Refs: github.com/microsoft/playwright/issues/19776
+                    #       developers.google.com/identity/gsi/web/guides/fedcm-migration
+                    logger.info("[GPAY_FLOW] FastSpring: клик + сканирование Sign-In (FedCM-aware)")
 
-                    # Запускаем expect_page в фоне (вариант D — window.open)
+                    # Подписываемся на console события popup_page для перехвата FedCM сообщений
+                    _fedcm_detected = []
+                    def _on_console_fedcm(msg):
+                        try:
+                            txt = msg.text or ""
+                            if "FedCM-INTERCEPT" in txt or "fedcm" in txt.lower():
+                                _fedcm_detected.append(txt)
+                                logger.info("[GPAY_FLOW] 🔑 FedCM в popup консоли: %s", txt[:120])
+                        except Exception:
+                            pass
+                    try:
+                        popup_page.on("console", _on_console_fedcm)
+                    except Exception:
+                        pass
+
+                    # Запускаем expect_page в фоне (вариант D — window.open, если FedCm отключён)
                     _signin_from_expect_page = None
                     try:
                         async with popup_page.context.expect_page(timeout=15_000) as _ep_info:
@@ -2800,16 +2790,33 @@ async def handle_google_pay(
                         log_automation("GPAY expect_page: %s", su[:60])
                         if "accounts.google.com" in su or "signin" in su or "google" in su:
                             signin_page = _signin_from_expect_page
-                            logger.info("[GPAY_FLOW] ✓ SIGN-IN (вариант D — новое окно): %s", su[:80])
+                            logger.info("[GPAY_FLOW] ✓ SIGN-IN (вариант D — новое окно, FedCM отключён): %s", su[:80])
                             log_automation("GPAY SIGN-IN вариант D (новое окно): %s", su[:60])
                     except Exception as ep_e:
-                        logger.info("[GPAY_FLOW] expect_page: %s — сканируем варианты A/B/C", type(ep_e).__name__)
-                        # Клик был внутри expect_page, повторять не нужно
+                        logger.info("[GPAY_FLOW] expect_page: %s — сканируем варианты A/B/C/F", type(ep_e).__name__)
 
-                    # ── Сканирование вариантов A / B / C (до 15 сек) ─────────────────
+                    # ── Сканирование вариантов A / B / C / F (до 20 сек) ─────────────
                     if signin_page is None:
-                        logger.info("[GPAY_FLOW] Сканируем варианты A/B/C Sign-In (до 15 сек)...")
-                        for _scan_i in range(15):
+                        logger.info("[GPAY_FLOW] Сканируем варианты A/B/C/F Sign-In (до 20 сек)...")
+                        for _scan_i in range(20):
+                            # ── Вариант F: FedCM detected через console interceptor ────────────
+                            # Если FedCM был вызван — Google Sign-In идёт через нативный диалог.
+                            # Playwright не может взаимодействовать с этим диалогом.
+                            # Но если Google session уже есть в профиле → FedCM авторизует автоматически
+                            # без показа диалога (silent auth). Оплата пройдёт фоново.
+                            if _fedcm_detected:
+                                logger.info(
+                                    "[GPAY_FLOW] ⚠ FedCM обнаружен в консоли popup (шаг %s). "
+                                    "Google Sign-In идёт через нативный браузерный диалог. "
+                                    "Если --disable-features=FedCm добавлен в Chrome args — "
+                                    "перезапустите браузер. FedCM сообщения: %s",
+                                    _scan_i, _fedcm_detected[:2]
+                                )
+                                log_automation("GPAY FedCM detected — silent auth ожидается")
+                                # При FedCM с cached session оплата всё равно проходит (без нашего участия)
+                                # Продолжаем — не ждём sign-in окно, просто ждём завершения платежа
+                                break
+
                             # ── Вариант A: Sign-In как overlay в DOM — input[type=email] видим ──
                             try:
                                 email_el = await popup_page.query_selector(
@@ -2826,7 +2833,8 @@ async def handle_google_pay(
                             # ── Вариант B: Sign-In как новый iframe внутри popup ──────────────
                             try:
                                 cur_frames = popup_page.frames
-                                logger.info("[GPAY_FLOW] Frames popup шаг %s: %s", _scan_i, [f.url[:60] for f in cur_frames])
+                                if _scan_i % 3 == 0:  # логируем каждые 3 сек, не каждую
+                                    logger.info("[GPAY_FLOW] Frames popup шаг %s: %s", _scan_i, [f.url[:60] for f in cur_frames])
                                 for fr in cur_frames:
                                     fu = (fr.url or "").lower()
                                     if "accounts.google.com" in fu or ("signin" in fu and "google" in fu):
@@ -2864,18 +2872,40 @@ async def handle_google_pay(
                             except Exception:
                                 pass
 
+                            # Проверяем _fedcmCalled через JS — может выставился после загрузки скрипта
+                            try:
+                                fed_called = await popup_page.evaluate("() => window._fedcmCalled || false")
+                                if fed_called:
+                                    _fedcm_detected.append("window._fedcmCalled=true")
+                                    logger.info("[GPAY_FLOW] ⚠ FedCM: window._fedcmCalled=true обнаружен (шаг %s)", _scan_i)
+                            except Exception:
+                                pass
+
                             await popup_page.wait_for_timeout(1000)
 
+                        # Убираем listener
+                        try:
+                            popup_page.remove_listener("console", _on_console_fedcm)
+                        except Exception:
+                            pass
+
                         if signin_page is None:
-                            # ── Вариант E: Google уже авторизован (cached session) ────────────
-                            # Оплата идёт фоново через Google One Tap / silent auth.
-                            # URL не меняется, sign-in не нужен — просто ждём завершения.
-                            logger.info(
-                                "[GPAY_FLOW] Sign-In не обнаружен за 15 сек — "
-                                "вероятно Google session кэширована (silent auth). "
-                                "Оплата продолжается фоново. Пропускаем логин."
-                            )
-                            log_automation("GPAY SIGN-IN: не найден → cached session, пропуск логина")
+                            # ── Вариант E: cached session / FedCM silent auth ────────────────
+                            if _fedcm_detected:
+                                logger.info(
+                                    "[GPAY_FLOW] FedCM silent auth: Sign-In идёт фоново. "
+                                    "Оплата продолжится без нашего участия. "
+                                    "Для отключения FedCM убедитесь что Chrome запущен с "
+                                    "--disable-features=FedCm (добавлено в browser_automation.py)."
+                                )
+                                log_automation("GPAY FedCM silent auth → ждём оплаты")
+                            else:
+                                logger.info(
+                                    "[GPAY_FLOW] Sign-In не обнаружен за 20 сек — "
+                                    "вероятно Google session кэширована (silent auth без FedCM). "
+                                    "Оплата продолжается фоново. Пропускаем логин."
+                                )
+                                log_automation("GPAY SIGN-IN: не найден → cached session, пропуск логина")
                             await _screenshot(popup_page, "gpay_signin_not_found_cached")
 
                 else:
@@ -2963,24 +2993,7 @@ async def handle_google_pay(
                 log_automation("GPAY ПОДТВЕРЖДЕНИЕ ОПЛАТЫ: исключение — %s", str(e)[:80])
 
         else:
-            # Popup не открылся — Sign-In может быть overlay в том же окне (основная страница)
-            logger.info("[GPAY_FLOW] ШАГ ОПЛАТЫ (без popup): ищем Sign-In overlay на странице, затем кнопку Pay...")
-            if clicked and email and app_password:
-                login_ctx, _ = await _find_login_target(page, 12000)
-                if login_ctx is not None:
-                    logger.info("[GPAY_FLOW] Sign-In overlay на основной странице — выполняем логин")
-                    log_automation("GPAY SIGN-IN overlay (то же окно)")
-                    try:
-                        backup_codes = getattr(settings, "GOOGLE_BACKUP_CODES", "") or ""
-                        logged_in, login_msg = await _login_google_in_popup(
-                            page, email, app_password, backup_codes=backup_codes
-                        )
-                        if logged_in:
-                            await asyncio.sleep(5)
-                        elif login_msg:
-                            result["error"] = login_msg
-                    except Exception as e:
-                        logger.warning("Логин в overlay на основной странице: %s", e)
+            logger.info("[GPAY_FLOW] ШАГ ОПЛАТЫ (без popup): ищем кнопку Оплатить/Pay...")
             log_automation("GPAY ШАГ ОПЛАТЫ (без popup)")
             confirmed = await _confirm_payment_in_popup(target_page)
             result["payment_confirmed"] = confirmed
