@@ -376,8 +376,15 @@ def _click_delay_ms() -> int:
 
 
 async def _mouse_click_with_delay(page, x: float, y: float, delay_ms: int | None = None) -> None:
-    """Клик мышью с паузой до/после, чтобы на видео было видно куда кликает."""
+    """Клик мышью с паузой до/после, чтобы на видео было видно куда кликает.
+    FIX[server]: bring_to_front() перед кликом — без активации окна Chrome блокирует window.open()
+    даже при --disable-popup-blocking (popup blocker срабатывает на клики в неактивном окне).
+    """
     d = delay_ms if delay_ms is not None else _click_delay_ms()
+    try:
+        await page.bring_to_front()
+    except Exception:
+        pass
     await page.wait_for_timeout(max(80, d // 2))
     await page.mouse.click(x, y, delay=d)
     await page.wait_for_timeout(max(50, d // 3))
@@ -500,7 +507,6 @@ async def _try_click_in_frame(frame, selectors: list, label: str) -> bool:
     """
     Пробует кликнуть по первому найденному селектору в frame.
     Пропускает элементы-контейнеры (body, html, крупные div на всю страницу).
-    На сервере (headless) часто нужны force=True и больший таймаут — overlay/viewport.
     """
     for sel in selectors:
         try:
@@ -508,38 +514,29 @@ async def _try_click_in_frame(frame, selectors: list, label: str) -> bool:
             count = await locs.count()
             if count == 0:
                 continue
+            # Если несколько — перебираем, берём первый видимый и не-контейнер
             for i in range(min(count, 5)):
                 loc = locs.nth(i)
                 try:
                     visible = await loc.is_visible()
                     if not visible:
                         continue
+                    # Проверяем что это не огромный контейнер (body/wrapper)
                     tag = await loc.evaluate("el => el.tagName.toLowerCase()")
                     if tag in ("body", "html"):
                         continue
                     box = await loc.bounding_box()
                     if box and box["width"] > 800 and box["height"] > 400:
+                        # Слишком большой элемент — это контейнер, пропускаем
                         logger.debug(f"Пропуск контейнера {tag} ({box['width']}x{box['height']}): {sel}")
                         continue
                     await loc.scroll_into_view_if_needed()
-                    await frame.wait_for_timeout(300)
-                    # Сначала обычный клик; на сервере/headless часто перехватывает overlay — пробуем force
-                    try:
-                        await loc.click(timeout=15_000)
-                    except Exception as click_err:
-                        logger.debug("[GPAY] Обычный клик не удался (%s), пробуем force=True: %s", sel[:50], click_err)
-                        try:
-                            await loc.click(timeout=10_000, force=True)
-                        except Exception as force_err:
-                            logger.debug("[GPAY] force=True не удался: %s", force_err)
-                            continue
+                    await loc.click(timeout=5000)
                     logger.info(f"{label}: {sel}")
                     return True
-                except Exception as e:
-                    logger.debug("[GPAY] _try_click_in_frame элемент %s: %s", sel[:40], e)
+                except Exception:
                     continue
-        except Exception as e:
-            logger.debug("[GPAY] _try_click_in_frame селектор %s: %s", sel[:40], e)
+        except Exception:
             continue
     return False
 
@@ -975,11 +972,6 @@ async def select_gpay_tab_and_pay(page, timeout_ms: int = 90000) -> bool:
     logger.info("═══════════════════════════════════════════")
     logger.info("═══ select_gpay_tab_and_pay START ═══")
     logger.info(f"═══ URL: {page.url}")
-    try:
-        headless = getattr(settings, "BROWSER_HEADLESS", True)
-        logger.info("[GPAY] BROWSER_HEADLESS=%s (на сервере true — клики через force при необходимости)", headless)
-    except Exception:
-        pass
     logger.info("═══════════════════════════════════════════")
 
     try:
@@ -1069,23 +1061,6 @@ async def select_gpay_tab_and_pay(page, timeout_ms: int = 90000) -> bool:
 
     await _screenshot(page, "fastspring_loaded")
     logger.info(f"[ШАГ 3] FastSpring форма готова. Frames для обработки: {len(loaded_frames)}")
-
-    # Диагностика для сервера/headless: viewport и прокрутка iframe в зону видимости
-    try:
-        viewport = await page.evaluate("() => ({ w: window.innerWidth, h: window.innerHeight })")
-        logger.info("[GPAY] Viewport (inner): %sx%s", viewport.get("w"), viewport.get("h"))
-    except Exception:
-        pass
-    try:
-        for idx in range(8):
-            ifr = page.locator("iframe").nth(idx)
-            if await ifr.count() == 0:
-                break
-            await ifr.scroll_into_view_if_needed()
-            await page.wait_for_timeout(200)
-        logger.info("[GPAY] Iframe(s) прокручены в зону видимости (для headless/сервера)")
-    except Exception as scroll_e:
-        logger.debug("[GPAY] Прокрутка iframe: %s", scroll_e)
 
     # ── Клик по вкладке Google Pay ─────────────────────────────────────────────
     tab_click_max_attempts = 4
@@ -1253,6 +1228,13 @@ async def _login_google_in_popup(
     Ввод email/пароля/кода — посимвольно с задержкой, чтобы снизить детект автоматизации.
     """
     logger.info("Вход в Google в popup окне...")
+
+    # FIX[server]: активируем окно sign-in перед вводом данных
+    try:
+        await popup_page.bring_to_front()
+        await popup_page.wait_for_timeout(300)
+    except Exception:
+        pass
 
     # Увеличенные таймауты на каждом этапе авторизации Google — ждём до последнего
     try:
@@ -2030,6 +2012,12 @@ async def _click_pay_button_by_mouse_at_coords(popup_page) -> bool:
 
 async def _click_pay_button_once(popup_page, confirm_selectors, re_module) -> bool:
     """Одна попытка нажать кнопку Оплатить/Pay. Возвращает True если клик выполнен."""
+    # FIX[server]: активируем окно перед поиском и кликом
+    try:
+        await popup_page.bring_to_front()
+        await popup_page.wait_for_timeout(200)
+    except Exception:
+        pass
     # Пауза перед поиском (основное ожидание — в _confirm_payment_in_popup)
     await popup_page.wait_for_timeout(4000)
 
@@ -2071,6 +2059,11 @@ async def _click_pay_button_once(popup_page, confirm_selectors, re_module) -> bo
                         log_automation("Клик: кнопка по bounding_box (%s)", sel[:60])
                         return True
                     try:
+                        # FIX[server]: bring_to_front перед loc.click
+                        try:
+                            await popup_page.bring_to_front()
+                        except Exception:
+                            pass
                         await loc.click(timeout=15000)
                     except Exception:
                         await loc.click(timeout=10000, force=True)
@@ -2176,6 +2169,15 @@ async def _confirm_payment_in_popup(popup_page) -> bool:
     logger.info("Подтверждение оплаты в Google Pay popup...")
     logger.info("[GPAY_FLOW] Попытка нажать Оплатить/Pay, URL popup: %s", (popup_page.url or "")[:90])
 
+    # FIX[server]: активируем окно popup перед любым кликом.
+    # Без bring_to_front() Chrome блокирует window.open() (Google Sign-In) даже при --disable-popup-blocking —
+    # popup blocker срабатывает на клики в неактивных (фоновых) окнах.
+    try:
+        await popup_page.bring_to_front()
+        await popup_page.wait_for_timeout(300)
+    except Exception:
+        pass
+
     try:
         await popup_page.wait_for_load_state("domcontentloaded", timeout=45_000)
     except Exception:
@@ -2279,6 +2281,90 @@ async def _confirm_payment_in_popup(popup_page) -> bool:
             elif url_before_click == url_after_click or "fastspring.com" in url_after_click.lower():
                 logger.warning("[GPAY_FLOW] Клик по Pay/Оплатить не привёл к смене экрана (остались на %s)", url_after_click[:80])
                 log_automation("ВНИМАНИЕ: клик не привёл к смене экрана, URL без изменений")
+
+                # ── ДИАГНОСТИКА: проверяем ВСЕ варианты появления Google Sign-In ────────
+                # Теория: Sign-In открывается КАК ОВЕРЛЕЙ/IFRAME внутри текущего popup,
+                # а не как отдельное window.open() — тогда URL не меняется, expect_page ничего не ловит.
+                signin_found_in = None
+                try:
+                    # Вариант A: Sign-In iframe внутри текущего popup
+                    popup_frames = popup_page.frames
+                    logger.info("[ДИАГН] Frames в popup после клика: %s", len(popup_frames))
+                    for fi, fr in enumerate(popup_frames):
+                        try:
+                            fu = (fr.url or "").lower()
+                            logger.info("[ДИАГН] popup frame[%s]: %s", fi, fu[:100])
+                            if "accounts.google.com" in fu or ("signin" in fu and "google" in fu):
+                                signin_found_in = f"iframe[{fi}] в popup: {fu[:80]}"
+                                logger.info("[ДИАГН] ✓ Sign-In НАЙДЕН как iframe в popup: %s", fu[:80])
+                        except Exception:
+                            continue
+
+                    # Вариант B: Sign-In overlay — input[type=email] появился в popup DOM
+                    try:
+                        email_input = await popup_page.query_selector('input[type="email"], input[name="identifier"], #identifierId')
+                        if email_input and await email_input.is_visible():
+                            signin_found_in = "overlay/DOM в popup (email input visible)"
+                            logger.info("[ДИАГН] ✓ Sign-In НАЙДЕН как overlay в popup (email input видим)")
+                    except Exception:
+                        pass
+
+                    # Вариант C: Sign-In в другом окне context.pages (новый popup)
+                    if signin_found_in is None:
+                        try:
+                            ctx = popup_page.context
+                            all_pages = ctx.pages
+                            logger.info("[ДИАГН] Всего страниц в context: %s", len(all_pages))
+                            for pi, p in enumerate(all_pages):
+                                try:
+                                    pu = (p.url or "").lower()
+                                    logger.info("[ДИАГН] context.pages[%s]: %s", pi, pu[:100])
+                                    if "accounts.google.com" in pu or ("signin" in pu and "google" in pu):
+                                        signin_found_in = f"context.pages[{pi}]: {pu[:80]}"
+                                        logger.info("[ДИАГН] ✓ Sign-In НАЙДЕН в context.pages[%s]: %s", pi, pu[:80])
+                                except Exception:
+                                    continue
+                        except Exception as e:
+                            logger.debug("[ДИАГН] context.pages проверка: %s", e)
+
+                    # Вариант D: Sign-In как дочерние frames FastSpring iframe
+                    if signin_found_in is None:
+                        try:
+                            # Проверяем frames главной страницы тоже
+                            main_page = popup_page.context.pages[0] if popup_page.context.pages else None
+                            if main_page and main_page != popup_page:
+                                for fi, fr in enumerate(main_page.frames):
+                                    try:
+                                        fu = (fr.url or "").lower()
+                                        if "accounts.google.com" in fu or ("signin" in fu and "google" in fu):
+                                            signin_found_in = f"main_page frame[{fi}]: {fu[:80]}"
+                                            logger.info("[ДИАГН] ✓ Sign-In в frame главной страницы[%s]: %s", fi, fu[:80])
+                                    except Exception:
+                                        continue
+                        except Exception as e:
+                            logger.debug("[ДИАГН] main page frames: %s", e)
+
+                    # Итог диагностики
+                    if signin_found_in:
+                        logger.info("[ДИАГН] ✓✓ РЕЗУЛЬТАТ: Sign-In открылся как: %s", signin_found_in)
+                        log_automation("GPAY ДИАГН: Sign-In = %s", signin_found_in[:60])
+                        # Если это overlay/DOM в том же popup — пробуем логин прямо здесь
+                        if "overlay" in signin_found_in or "DOM" in signin_found_in:
+                            logger.info("[ДИАГН] Sign-In оверлей в popup — возвращаем True, логин будет в handle_google_pay")
+                            return True
+                    else:
+                        logger.warning(
+                            "[ДИАГН] ✗ Sign-In НЕ найден ни в одном варианте после клика. "
+                            "Возможные причины: 1) Google заблокировал (headless), "
+                            "2) кнопка [class*=pay-button] — декоративная (нужен JS-клик), "
+                            "3) нужно ждать дольше. "
+                            "Сделайте скриншот goglepay.html вручную для анализа."
+                        )
+                        log_automation("GPAY ДИАГН: Sign-In не найден ни в одном варианте")
+                        await _screenshot(popup_page, "gpay_after_click_no_signin")
+                except Exception as diag_err:
+                    logger.debug("[ДИАГН] Ошибка диагностики: %s", diag_err)
+                # ─────────────────────────────────────────────────────────────────────
 
         await popup_page.wait_for_timeout(10_000)
         if await _payment_page_has_error_async(popup_page):
@@ -2638,54 +2724,154 @@ async def handle_google_pay(
             current_url = (popup_page.url or "").lower()
             is_signin = "accounts.google.com" in current_url or "signin" in current_url
 
-            # Шаг 2a: Если popup ещё на экране G Pay (не sign-in) — нажимаем "Оплатить"/Pay, после чего откроется sign-in
-            signin_page = None  # страница с accounts.google.com (может быть тот же popup или новое окно)
+            # Шаг 2a: Если popup на экране G Pay (не sign-in) — нажимаем «Pay with G Pay».
+            # FIX[server]: на pay.fastspring.com клик открывает accounts.google.com в НОВОМ окне (popup 2).
+            # Используем expect_page вокруг клика чтобы гарантированно поймать это окно.
+            signin_page = None
             if not is_signin:
-                logger.info("Popup открыт на экране G Pay, нажимаем 'Оплатить' / Pay...")
-                first_pay_clicked = await _confirm_payment_in_popup(popup_page)
-                if first_pay_clicked:
-                    logger.info("Кнопка оплаты нажата, ожидание перехода на страницу входа Google...")
-                    # Сначала явно ждём навигации в том же popup на accounts.google.com (часто после клика на FastSpring)
+                logger.info("Popup на экране G Pay, ловим sign-in окно через expect_page...")
+                is_fastspring = "fastspring.com" in (popup_page.url or "").lower()
+
+                if is_fastspring:
+                    # ── ДИАГНОСТИКА ПЕРЕД КЛИКОМ: снимок состояния popup ──────────────
+                    try:
+                        pre_frames = [f.url for f in popup_page.frames]
+                        logger.info("[GPAY_FLOW] Frames в popup ДО клика: %s", pre_frames)
+                    except Exception:
+                        pass
+
+                    # FastSpring: после клика Pay with G Pay Sign-In открывается в ОДНОМ из 4 вариантов.
+                    # По данным логов (network_console.log, март 2026):
+                    #   - URL popup остаётся pay.fastspring.com — новое окно НЕ открывается
+                    #   - pagead/1p-conversion отправляется → покупка проходит успешно
+                    #   - ВЫВОД: Sign-In = оверлей/iframe внутри popup (не window.open)
+                    #
+                    # Алгоритм: запускаем expect_page параллельно с кликом (на случай window.open),
+                    # но сразу после клика сканируем ВСЕ 4 варианта с коротким timeout (15 сек).
+                    # Если ничего не нашли — Google уже авторизован (cached session), оплата идёт фоново.
+                    logger.info("[GPAY_FLOW] FastSpring: клик + параллельный поиск Sign-In (4 варианта)")
+
+                    # Запускаем expect_page в фоне (вариант D — window.open)
+                    _signin_from_expect_page = None
+                    try:
+                        async with popup_page.context.expect_page(timeout=15_000) as _ep_info:
+                            await _confirm_payment_in_popup(popup_page)
+                        _signin_from_expect_page = await _ep_info.value
+                        try:
+                            await _signin_from_expect_page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                        except Exception:
+                            pass
+                        su = (_signin_from_expect_page.url or "").lower()
+                        logger.info("[GPAY_FLOW] expect_page поймал окно: %s", su[:100])
+                        log_automation("GPAY expect_page: %s", su[:60])
+                        if "accounts.google.com" in su or "signin" in su or "google" in su:
+                            signin_page = _signin_from_expect_page
+                            logger.info("[GPAY_FLOW] ✓ SIGN-IN (вариант D — новое окно): %s", su[:80])
+                            log_automation("GPAY SIGN-IN вариант D (новое окно): %s", su[:60])
+                    except Exception as ep_e:
+                        logger.info("[GPAY_FLOW] expect_page: %s — сканируем варианты A/B/C", type(ep_e).__name__)
+                        # Клик был внутри expect_page, повторять не нужно
+
+                    # ── Сканирование вариантов A / B / C (до 15 сек) ─────────────────
+                    if signin_page is None:
+                        logger.info("[GPAY_FLOW] Сканируем варианты A/B/C Sign-In (до 15 сек)...")
+                        for _scan_i in range(15):
+                            # ── Вариант A: Sign-In как overlay в DOM — input[type=email] видим ──
+                            try:
+                                email_el = await popup_page.query_selector(
+                                    'input[type="email"], input[name="identifier"], #identifierId'
+                                )
+                                if email_el and await email_el.is_visible():
+                                    signin_page = popup_page
+                                    logger.info("[GPAY_FLOW] ✓ SIGN-IN вариант A (overlay DOM, email input visible) шаг %s", _scan_i)
+                                    log_automation("GPAY SIGN-IN вариант A (overlay DOM)")
+                                    break
+                            except Exception:
+                                pass
+
+                            # ── Вариант B: Sign-In как новый iframe внутри popup ──────────────
+                            try:
+                                cur_frames = popup_page.frames
+                                logger.info("[GPAY_FLOW] Frames popup шаг %s: %s", _scan_i, [f.url[:60] for f in cur_frames])
+                                for fr in cur_frames:
+                                    fu = (fr.url or "").lower()
+                                    if "accounts.google.com" in fu or ("signin" in fu and "google" in fu):
+                                        signin_page = popup_page
+                                        logger.info("[GPAY_FLOW] ✓ SIGN-IN вариант B (iframe в popup): %s", fu[:80])
+                                        log_automation("GPAY SIGN-IN вариант B (iframe): %s", fu[:50])
+                                        break
+                                if signin_page is not None:
+                                    break
+                            except Exception:
+                                pass
+
+                            # ── Вариант C: Навигация в том же popup окне ──────────────────────
+                            try:
+                                pu = (popup_page.url or "").lower()
+                                if "accounts.google.com" in pu or ("signin" in pu and "google" in pu):
+                                    signin_page = popup_page
+                                    logger.info("[GPAY_FLOW] ✓ SIGN-IN вариант C (навигация popup): %s", pu[:80])
+                                    log_automation("GPAY SIGN-IN вариант C (навигация)")
+                                    break
+                            except Exception:
+                                pass
+
+                            # ── Вариант D доп: context.pages (если expect_page не поймал) ─────
+                            try:
+                                for _cp in list(popup_page.context.pages):
+                                    _cu = (_cp.url or "").lower()
+                                    if "accounts.google.com" in _cu or ("signin" in _cu and "google" in _cu):
+                                        signin_page = _cp
+                                        logger.info("[GPAY_FLOW] ✓ SIGN-IN вариант D (context.pages): %s", _cu[:80])
+                                        log_automation("GPAY SIGN-IN вариант D (context.pages): %s", _cu[:50])
+                                        break
+                                if signin_page is not None:
+                                    break
+                            except Exception:
+                                pass
+
+                            await popup_page.wait_for_timeout(1000)
+
+                        if signin_page is None:
+                            # ── Вариант E: Google уже авторизован (cached session) ────────────
+                            # Оплата идёт фоново через Google One Tap / silent auth.
+                            # URL не меняется, sign-in не нужен — просто ждём завершения.
+                            logger.info(
+                                "[GPAY_FLOW] Sign-In не обнаружен за 15 сек — "
+                                "вероятно Google session кэширована (silent auth). "
+                                "Оплата продолжается фоново. Пропускаем логин."
+                            )
+                            log_automation("GPAY SIGN-IN: не найден → cached session, пропуск логина")
+                            await _screenshot(popup_page, "gpay_signin_not_found_cached")
+
+                else:
+                    # Не FastSpring (pay.google.com): sign-in открывается навигацией в том же popup
+                    await _confirm_payment_in_popup(popup_page)
                     try:
                         await popup_page.wait_for_url(
                             lambda u: "accounts.google.com" in (u or "") or ("signin" in (u or "").lower() and "google" in (u or "").lower()),
                             timeout=60_000,
                         )
                         signin_page = popup_page
-                        logger.info("[GPAY_FLOW] ДОШЛИ ДО SIGN-IN: страница входа Google открылась (wait_for_url), URL=%s", (popup_page.url or "")[:80])
-                        log_automation("GPAY ДОШЛИ ДО SIGN-IN (popup), URL: %s", (popup_page.url or "")[:60])
+                        logger.info("[GPAY_FLOW] SIGN-IN (wait_for_url), URL=%s", (popup_page.url or "")[:80])
                     except Exception:
                         pass
-                    # Дополнительно: опрос popup и всех окон (до 90 сек), если sign-in ещё не найден (новое окно или задержка)
-                    if signin_page is None:
-                        for _ in range(90):
+                    if signin_page is None and browser.context:
+                        for _i in range(30):
                             await popup_page.wait_for_timeout(1000)
-                            try:
-                                current_url = (popup_page.url or "").lower()
-                                if "accounts.google.com" in current_url or "signin" in current_url:
-                                    signin_page = popup_page
-                                    logger.info("Открылась страница входа Google (sign-in) в том же popup")
-                                    break
-                            except Exception:
-                                pass
-                            if signin_page is not None:
-                                break
-                            # Проверяем все страницы контекста — sign-in мог открыться в новом окне
-                            if browser.context:
-                                for p in browser.context.pages:
-                                    try:
-                                        u = (p.url or "").lower()
-                                        if "accounts.google.com" in u or ("signin" in u and "google" in u):
-                                            signin_page = p
-                                            logger.info("[GPAY_FLOW] ДОШЛИ ДО SIGN-IN: страница входа в новом окне, URL=%s", (p.url or "")[:80])
-                                            log_automation("GPAY ДОШЛИ ДО SIGN-IN (новое окно)")
-                                            break
-                                    except Exception:
-                                        continue
+                            for p in list(browser.context.pages):
+                                try:
+                                    u = (p.url or "").lower()
+                                    if "accounts.google.com" in u or ("signin" in u and "google" in u):
+                                        signin_page = p
+                                        logger.info("[GPAY_FLOW] SIGN-IN (context.pages), URL=%s", u[:80])
+                                        break
+                                except Exception:
+                                    continue
                             if signin_page is not None:
                                 break
                         if signin_page is None:
-                            logger.warning("Страница sign-in не обнаружена за 90 сек (popup и все окна проверены)")
+                            logger.warning("[GPAY_FLOW] sign-in не найден за 30 сек (non-FastSpring)")
 
             # Страница для логина: найденная sign-in или текущий popup если уже на sign-in
             if signin_page is None and popup_page:
