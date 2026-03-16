@@ -1216,10 +1216,8 @@ def _parse_first_backup_code(backup_codes_str: str) -> str | None:
     if not backup_codes_str or not backup_codes_str.strip():
         return None
     try:
-        from app.core.google_backup_codes import get_next_google_backup_code, consume_google_backup_code
+        from app.core.google_backup_codes import get_next_google_backup_code
         code = get_next_google_backup_code()
-        if code:
-            consume_google_backup_code()  # помечаем код как использованный
         if code:
             logger.info(f"Backup code получен через ротацию: {code[:4]}****")
             return code
@@ -1629,6 +1627,11 @@ async def _login_google_in_popup(
                         )
                         await _delay(popup_page, 500, 1000)
                         logger.info("Введён 8-значный резервный код (после Try another way)")
+                        try:
+                            from app.core.google_backup_codes import consume_google_backup_code
+                            consume_google_backup_code()
+                        except Exception:
+                            pass
                         # Нажимаем Next/Verify
                         _next_sels = [
                             'button:has-text("Next")', 'button:has-text("Verify")',
@@ -1726,6 +1729,11 @@ async def _login_google_in_popup(
                     await _delay(popup_page, 500, 1000)
                     code_entered = True
                     logger.info("Введён 8-значный резервный код")
+                    try:
+                        from app.core.google_backup_codes import consume_google_backup_code
+                        consume_google_backup_code()
+                    except Exception:
+                        pass
             if code_entered:
                 await _delay(popup_page, 600, 1200)
                 next_verify_selectors = [

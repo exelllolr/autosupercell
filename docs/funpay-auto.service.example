@@ -1,0 +1,29 @@
+# Пример unit для systemd. Скопируйте в /etc/systemd/system/funpay-auto.service
+# и замените /root/autosupercell на реальный путь к проекту и пользователя на своего.
+#
+# Важно:
+# - НЕ используйте EnvironmentFile= с путём до несуществующего .env — сервис не стартует.
+# - Скрипт сам подхватывает .env из WorkingDirectory; если нужен EnvironmentFile,
+#   укажите с минусом: EnvironmentFile=-/root/autosupercell/.env (минус = не падать, если файла нет).
+#
+# sudo cp docs/funpay-auto.service.example /etc/systemd/system/funpay-auto.service
+# sudo nano /etc/systemd/system/funpay-auto.service   # поправьте пути и User
+# sudo systemctl daemon-reload && sudo systemctl enable funpay-auto && sudo systemctl start funpay-auto
+
+[Unit]
+Description=FunPay Auto Purchase
+After=network.target redis.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/autosupercell
+Environment=PATH=/root/autosupercell/venv/bin:/usr/bin
+ExecStart=/root/autosupercell/venv/bin/python examples/funpay_purchase_auto.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

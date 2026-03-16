@@ -232,43 +232,55 @@ echo $!   # сохраните PID, чтобы потом убить: kill <PID>
 
 ### 4. Запуск как сервис systemd (рекомендуется)
 
-Создайте файл `/etc/systemd/system/funpay-purchase-auto.service` (подставьте свой путь и пользователя):
+Создайте файл `/etc/systemd/system/funpay-auto.service`. **Не используйте `EnvironmentFile=`**, если путь к файлу может не существовать — иначе сервис не стартует с ошибкой «Failed to load environment files». Скрипт сам подхватывает `.env` из рабочей директории.
+
+Подставьте **реальный** путь к проекту (например `/root/autosupercell` или `/home/user/autosupercell`) и имя пользователя. Путь к Python — каталог `venv` или `.venv` в проекте:
 
 ```ini
 [Unit]
-Description=FunPay autonomous purchase script
+Description=FunPay Auto Purchase
 After=network.target redis.service
 
 [Service]
 Type=simple
-User=www-data
-WorkingDirectory=/path/to/autosupercell
-Environment=PATH=/path/to/autosupercell/.venv/bin:/usr/bin
-ExecStart=/path/to/autosupercell/.venv/bin/python examples/funpay_purchase_auto.py
+User=root
+WorkingDirectory=/root/autosupercell
+Environment=PATH=/root/autosupercell/venv/bin:/usr/bin
+ExecStart=/root/autosupercell/venv/bin/python examples/funpay_purchase_auto.py
 Restart=always
 RestartSec=10
-StandardOutput=append:logs/funpay_auto.log
-StandardError=append:logs/funpay_auto.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+Готовый пример можно скопировать из репозитория: `docs/funpay-auto.service.example`.
+
 Включите и запустите:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable funpay-purchase-auto
-sudo systemctl start funpay-purchase-auto
-sudo systemctl status funpay-purchase-auto
+sudo systemctl enable funpay-auto
+sudo systemctl start funpay-auto
+sudo systemctl status funpay-auto
 ```
 
 Просмотр логов:
 
 ```bash
-journalctl -u funpay-purchase-auto -f
-# или просто tail -f /path/to/autosupercell/logs/funpay_auto.log
+journalctl -u funpay-auto -f
 ```
+
+#### Если сервис не стартует (Failed to load environment files / No such file or directory)
+
+- **«Failed to load environment files: No such file or directory»** — в unit указан `EnvironmentFile=/какой-то/путь/.env`, а такого файла или каталога нет. Либо удалите строку `EnvironmentFile=`, либо сделайте её опциональной: `EnvironmentFile=-/реальный/путь/к/проекту/.env` (минус перед путём = не падать, если файла нет).
+- **«Failed to run 'start' task: No such file or directory»** — неверный путь в `ExecStart` или `WorkingDirectory`. Проверьте:
+  - `WorkingDirectory` — существующая папка проекта (например `ls /root/autosupercell`).
+  - В `ExecStart` путь к `python` — существующий файл (например `ls /root/autosupercell/venv/bin/python`). Если venv называется `.venv`, подставьте `.venv` вместо `venv`.
+
+После правок: `sudo systemctl daemon-reload` и снова `sudo systemctl start funpay-auto`.
 
 ### 5. Откуда берутся заказы
 
