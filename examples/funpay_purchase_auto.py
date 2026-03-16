@@ -31,6 +31,8 @@
 import asyncio
 import os
 import sys
+from dotenv import load_dotenv
+load_dotenv("/root/autosupercell/.env")
 import time
 from pathlib import Path
 from typing import Dict, Optional, Set
@@ -54,7 +56,7 @@ FUNPAY_GOLDEN_KEY = os.environ.get("FUNPAY_GOLDEN_KEY", "")
 FUNPAY_EMAIL_PASSWORD = os.environ.get("FUNPAY_EMAIL_PASSWORD", "")  # опционально
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "45"))
 OTP_WAIT_SECONDS = int(os.environ.get("OTP_WAIT_SECONDS", "240"))
-REQUEST_TIMEOUT = 620  # чуть больше таймаута сервера (600 сек)
+REQUEST_TIMEOUT = 720  # чуть больше таймаута сервера (600 сек)
 
 # ──────────────────────────── состояние ──────────────────────────────────────
 
@@ -236,14 +238,13 @@ async def process_order(client: FunPayClient, order: Dict) -> None:
 
     if result is None:
         logger.error(f"Заказ {order_id}: нет ответа от API (network error)")
-        await client.update_order_status(
-            order_id, "failed", {"error": "Нет ответа от API (сетевая ошибка)"}
-        )
-        _processed_orders.add(order_id)
+        await client.send_chat_message(order_id, "⚠️ Ошибка связи с сервером. Повторяем попытку через минуту.")
+        # Не помечаем как обработанный — повторим на следующем цикле
         return
 
     # 7. Обрабатываем результат
     success = result.get("success", False)
+    error = result.get("error") or result.get("message") or ""
     proof = {
         "message": result.get("message", ""),
         "url": result.get("url", ""),
@@ -258,12 +259,28 @@ async def process_order(client: FunPayClient, order: Dict) -> None:
     if success:
         logger.success(f"✅ Заказ {order_id} выполнен: {result.get('message', '')}")
         await client.update_order_status(order_id, "completed", proof)
+        _processed_orders.add(order_id)
     else:
-        error = result.get("error") or result.get("message") or "Неизвестная ошибка"
-        logger.error(f"❌ Заказ {order_id} провалился: {error}")
-        await client.update_order_status(order_id, "failed", {"error": error, **proof})
+        # Проверяем: ошибка неверного OTP?
+        otp_error_keywords = ("invalid code", "неверный код", "code expired", "wrong code",
+                               "verification", "код", "истек", "повторите")
+        is_otp_error = any(kw in error.lower() for kw in otp_error_keywords)
 
-    _processed_orders.add(order_id)
+        if is_otp_error and verification_code:
+            logger.warning(f"❌ Заказ {order_id}: OTP неверный — просим новый код у покупателя")
+            # Сбрасываем флаг ожидания чтобы на следующем цикле запросить новый код
+            _awaiting_otp.pop(order_id, None)
+            await client.send_chat_message(
+                order_id,
+                "❌ Код верификации не подошёл или устарел.\n"
+                "Пожалуйста, запросите новый код входа в Supercell и пришлите его сюда.\n"
+                "⚠️ Код действует только 5 минут — присылайте сразу после получения письма."
+            )
+            # НЕ помечаем как обработанный — будем ждать новый OTP
+        else:
+            logger.error(f"❌ Заказ {order_id} провалился: {error}")
+            await client.update_order_status(order_id, "failed", {"error": error, **proof})
+            _processed_orders.add(order_id)
 
 
 # ──────────────────────────── главный цикл ───────────────────────────────────

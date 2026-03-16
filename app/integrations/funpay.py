@@ -140,19 +140,20 @@ class FunPayClient:
             self._last_csrf_refresh = time.time()
 
     def _parse_user_info(self, html: str) -> None:
-        """Извлечь user_id и username из HTML."""
-        # user_id в атрибутах или JS
-        m = re.search(r'"userId"\s*:\s*(\d+)', html)
-        if not m:
-            m = re.search(r'data-user-id=["\'"](\d+)', html)
+        m = re.search(r'class="user-link-name"[^>]*>([^<]+)<', html)
+        if m:
+            self._username = m.group(1).strip()
+        m = re.search(r'/users/(\d+)/', html)
         if m:
             self._user_id = int(m.group(1))
-
-        m = re.search(r'"username"\s*:\s*"([^"]+)"', html)
-        if not m:
-            m = re.search(r'data-username=["\'"]([^"\']+)', html)
-        if m:
-            self._username = m.group(1)
+        if not self._user_id:
+            m = re.search(r'"userId"\s*:\s*(\d+)', html)
+            if m:
+                self._user_id = int(m.group(1))
+        if not self._username:
+            m = re.search(r'"username"\s*:\s*"([^"]+)"', html)
+            if m:
+                self._username = m.group(1)
 
     async def get_csrf_token(self) -> str:
         """Получить актуальный CSRF-токен (кеш 5 минут)."""
@@ -174,18 +175,7 @@ class FunPayClient:
             logger.error(f"FunPay whoami ошибка: {e}")
             return None
 
-    async def get_orders(self, status: str = "paid") -> List[Dict]:
-        """
-        Получить список заказов продавца.
-
-        Args:
-            status: 'paid' — оплаченные (ожидают выполнения), 'all' — все.
-
-        Returns:
-            Список словарей с полями:
-              order_id, title, buyer_name, buyer_id,
-              amount, currency, created_at, status_raw
-        """
+    async def get_orders(self, status: str = "paid") -> list:
         try:
             resp = await self._get("/orders/trade")
             if resp.status_code != 200:
@@ -195,42 +185,44 @@ class FunPayClient:
             soup = BeautifulSoup(resp.text, "html.parser")
             orders = []
 
-            # Каждый заказ — строка таблицы с классом order-row или tr[data-id]
-            rows = soup.select("tr[data-id]")
-            if not rows:
-                # Альтернативная разметка
-                rows = soup.select(".tc-item")
+            # Реальная разметка FunPay: <a class="tc-item ..." href="/orders/XXXXXXX/">
+            rows = soup.select("a.tc-item")
 
             for row in rows:
                 try:
-                    order_id = (
-                        row.get("data-id")
-                        or row.get("data-order-id")
-                        or ""
-                    )
-                    if not order_id:
+                    # order_id из href="/orders/H3U47EXF/"
+                    href = row.get("href", "")
+                    m = re.search(r"/orders/([^/]+)/", href)
+                    if not m:
+                        continue
+                    order_id = m.group(1)
+
+                    # Статус: класс строки (info=новый, warning=спор, success=выполнен)
+                    classes = " ".join(row.get("class", []))
+                    if "warning" in classes or "danger" in classes:
+                        status_text = "dispute"
+                    elif "success" in classes or "muted" in classes:
+                        status_text = "completed"
+                    else:
+                        status_text = "paid"  # info = оплачен, ожидает выполнения
+
+                    # Фильтр
+                    if status == "paid" and status_text != "paid":
                         continue
 
-                    # Статус заказа
-                    status_el = row.select_one(".tc-status, .order-status, [class*='status']")
-                    status_text = status_el.get_text(strip=True).lower() if status_el else ""
-
-                    # Фильтруем по статусу
-                    is_paid = any(w in status_text for w in ("оплач", "paid", "ожидает", "новый", "new"))
-                    if status == "paid" and not is_paid:
-                        continue
-
-                    # Название лота / товара
-                    title_el = row.select_one(".tc-desc, .order-title, [class*='desc']")
+                    # Название товара
+                    title_el = row.select_one(".tc-desc-text, .tc-desc, [class*='desc']")
                     title = title_el.get_text(strip=True) if title_el else ""
 
                     # Покупатель
-                    buyer_el = row.select_one(".tc-buyer, [class*='buyer'], .username")
+                    buyer_el = row.select_one(".tc-buyer-text, .tc-user, [class*='buyer']")
                     buyer_name = buyer_el.get_text(strip=True) if buyer_el else ""
 
                     # Сумма
-                    amount_el = row.select_one(".tc-price, .amount, [class*='price']")
-                    amount_str = amount_el.get_text(strip=True) if amount_el else "0"
+                    price_el = row.select_one(".tc-price div:last-child, [class*='price'] div")
+                    if not price_el:
+                        price_el = row.select_one(".tc-price")
+                    amount_str = price_el.get_text(strip=True) if price_el else "0"
                     amount_clean = re.sub(r"[^\d.,]", "", amount_str).replace(",", ".")
                     try:
                         amount = float(amount_clean) if amount_clean else 0.0
@@ -238,19 +230,29 @@ class FunPayClient:
                         amount = 0.0
 
                     orders.append({
-                        "order_id": str(order_id),
+                        "order_id": order_id,
                         "title": title,
                         "buyer_name": buyer_name,
                         "buyer_id": None,
                         "amount": amount,
                         "currency": "RUB",
                         "status_text": status_text,
-                        "created_at": datetime.utcnow().isoformat(),
+                        "created_at": "",
                     })
                 except Exception as row_err:
                     logger.debug(f"Ошибка парсинга строки заказа: {row_err}")
                     continue
 
+            # Дедупликация: один order_id может встречаться несколько раз
+            seen = set()
+            unique = []
+            for o in orders:
+                if o["order_id"] not in seen:
+                    seen.add(o["order_id"])
+                    unique.append(o)
+            orders = unique
+            seen = set()
+            orders = [o for o in orders if not (o["order_id"] in seen or seen.add(o["order_id"]))]
             logger.info(f"FunPay: получено {len(orders)} заказов (status={status})")
             return orders
 
@@ -389,12 +391,21 @@ class FunPayClient:
         """
         try:
             # FunPay принимает сообщения через AJAX endpoint
+            # FunPay чат: сообщения отправляются через /orders/<id>/
+            # с параметром action=chat
             data = {
+                "action": "chat",
                 "node_id": order_id,
                 "text": text,
-                "html": "0",
             }
-            resp = await self._post("/chat/add/", data=data)
+            # Пробуем несколько endpoint-ов FunPay
+            for endpoint in ["/chat/", f"/orders/{order_id}/", "/orders/trade/"]:
+                try:
+                    resp = await self._post(endpoint, data={**data, "node_id": order_id})
+                    if resp.status_code == 200:
+                        break
+                except Exception:
+                    continue
             if resp.status_code == 200:
                 result = resp.json() if resp.content else {}
                 if result.get("error") == 0 or result.get("success"):

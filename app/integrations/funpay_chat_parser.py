@@ -55,16 +55,17 @@ PRODUCT_TYPE_KEYWORDS: Dict[str, str] = {
     "гемов": "gems",
     "кристалл": "gems",
     "кристаллы": "gems",
-    "gold": "gold",
-    "золото": "gold",
-    "pass": "pass",
-    "пасс": "pass",
+    "pass royale": "pass",
     "battle pass": "pass",
     "боевой пропуск": "pass",
+    "пасс": "pass",
+    "pass": "pass",
+    "wild shards": "wild_shards",
+    "wild": "wild_shards",
     "cards": "cards",
     "карты": "cards",
-    "wild": "wild_shards",
-    "wild shards": "wild_shards",
+    "gold": "gold",
+    "золото": "gold",
 }
 
 # Нормализация количества гемов для product_name
@@ -74,11 +75,11 @@ GEM_COUNTS = [80, 170, 360, 950, 2000, 14000]
 # ─────────────────────────── вспомогательные функции ─────────────────────────
 
 _EMAIL_RE = re.compile(
-    r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
+    r"([a-zA-Z0-9][a-zA-Z0-9._%+\-]*@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})",
     re.IGNORECASE,
 )
 
-_OTP_RE = re.compile(r"\b(\d{6})\b")
+_OTP_RE = re.compile(r"\b(\d{3}\s?\d{3})\b")
 
 # Шаблоны, которые выглядят как OTP, но не являются им
 _OTP_EXCLUDE_RE = re.compile(
@@ -151,9 +152,12 @@ class FunPayChatParser:
         now = time.time()
 
         # 1. Определяем игру и товар из названия лота / описания
+        # Собираем весь доступный текст: title + description + все сообщения чата
+        all_messages_text = " ".join(m.get("text", "") for m in messages)
         source_text = " ".join([
             order.get("title", ""),
             order.get("description", ""),
+            all_messages_text,
         ]).lower()
 
         game = self._detect_game(source_text)
@@ -175,12 +179,12 @@ class FunPayChatParser:
             buyer_messages = messages
 
         # 3. Ищем последний email из сообщений покупателя
-        email = self._extract_last_email(buyer_messages)
+        email = self._extract_last_email(messages)
         if not email:
             errors.append("Email не найден в сообщениях чата")
 
         # 4. Ищем последний OTP (максимально свежий)
-        verification_code, otp_age = self._extract_last_otp(buyer_messages, now)
+        verification_code, otp_age = self._extract_last_otp(messages, now)
 
         # Предупреждение если OTP старый
         if verification_code and otp_age is not None and otp_age > 270:  # > 4.5 мин
@@ -237,13 +241,21 @@ class FunPayChatParser:
         """
         text_lower = text.lower()
 
-        # Определяем тип товара
-        product_type = "gems"  # дефолт
-        sorted_type_keys = sorted(PRODUCT_TYPE_KEYWORDS.keys(), key=len, reverse=True)
-        for keyword in sorted_type_keys:
-            if keyword in text_lower:
-                product_type = PRODUCT_TYPE_KEYWORDS[keyword]
-                break
+        # Gems имеет наивысший приоритет — проверяем явно до общего маппинга
+        # Паттерн: "80 gems", "80 гемов", "гемы", "gems"
+        gems_explicit = re.search(
+            r'(\d+)\s*(?:gem|гем|кристалл)|(?:gem|гем|кристалл)\w*\s+(\d+)', text_lower
+        )
+        if gems_explicit or any(w in text_lower for w in ("gems", "гемы", "гемов", "кристалл")):
+            product_type = "gems"
+        else:
+            # Определяем тип товара по приоритетному маппингу
+            product_type = "gems"  # дефолт
+            sorted_type_keys = sorted(PRODUCT_TYPE_KEYWORDS.keys(), key=len, reverse=True)
+            for keyword in sorted_type_keys:
+                if keyword in text_lower:
+                    product_type = PRODUCT_TYPE_KEYWORDS[keyword]
+                    break
 
         # Ищем количество (число + тип товара)
         # Паттерны: "80 gems", "170 гемов", "80гем", "80 gem"
@@ -300,6 +312,12 @@ class FunPayChatParser:
             if matches:
                 # Берём первый найденный в этом сообщении
                 candidate = matches[0].strip().lower()
+                # Убираем мусор перед email: цифры и спецсимволы в начале локальной части
+                # "28sheskinles@gmail.com" → "sheskinles@gmail.com"
+                import re as _re
+                clean = _re.search(r"[a-zA-Z][a-zA-Z0-9._%+\-]*@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", candidate)
+                if clean:
+                    candidate = clean.group(0)
                 # Фильтруем: исключаем служебные адреса
                 if not any(excl in candidate for excl in ("noreply", "no-reply", "example.com")):
                     last_email = candidate
@@ -331,11 +349,10 @@ class FunPayChatParser:
                     ts = _parse_timestamp(ts_str)
                     age = (now - ts) if ts else None
 
-                    # Отклоняем если OTP явно устарел (> 6 мин — даём небольшой запас)
-                    if age is not None and age > 360:
-                        logger.debug(f"OTP {code} слишком старый ({age:.0f} сек), пропускаем")
-                        continue
+                    # Timestamp сообщений FunPay недоступен — берём любой найденный код
+                    # (пропуск по возрасту отключён)
 
+                    code = code.replace(" ", "")  # убираем пробел: "384 718" → "384718"
                     logger.debug(f"OTP найден: {code}, возраст: {age}")
                     return code, age
 

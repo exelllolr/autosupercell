@@ -1209,13 +1209,32 @@ def _is_google_block_page(page_text: str) -> bool:
 
 
 def _parse_first_backup_code(backup_codes_str: str) -> str | None:
-    """Из строки резервных кодов (например '5519 2680' или '55192680,12345678') возвращает первый 8-значный код без пробелов."""
+    """
+    Возвращает следующий неиспользованный 8-значный backup code с ротацией.
+    Использует google_backup_codes.py для правильной ротации по списку.
+    """
     if not backup_codes_str or not backup_codes_str.strip():
         return None
-    # Убираем пробелы из всей строки, затем берём первые 8 цифр подряд
-    digits = "".join(c for c in backup_codes_str if c.isdigit())
-    if len(digits) >= 8:
-        return digits[:8]
+    try:
+        from app.core.google_backup_codes import get_next_google_backup_code, consume_google_backup_code
+        code = get_next_google_backup_code()
+        if code:
+            consume_google_backup_code()  # помечаем код как использованный
+        if code:
+            logger.info(f"Backup code получен через ротацию: {code[:4]}****")
+            return code
+    except Exception as e:
+        logger.warning(f"Ошибка ротации backup codes: {e}, fallback к первому коду")
+    # Fallback: берём первый код из списка (разделитель — запятая или пробел)
+    import re
+    codes = re.findall(r'\d{8}', backup_codes_str.replace(" ", "").replace(",", ""))
+    if not codes:
+        # Пробуем с пробелами внутри кода: "9382 2170" → "93822170"
+        codes = re.findall(r'\d[\d ]{6}\d', backup_codes_str)
+        codes = ["".join(c.split()) for c in codes]
+    if codes:
+        logger.info(f"Backup code (fallback): {codes[0][:4]}****")
+        return codes[0]
     return None
 
 
