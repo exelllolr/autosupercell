@@ -157,6 +157,7 @@ class Settings(BaseSettings):
 
     FUNPAY_API_KEY: str = ""
     FUNPAY_API_URL: str = "https://funpay.com/api"
+    FUNPAY_GOLDEN_KEY: str = "zqmcmol9xdj12ko0geewx707o2kqowdt"   # golden_key из cookie funpay.com
 
     AVITO_API_KEY: str = ""
     AVITO_API_URL: str = "https://api.avito.ru"
