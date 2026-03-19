@@ -17,7 +17,7 @@ import json
 import time
 import random
 import string
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 from html import unescape
 
 import httpx
@@ -410,15 +410,13 @@ class FunPayClient:
             logger.error(f"Ошибка get_order_detail {order_id}: {e}")
             return None
 
+    # Лимит FunPay: "Слишком много строк" при большом числе переносов в одном сообщении
+    MAX_LINES_PER_MESSAGE = 12
+
     async def send_chat_message(self, order_id: str, text: str) -> bool:
         """
         Отправить сообщение в чат заказа.
-
-        Node — строка "users-<seller_id>-<buyer_id>" (data-name со страницы заказа).
-        Числовой data-id для отправки не подходит — только для чтения чата.
-        Формат objects для отправки:
-            [{"type":"chat_message","id":"users-X-Y","tag":"<hex8>",
-              "data":{"node":"users-X-Y","last_message":<id>,"content":"текст"}}]
+        Длинный текст автоматически разбивается на части (лимит строк на сообщение — FunPay).
         """
         await self._ensure_session()
 
@@ -451,76 +449,69 @@ class FunPayClient:
 
         order_referer = f"{FUNPAY_BASE}/orders/{order_id}/"
 
-        # Формат LIMBODS FunPayAPI (GitHub): request — объект {"action": "chat_message", "data": {...}},
-        # objects — один chat_node с пустым content. Без этого сервер не принимает сообщение.
-        # Символ ⁤ (U+2064) — маркер сообщения от бота, как в официальной библиотеке.
-        _BOT_CHAR = "\u2064"
-        content_with_marker = f"{_BOT_CHAR}{text}" if text else ""
+        # FunPay возвращает "Слишком много строк" при большом числе \n — разбиваем на части
+        lines = text.split("\n") if text else [""]
+        chunks: List[str] = []
+        for i in range(0, len(lines), self.MAX_LINES_PER_MESSAGE):
+            chunk = "\n".join(lines[i : i + self.MAX_LINES_PER_MESSAGE])
+            if chunk or not chunks:
+                chunks.append(chunk or " ")
+        if not chunks:
+            chunks = [" "]
 
-        objects = [
-            {
-                "type": "chat_node",
-                "id": node,
-                "tag": _tag(),
-                "data": {"node": node, "last_message": last_message, "content": ""},
+        _BOT_CHAR = "\u2064"
+        last_msg = last_message
+
+        async def _send_one(content: str) -> Tuple[bool, int]:
+            """Отправить одну часть. Возвращает (успех, новый last_message или -1)."""
+            content_with_marker = f"{_BOT_CHAR}{content}" if content else _BOT_CHAR
+            objects = [
+                {
+                    "type": "chat_node",
+                    "id": node,
+                    "tag": _tag(),
+                    "data": {"node": node, "last_message": last_msg, "content": ""},
+                }
+            ]
+            request_payload = {
+                "action": "chat_message",
+                "data": {
+                    "node": node,
+                    "last_message": last_msg,
+                    "content": content_with_marker,
+                },
             }
-        ]
-        request_payload: Dict = {
-            "action": "chat_message",
-            "data": {
-                "node": node,
-                "last_message": last_message,
-                "content": content_with_marker,
-            },
-        }
+            resp = await self._post_runner(
+                objects, referer=order_referer, request_value=request_payload
+            )
+            if resp.status_code != 200:
+                return False, last_msg
+            data = resp.json()
+            resp_obj = data.get("response")
+            if resp_obj is None or resp_obj.get("error") is not None:
+                return False, last_msg
+            new_id = last_msg
+            try:
+                objs = data.get("objects", [])
+                if objs and objs[0].get("data", {}).get("messages"):
+                    raw = objs[0]["data"]["messages"][-1].get("id", last_msg)
+                    new_id = int(raw) if raw is not None else last_msg
+            except (IndexError, KeyError, TypeError, ValueError):
+                pass
+            return True, new_id
 
         try:
-            resp = await self._post_runner(
-                objects,
-                referer=order_referer,
-                request_value=request_payload,
-            )
-            logger.debug(
-                f"Заказ {order_id}: runner (action=chat_message) → HTTP {resp.status_code}"
-            )
-
-            if resp.status_code != 200:
-                logger.error(
-                    f"Заказ {order_id}: /runner/ HTTP {resp.status_code} | {resp.text[:500]}"
-                )
-                if resp.status_code in (403, 419) or "csrf" in resp.text.lower():
-                    self._last_csrf_refresh = 0
-                    await self._init_session()
-                    resp = await self._post_runner(
-                        objects, referer=order_referer, request_value=request_payload
+            for i, chunk in enumerate(chunks):
+                ok, last_msg = await _send_one(chunk)
+                if not ok:
+                    logger.warning(
+                        f"Заказ {order_id}: не удалось отправить часть сообщения (часть {i + 1}/{len(chunks)})"
                     )
-                    if resp.status_code != 200:
-                        return False
-                else:
                     return False
-
-            try:
-                data = resp.json()
-                # Успех по формату FunPayAPI: есть response и нет error
-                resp_obj = data.get("response")
-                if resp_obj is not None and resp_obj.get("error") is None:
-                    # Сообщение может вернуться в objects[0].data.messages
-                    objs = data.get("objects", [])
-                    if objs and objs[0].get("data", {}).get("messages"):
-                        logger.info(f"✅ Сообщение отправлено в {order_id}")
-                        return True
-                    logger.info(f"✅ Сообщение отправлено в {order_id} (response OK)")
-                    return True
-                err = resp_obj.get("error") if isinstance(resp_obj, dict) else None
-                logger.warning(
-                    f"Заказ {order_id}: сообщение не принято. response={resp_obj}, error={err}. "
-                    f"Ответ: {str(data)[:500]}"
-                )
-            except Exception:
-                logger.warning(
-                    f"Заказ {order_id}: ответ не JSON. Текст: {resp.text[:400]}"
-                )
-            return False
+                if len(chunks) > 1 and i < len(chunks) - 1:
+                    await asyncio.sleep(0.5)
+            logger.info(f"✅ Сообщение отправлено в {order_id}" + (f" ({len(chunks)} част.)" if len(chunks) > 1 else ""))
+            return True
 
         except Exception as e:
             logger.error(f"Ошибка send_chat_message {order_id}: {e}")
