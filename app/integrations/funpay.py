@@ -446,16 +446,19 @@ class FunPayClient:
 
         order_referer = f"{FUNPAY_BASE}/orders/{order_id}/"
 
-        msg_obj = {
-            "type": "chat_message",
-            "id": node,
-            "tag": _tag(),
-            "data": {
-                "node": node,
+        def _make_msg_obj(chat_id: str, use_content: bool = True) -> dict:
+            data: Dict = {
+                "node": chat_id,
                 "last_message": last_message,
-                "content": text,
-            },
-        }
+            }
+            if use_content:
+                data["content"] = text
+            return {
+                "type": "chat_message",
+                "id": chat_id,
+                "tag": _tag(),
+                "data": data,
+            }
 
         def _check_success(resp: httpx.Response) -> bool:
             if resp.status_code != 200:
@@ -470,8 +473,7 @@ class FunPayClient:
                 return False
 
         try:
-            # Вариант: два запроса подряд — сначала chat_node (открыть чат), затем chat_message.
-            # Возможно, сервер принимает сообщение только после недавнего запроса chat_node.
+            # 1) Запрос chat_node — получаем числовой node.id из ответа (243006139)
             node_obj = [
                 {
                     "type": "chat_node",
@@ -484,36 +486,49 @@ class FunPayClient:
                 node_obj, referer=order_referer, request_value="false"
             )
             logger.debug(
-                f"Заказ {order_id}: запрос chat_node → HTTP {resp_node.status_code}"
-            )
-            await asyncio.sleep(0.5)
-
-            resp = await self._post_runner(
-                [msg_obj], referer=order_referer, request_value="false"
-            )
-            logger.debug(
-                f"/runner/ chat_message HTTP {resp.status_code} | ответ: {resp.text[:250]}"
+                f"Заказ {order_id}: chat_node → HTTP {resp_node.status_code}"
             )
 
-            if resp.status_code != 200:
-                logger.error(
-                    f"Заказ {order_id}: /runner/ HTTP {resp.status_code} | {resp.text[:500]}"
-                )
-                if resp.status_code in (403, 419) or "csrf" in resp.text.lower():
-                    self._last_csrf_refresh = 0
-                    await self._init_session()
-                    await asyncio.sleep(0.3)
+            node_id_for_send: Optional[str] = None
+            if resp_node.status_code == 200:
+                try:
+                    j = resp_node.json()
+                    for obj in j.get("objects", []):
+                        if obj.get("type") == "chat_node":
+                            nd = obj.get("data", {}).get("node")
+                            if isinstance(nd, dict) and nd.get("id") is not None:
+                                node_id_for_send = str(nd["id"])
+                                logger.debug(
+                                    f"Заказ {order_id}: числовой node.id={node_id_for_send}"
+                                )
+                                break
+                except Exception:
+                    pass
+
+            await asyncio.sleep(0.3)
+
+            # 2) Отправка сообщения — пробуем строковый node и числовой id, request false и true
+            for req_val in ("false", "true"):
+                for chat_id in (
+                    [node_id_for_send] if node_id_for_send else []
+                ) + [node]:
+                    msg_obj = _make_msg_obj(chat_id)
                     resp = await self._post_runner(
-                        [msg_obj], referer=order_referer, request_value="false"
+                        [msg_obj], referer=order_referer, request_value=req_val
+                    )
+                    logger.debug(
+                        f"Заказ {order_id}: chat_message id={chat_id} request={req_val} → HTTP {resp.status_code}"
                     )
                     if resp.status_code == 200 and _check_success(resp):
                         logger.info(f"✅ Сообщение отправлено в {order_id}")
                         return True
-                return False
-
-            if _check_success(resp):
-                logger.info(f"✅ Сообщение отправлено в {order_id}")
-                return True
+                    if resp.status_code != 200 and resp.status_code in (
+                        403,
+                        419,
+                    ):
+                        self._last_csrf_refresh = 0
+                        await self._init_session()
+                        break
 
             try:
                 data = resp.json()
@@ -523,7 +538,7 @@ class FunPayClient:
                     f"Заказ {order_id}: сообщение не принято. "
                     f"response={data.get('response')}, error={data.get('error')}, "
                     f"objects={len(objs)} шт, types={types}. "
-                    f"Ответ (сокращённо): {str(data)[:600]}"
+                    f"Ответ: {str(data)[:500]}"
                 )
             except Exception:
                 logger.warning(
