@@ -489,49 +489,54 @@ class FunPayClient:
                 return False
 
         try:
-            # Сначала с chat_node + chat_message в одном запросе
-            resp = await _do_send(include_chat_node=True)
-            logger.debug(
-                f"/runner/ HTTP {resp.status_code} | node={node} | "
-                f"ответ: {resp.text[:300]}"
-            )
-
-            if resp.status_code != 200:
-                logger.error(
-                    f"Заказ {order_id}: /runner/ HTTP {resp.status_code} | "
-                    f"ответ: {resp.text[:500]}"
+            # Сначала только chat_message (один объект). При [chat_node, chat_message] сервер
+            # возвращает только chat_node и не отправляет сообщение.
+            for request_val in ("false", "true"):
+                resp = await _do_send(
+                    include_chat_node=False, request_val=request_val
                 )
-                if resp.status_code in (403, 419) or "csrf" in resp.text.lower():
-                    logger.info(f"Заказ {order_id}: обновляем сессию и повторяем отправку")
-                    self._last_csrf_refresh = 0
-                    await self._init_session()
-                    resp = await _do_send(include_chat_node=True)
-                    if resp.status_code != 200:
-                        logger.error(f"Заказ {order_id}: повторный /runner/ HTTP {resp.status_code}")
-                        return False
-                else:
-                    return False
+                logger.debug(
+                    f"/runner/ HTTP {resp.status_code} | node={node} | request={request_val} | "
+                    f"ответ: {resp.text[:300]}"
+                )
 
-            if _check_success(resp):
-                logger.info(f"✅ Сообщение отправлено в {order_id}")
-                return True
-
-            # Пустой objects — пробуем только chat_message без chat_node, затем с request=true
-            try:
-                data = resp.json()
-                if not data.get("objects") and data.get("response") is False:
-                    for req_val in ("false", "true"):
-                        logger.debug(
-                            f"Заказ {order_id}: повтор — только chat_message, request={req_val}"
+                if resp.status_code != 200:
+                    logger.error(
+                        f"Заказ {order_id}: /runner/ HTTP {resp.status_code} | "
+                        f"ответ: {resp.text[:500]}"
+                    )
+                    if resp.status_code in (403, 419) or "csrf" in resp.text.lower():
+                        logger.info(f"Заказ {order_id}: обновляем сессию и повторяем")
+                        self._last_csrf_refresh = 0
+                        await self._init_session()
+                        resp = await _do_send(
+                            include_chat_node=False, request_val=request_val
                         )
-                        resp2 = await _do_send(
-                            include_chat_node=False, request_val=req_val
-                        )
-                        if _check_success(resp2):
+                        if resp.status_code == 200 and _check_success(resp):
                             logger.info(f"✅ Сообщение отправлено в {order_id}")
                             return True
-            except Exception:
-                pass
+                    continue
+                if _check_success(resp):
+                    logger.info(f"✅ Сообщение отправлено в {order_id}")
+                    return True
+                # В objects вернулся chat_node или пусто — пробуем другой request
+                try:
+                    data = resp.json()
+                    objs = data.get("objects", [])
+                    if objs and all(o.get("type") != "chat_message" for o in objs):
+                        logger.debug(
+                            f"Заказ {order_id}: в ответе только {[o.get('type') for o in objs]}, "
+                            f"пробуем request={('true' if request_val == 'false' else 'chat_node+msg')}"
+                        )
+                except Exception:
+                    pass
+
+            # Последняя попытка: chat_node + chat_message в одном запросе
+            logger.debug(f"Заказ {order_id}: последняя попытка — chat_node + chat_message")
+            resp = await _do_send(include_chat_node=True, request_val="false")
+            if resp.status_code == 200 and _check_success(resp):
+                logger.info(f"✅ Сообщение отправлено в {order_id}")
+                return True
 
             try:
                 data = resp.json()
