@@ -1,17 +1,13 @@
 """
 Интеграция с FunPay через golden_key (неофициальный API).
 
-Основано на реверс-инжиниринге FunPayCardinal/FunPayAPI (sidor0912):
-  - CSRF получается через POST /runner/ с init-запросом (НЕ с главной страницы)
-  - Сообщения отправляются через POST /runner/ с form-urlencoded телом
-  - objects — JSON-строка внутри form-поля
+CSRF-токен хранится в атрибуте тега <body>:
+    data-app-data="{...,"csrf-token":"TOKEN",...}"
 
-Реализует:
-  - get_orders()          — список новых заказов продавца
-  - get_chat_messages()   — сообщения чата по order_id
-  - send_chat_message()   — ответ покупателю в чат заказа
-  - confirm_order()       — подтвердить выдачу заказа
-  - update_order_status() — обновить статус (completed / failed)
+Сообщения отправляются через POST /runner/ с form-urlencoded телом:
+    objects=[{"type":"chat_message","id":"<node>","tag":"<hex8>","data":{...}}]
+    &request=false
+    &csrf_token=TOKEN
 """
 
 import re
@@ -20,6 +16,7 @@ import time
 import random
 import string
 from typing import Dict, List, Optional
+from html import unescape
 
 import httpx
 from bs4 import BeautifulSoup
@@ -30,19 +27,10 @@ FUNPAY_BASE = "https://funpay.com"
 
 
 def _random_tag() -> str:
-    """Генерирует случайный 8-символьный hex-тег (как в оригинальной FunPayAPI)."""
     return "".join(random.choices(string.digits + "abcdef", k=8))
 
 
 class FunPayClient:
-    """
-    Клиент FunPay на основе golden_key cookie.
-
-    Ключевое отличие от предыдущих версий:
-    CSRF-токен получается через POST /runner/ с init payload,
-    а НЕ парсингом главной страницы. Именно так работает
-    официальная библиотека FunPayAPI (FunPayCardinal).
-    """
 
     def __init__(self, golden_key: str):
         if not golden_key:
@@ -71,7 +59,7 @@ class FunPayClient:
             },
         )
 
-    # ─────────────────────────── cookies / session ────────────────────────────
+    # ──────────────────────────── cookies / http ──────────────────────────────
 
     def _cookies(self) -> Dict[str, str]:
         c = {"golden_key": self.golden_key}
@@ -83,13 +71,7 @@ class FunPayClient:
         return await self._client.get(path, cookies=self._cookies(), **kwargs)
 
     async def _post_runner(self, objects: list) -> httpx.Response:
-        """
-        POST /runner/ — основной транспорт FunPay.
-
-        Content-Type: application/x-www-form-urlencoded
-        Поле objects содержит JSON-список как строку.
-        Поле csrf_token — текущий CSRF.
-        """
+        """POST /runner/ с form-urlencoded телом — основной транспорт FunPay."""
         payload = {
             "objects": json.dumps(objects, ensure_ascii=False),
             "request": "false",
@@ -108,126 +90,79 @@ class FunPayClient:
             headers=headers,
         )
 
-    # ─────────────────────────── инициализация ───────────────────────────────
+    # ──────────────────────────── инициализация ───────────────────────────────
 
     async def _init_session(self) -> None:
         """
-        Инициализация сессии — получение PHPSESSID и CSRF.
-
-        Шаг 1: GET / — получаем PHPSESSID из Set-Cookie.
-        Шаг 2: Парсим HTML главной страницы для user_id и username.
-        Шаг 3: POST /runner/ с init payload — FunPay возвращает csrf_token
-                в ответе. Именно так работает FunPayCardinal.
+        GET / → парсим data-app-data атрибут тега <body>:
+            <body data-app-data="{&quot;csrf-token&quot;:&quot;TOKEN&quot;,...}">
+        Именно там FunPay хранит CSRF-токен и userId.
         """
+        resp = await self._get("/")
+        resp.raise_for_status()
+
+        # PHPSESSID из Set-Cookie
+        for name, value in resp.cookies.items():
+            if name.upper() == "PHPSESSID":
+                self._phpsessid = value
+                break
+
+        html = resp.text
+        self._parse_app_data(html)
+        self._initiated = True
+        logger.debug(
+            f"FunPay init: user_id={self._user_id}, username={self._username}, "
+            f"csrf={self._csrf_token[:10] + '...' if self._csrf_token else 'MISSING'}"
+        )
+
+    def _parse_app_data(self, html: str) -> None:
+        """
+        Парсим data-app-data из <body>:
+            <body data-app-data="{&quot;locale&quot;:&quot;ru&quot;,
+                &quot;csrf-token&quot;:&quot;vndvuh8kvbm1bdnv&quot;,
+                &quot;userId&quot;:19036470,...}">
+        """
+        # Шаг 1: извлекаем строку атрибута
+        m = re.search(r'<body[^>]+data-app-data=["\']([^"\']+)["\']', html)
+        if not m:
+            logger.error("data-app-data не найден в <body> — невозможно получить CSRF")
+            return
+
+        # Шаг 2: раскодируем HTML-entities (&quot; → ")
+        raw = unescape(m.group(1))
+
+        # Шаг 3: парсим JSON
         try:
-            # Шаг 1: получаем PHPSESSID
-            resp = await self._get("/")
-            resp.raise_for_status()
-
-            for name, value in resp.cookies.items():
-                if name.upper() == "PHPSESSID":
-                    self._phpsessid = value
-                    break
-
-            # Парсим user_id и username с главной
-            self._parse_user_info(resp.text)
-
-            # Шаг 2: Получаем CSRF через /runner/ init-запрос
-            # Это точная копия того, что делает FunPayAPI при Account.get()
-            init_objects = [
-                {
-                    "type": "orders_counters",
-                    "id": str(self._user_id) if self._user_id else "0",
-                    "tag": _random_tag(),
-                    "data": False,
-                }
-            ]
-            payload = {
-                "objects": json.dumps(init_objects, ensure_ascii=False),
-                "request": "false",
-                "csrf_token": "",  # пустой при первом запросе
-            }
-            headers = {
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "X-Requested-With": "XMLHttpRequest",
-                "Accept": "*/*",
-                "Referer": FUNPAY_BASE + "/",
-            }
-            runner_resp = await self._client.post(
-                "/runner/",
-                data=payload,
-                cookies=self._cookies(),
-                headers=headers,
-            )
-
-            if runner_resp.status_code == 200 and runner_resp.content:
-                try:
-                    data = runner_resp.json()
-                    # FunPay возвращает csrf_token в корне ответа
-                    csrf = data.get("csrf_token") or data.get("csrfToken") or ""
-                    if csrf:
-                        self._csrf_token = csrf
-                        self._last_csrf_refresh = time.time()
-                        logger.debug(f"CSRF получен через /runner/ init: {csrf[:10]}...")
-                    else:
-                        logger.warning(f"csrf_token не найден в ответе /runner/: {str(data)[:200]}")
-                        # Fallback: пробуем достать CSRF из HTML главной страницы
-                        self._parse_csrf_from_html(resp.text)
-                except Exception as e:
-                    logger.warning(f"Ошибка парсинга ответа /runner/ init: {e}")
-                    self._parse_csrf_from_html(resp.text)
-            else:
-                logger.warning(f"/runner/ init HTTP {runner_resp.status_code}, пробуем HTML fallback")
-                self._parse_csrf_from_html(resp.text)
-
-            self._initiated = True
-            logger.debug(
-                f"FunPay init: user_id={self._user_id}, username={self._username}, "
-                f"csrf={'OK' if self._csrf_token else 'MISSING'}"
-            )
-
+            data = json.loads(raw)
         except Exception as e:
-            logger.error(f"Ошибка инициализации сессии FunPay: {e}")
-            raise
+            logger.error(f"Ошибка парсинга data-app-data JSON: {e} | raw={raw[:200]}")
+            return
 
-    def _parse_csrf_from_html(self, html: str) -> None:
-        """Fallback: поиск CSRF в HTML (7 паттернов)."""
-        patterns = [
-            r'app\.Csrf\s*=\s*["\']([a-f0-9]+)["\']',
-            r'"csrf_token"\s*:\s*"([a-f0-9]+)"',
-            r'"csrf"\s*:\s*"([a-f0-9]+)"',
-            r'window\.csrfToken\s*=\s*["\']([a-f0-9]+)["\']',
-            r'csrf_token\s*=\s*["\']([a-f0-9]+)["\']',
-            r'data-csrf=["\']([a-f0-9]+)["\']',
-            r'<meta\s+name=["\']csrf-token["\'][^>]*content=["\']([\w\-]+)',
-        ]
-        for pattern in patterns:
-            m = re.search(pattern, html, re.IGNORECASE)
-            if m:
-                self._csrf_token = m.group(1)
-                self._last_csrf_refresh = time.time()
-                logger.debug(f"CSRF (HTML fallback): {self._csrf_token[:10]}...")
-                return
-        logger.warning("CSRF не найден ни в /runner/ ответе, ни в HTML")
+        # Шаг 4: достаём нужные поля
+        csrf = data.get("csrf-token") or data.get("csrf_token") or data.get("csrfToken") or ""
+        user_id = data.get("userId") or data.get("user_id")
 
-    def _parse_user_info(self, html: str) -> None:
-        for p in [r'/users/(\d+)/', r'"userId"\s*:\s*(\d+)', r'app\.UserId\s*=\s*(\d+)']:
-            m = re.search(p, html)
-            if m:
-                self._user_id = int(m.group(1))
-                break
-        for p in [r'class="user-link-name"[^>]*>([^<]+)<', r'"username"\s*:\s*"([^"]+)"']:
-            m = re.search(p, html)
-            if m:
-                self._username = m.group(1).strip()
-                break
+        if csrf:
+            self._csrf_token = str(csrf)
+            self._last_csrf_refresh = time.time()
+            logger.debug(f"CSRF из data-app-data: {self._csrf_token[:10]}...")
+        else:
+            logger.error(f"csrf-token не найден в data-app-data: {data}")
+
+        if user_id:
+            self._user_id = int(user_id)
+
+        # username — парсим отдельно из HTML
+        m2 = re.search(r'class="user-link-name"[^>]*>([^<]+)<', html)
+        if m2:
+            self._username = m2.group(1).strip()
 
     async def _ensure_session(self) -> None:
         """Инициализировать или обновить сессию (кеш 5 минут)."""
         if not self._initiated or (time.time() - self._last_csrf_refresh) > 300:
             await self._init_session()
 
-    # ─────────────────────────── публичные методы ────────────────────────────
+    # ──────────────────────────── публичные методы ───────────────────────────
 
     async def whoami(self) -> Optional[Dict]:
         try:
@@ -275,8 +210,10 @@ class FunPayClient:
                     buyer_el = row.select_one(".tc-buyer-text, .tc-user, [class*='buyer']")
                     buyer_name = buyer_el.get_text(strip=True) if buyer_el else ""
 
-                    price_el = row.select_one(".tc-price div:last-child, [class*='price'] div") \
-                                or row.select_one(".tc-price")
+                    price_el = (
+                        row.select_one(".tc-price div:last-child, [class*='price'] div")
+                        or row.select_one(".tc-price")
+                    )
                     amount_str = price_el.get_text(strip=True) if price_el else "0"
                     amount_clean = re.sub(r"[^\d.,]", "", amount_str).replace(",", ".")
                     try:
@@ -318,7 +255,6 @@ class FunPayClient:
 
             soup = BeautifulSoup(resp.text, "html.parser")
             messages = []
-
             msg_els = soup.select(".message-item, .chat-message, .msg-item")
             if not msg_els:
                 msg_els = soup.select("[class*='message'][class*='item']")
@@ -357,14 +293,16 @@ class FunPayClient:
             resp = await self._get(f"/orders/{order_id}/")
             if resp.status_code != 200:
                 return None
-
             soup = BeautifulSoup(resp.text, "html.parser")
-            title_el = soup.select_one("h1.page-title") or soup.select_one(".order-title") or soup.select_one("h1")
+            title_el = (
+                soup.select_one("h1.page-title")
+                or soup.select_one(".order-title")
+                or soup.select_one("h1")
+            )
             title = title_el.get_text(strip=True) if title_el else ""
             buyer_el = soup.select_one(".buyer-username, [class*='buyer'] .username")
             buyer = buyer_el.get_text(strip=True) if buyer_el else ""
             messages = await self.get_chat_messages(order_id)
-
             return {
                 "order_id": order_id,
                 "title": title,
@@ -386,7 +324,21 @@ class FunPayClient:
             resp = await self._get(f"/orders/{order_id}/")
             if resp.status_code != 200:
                 return None
+
+            # Проверяем data-app-data на странице заказа — там тоже есть node
             html = resp.text
+            m = re.search(r'<body[^>]+data-app-data=["\']([^"\']+)["\']', html)
+            if m:
+                try:
+                    data = json.loads(unescape(m.group(1)))
+                    node = data.get("node") or data.get("nodeId") or data.get("chatNode")
+                    if node:
+                        self._order_node_cache[order_id] = int(node)
+                        return int(node)
+                except Exception:
+                    pass
+
+            # Паттерны в HTML
             for pattern in [
                 r'data-node=["\'](\d+)["\']',
                 r'data-id=["\'](\d+)["\']',
@@ -395,12 +347,14 @@ class FunPayClient:
                 r'"nodeId"\s*:\s*(\d+)',
                 r'data-chat=["\'](\d+)["\']',
             ]:
-                m = re.search(pattern, html)
-                if m:
-                    node = int(m.group(1))
+                m2 = re.search(pattern, html)
+                if m2:
+                    node = int(m2.group(1))
                     self._order_node_cache[order_id] = node
                     logger.debug(f"node для заказа {order_id}: {node}")
                     return node
+
+            logger.warning(f"node не найден для заказа {order_id}")
             return None
         except Exception as e:
             logger.error(f"Ошибка получения node для {order_id}: {e}")
@@ -408,37 +362,25 @@ class FunPayClient:
 
     async def send_chat_message(self, order_id: str, text: str) -> bool:
         """
-        Отправить сообщение в чат заказа через POST /runner/.
+        Отправить сообщение в чат заказа.
 
-        Формат objects для отправки сообщения (из реверс-инжиниринга FunPayCardinal):
-            [{
-                "type": "chat_message",
-                "id": "<node_id>",
-                "tag": "<random_8_hex>",
-                "data": {
-                    "node": <node_id>,
-                    "last_message": -1,
-                    "content": "<текст>"
-                }
-            }]
+        POST /runner/ с form-urlencoded телом:
+            objects=[{"type":"chat_message","id":"<node>","tag":"<hex8>",
+                      "data":{"node":<node>,"last_message":-1,"content":"<текст>"}}]
+            &request=false
+            &csrf_token=<TOKEN>
         """
         await self._ensure_session()
 
         if not self._csrf_token:
-            logger.error(f"Заказ {order_id}: CSRF токен отсутствует, невозможно отправить сообщение")
+            logger.error(f"Заказ {order_id}: CSRF отсутствует")
             return False
 
         node = await self._get_node_for_order(order_id)
-
         if node is None:
-            logger.warning(f"Заказ {order_id}: node не найден, пробуем отправку без node")
-            # Пробуем использовать order_id напрямую как строку-идентификатор
-            return await self._send_without_node(order_id, text)
+            logger.error(f"Заказ {order_id}: node не найден, отправка невозможна")
+            return False
 
-        return await self._send_with_node(node, order_id, text)
-
-    async def _send_with_node(self, node: int, order_id: str, text: str) -> bool:
-        """Отправка сообщения с известным числовым node."""
         try:
             objects = [
                 {
@@ -454,13 +396,17 @@ class FunPayClient:
             ]
 
             resp = await self._post_runner(objects)
-            logger.debug(f"/runner/ (node={node}) HTTP {resp.status_code}: {resp.text[:300]}")
+            logger.debug(
+                f"/runner/ HTTP {resp.status_code} | node={node} | "
+                f"ответ: {resp.text[:300]}"
+            )
 
             if resp.status_code != 200:
+                logger.error(f"Заказ {order_id}: /runner/ HTTP {resp.status_code}")
                 return False
 
             if not resp.text.strip():
-                logger.info(f"Сообщение отправлено в заказ {order_id} (пустой ответ = успех)")
+                logger.info(f"✅ Сообщение отправлено в заказ {order_id} (пустой ответ = OK)")
                 return True
 
             try:
@@ -471,55 +417,26 @@ class FunPayClient:
                     self._csrf_token = new_csrf
                     self._last_csrf_refresh = time.time()
 
-                objs = data.get("objects", [])
-                for obj in objs:
-                    if obj.get("type") == "chat_message" and obj.get("data"):
-                        logger.info(f"✅ Сообщение отправлено в заказ {order_id} via /runner/")
+                # Успех: в objects есть наш chat_message
+                for obj in data.get("objects", []):
+                    if obj.get("type") == "chat_message":
+                        logger.info(f"✅ Сообщение отправлено в заказ {order_id}")
                         return True
 
-                # Нет ошибки — считаем успехом
-                if not data.get("error"):
-                    logger.info(f"✅ Сообщение отправлено в заказ {order_id} via /runner/ (ответ: {str(objs)[:100]})")
+                # response=false но без ошибки — тоже успех (FunPay так работает)
+                if data.get("response") is False and not data.get("error"):
+                    logger.info(f"✅ Сообщение отправлено в заказ {order_id} (response=false = OK)")
                     return True
 
-                logger.warning(f"/runner/ вернул ошибку: {data}")
+                logger.warning(f"Заказ {order_id}: неожиданный ответ /runner/: {data}")
                 return False
 
             except Exception:
-                logger.info(f"✅ Сообщение отправлено в заказ {order_id} (не-JSON ответ 200)")
+                logger.info(f"✅ Сообщение отправлено в заказ {order_id} (не-JSON 200)")
                 return True
 
         except Exception as e:
-            logger.error(f"Ошибка _send_with_node для {order_id}: {e}")
-            return False
-
-    async def _send_without_node(self, order_id: str, text: str) -> bool:
-        """
-        Отправка если node не найден — пробуем chat_node тип
-        (FunPayCardinal использует этот тип для получения чата).
-        """
-        try:
-            objects = [
-                {
-                    "type": "chat_message",
-                    "id": order_id,
-                    "tag": _random_tag(),
-                    "data": {
-                        "node": order_id,
-                        "last_message": -1,
-                        "content": text,
-                    },
-                }
-            ]
-            resp = await self._post_runner(objects)
-            logger.debug(f"/runner/ (no node) HTTP {resp.status_code}: {resp.text[:200]}")
-
-            if resp.status_code == 200:
-                logger.info(f"Сообщение отправлено в заказ {order_id} (без node)")
-                return True
-            return False
-        except Exception as e:
-            logger.error(f"Ошибка _send_without_node: {e}")
+            logger.error(f"Ошибка send_chat_message {order_id}: {e}")
             return False
 
     async def confirm_order(self, order_id: str) -> bool:
