@@ -11,6 +11,7 @@
       &request=false&csrf_token=TOKEN
 """
 
+import asyncio
 import re
 import json
 import time
@@ -445,36 +446,16 @@ class FunPayClient:
 
         order_referer = f"{FUNPAY_BASE}/orders/{order_id}/"
 
-        async def _do_send(
-            include_chat_node: bool = True, request_val: str = "false"
-        ) -> httpx.Response:
-            # Вариант 1: в одном запросе сначала chat_node (открыть чат), затем chat_message.
-            msg_obj = {
-                "type": "chat_message",
-                "id": node,
-                "tag": _tag(),
-                "data": {
-                    "node": node,
-                    "last_message": last_message,
-                    "content": text,
-                },
-            }
-            if include_chat_node:
-                objects = [
-                    {
-                        "type": "chat_node",
-                        "id": node,
-                        "tag": _tag(),
-                        "data": False,
-                    },
-                    msg_obj,
-                ]
-            else:
-                objects = [msg_obj]
-            logger.debug(f"runner payload: request={request_val}, objects={objects}")
-            return await self._post_runner(
-                objects, referer=order_referer, request_value=request_val
-            )
+        msg_obj = {
+            "type": "chat_message",
+            "id": node,
+            "tag": _tag(),
+            "data": {
+                "node": node,
+                "last_message": last_message,
+                "content": text,
+            },
+        }
 
         def _check_success(resp: httpx.Response) -> bool:
             if resp.status_code != 200:
@@ -489,65 +470,64 @@ class FunPayClient:
                 return False
 
         try:
-            # Сначала только chat_message (один объект). При [chat_node, chat_message] сервер
-            # возвращает только chat_node и не отправляет сообщение.
-            for request_val in ("false", "true"):
-                resp = await _do_send(
-                    include_chat_node=False, request_val=request_val
-                )
-                logger.debug(
-                    f"/runner/ HTTP {resp.status_code} | node={node} | request={request_val} | "
-                    f"ответ: {resp.text[:300]}"
-                )
+            # Вариант: два запроса подряд — сначала chat_node (открыть чат), затем chat_message.
+            # Возможно, сервер принимает сообщение только после недавнего запроса chat_node.
+            node_obj = [
+                {
+                    "type": "chat_node",
+                    "id": node,
+                    "tag": _tag(),
+                    "data": False,
+                }
+            ]
+            resp_node = await self._post_runner(
+                node_obj, referer=order_referer, request_value="false"
+            )
+            logger.debug(
+                f"Заказ {order_id}: запрос chat_node → HTTP {resp_node.status_code}"
+            )
+            await asyncio.sleep(0.5)
 
-                if resp.status_code != 200:
-                    logger.error(
-                        f"Заказ {order_id}: /runner/ HTTP {resp.status_code} | "
-                        f"ответ: {resp.text[:500]}"
+            resp = await self._post_runner(
+                [msg_obj], referer=order_referer, request_value="false"
+            )
+            logger.debug(
+                f"/runner/ chat_message HTTP {resp.status_code} | ответ: {resp.text[:250]}"
+            )
+
+            if resp.status_code != 200:
+                logger.error(
+                    f"Заказ {order_id}: /runner/ HTTP {resp.status_code} | {resp.text[:500]}"
+                )
+                if resp.status_code in (403, 419) or "csrf" in resp.text.lower():
+                    self._last_csrf_refresh = 0
+                    await self._init_session()
+                    await asyncio.sleep(0.3)
+                    resp = await self._post_runner(
+                        [msg_obj], referer=order_referer, request_value="false"
                     )
-                    if resp.status_code in (403, 419) or "csrf" in resp.text.lower():
-                        logger.info(f"Заказ {order_id}: обновляем сессию и повторяем")
-                        self._last_csrf_refresh = 0
-                        await self._init_session()
-                        resp = await _do_send(
-                            include_chat_node=False, request_val=request_val
-                        )
-                        if resp.status_code == 200 and _check_success(resp):
-                            logger.info(f"✅ Сообщение отправлено в {order_id}")
-                            return True
-                    continue
-                if _check_success(resp):
-                    logger.info(f"✅ Сообщение отправлено в {order_id}")
-                    return True
-                # В objects вернулся chat_node или пусто — пробуем другой request
-                try:
-                    data = resp.json()
-                    objs = data.get("objects", [])
-                    if objs and all(o.get("type") != "chat_message" for o in objs):
-                        logger.debug(
-                            f"Заказ {order_id}: в ответе только {[o.get('type') for o in objs]}, "
-                            f"пробуем request={('true' if request_val == 'false' else 'chat_node+msg')}"
-                        )
-                except Exception:
-                    pass
+                    if resp.status_code == 200 and _check_success(resp):
+                        logger.info(f"✅ Сообщение отправлено в {order_id}")
+                        return True
+                return False
 
-            # Последняя попытка: chat_node + chat_message в одном запросе
-            logger.debug(f"Заказ {order_id}: последняя попытка — chat_node + chat_message")
-            resp = await _do_send(include_chat_node=True, request_val="false")
-            if resp.status_code == 200 and _check_success(resp):
+            if _check_success(resp):
                 logger.info(f"✅ Сообщение отправлено в {order_id}")
                 return True
 
             try:
                 data = resp.json()
+                objs = data.get("objects", [])
+                types = [o.get("type") for o in objs]
                 logger.warning(
-                    f"Заказ {order_id}: сообщение не принято сервером. "
-                    f"Ответ runner: response={data.get('response')}, error={data.get('error')}, "
-                    f"objects={len(data.get('objects', []))} шт. Полный ответ: {data}"
+                    f"Заказ {order_id}: сообщение не принято. "
+                    f"response={data.get('response')}, error={data.get('error')}, "
+                    f"objects={len(objs)} шт, types={types}. "
+                    f"Ответ (сокращённо): {str(data)[:600]}"
                 )
             except Exception:
                 logger.warning(
-                    f"Заказ {order_id}: ответ /runner/ не JSON. Текст: {resp.text[:400]}"
+                    f"Заказ {order_id}: ответ не JSON. Текст: {resp.text[:400]}"
                 )
             return False
 
