@@ -425,15 +425,6 @@ class FunPayClient:
             logger.error(f"Заказ {order_id}: node не найден")
             return False
 
-        # Для отправки сообщений FunPay ожидает node вида "users-X-Y", не числовой id
-        if node.isdigit():
-            logger.error(
-                f"Заказ {order_id}: для отправки сообщений нужен node вида users-X-Y, "
-                "найден только числовой data-id. Откройте страницу заказа в браузере и проверьте, "
-                "что в разметке есть data-name=\"users-...\" или ссылка /chat/?node=users-..."
-            )
-            return False
-
         # Получаем id последнего сообщения (некоторые версии API требуют его)
         last_message = -1
         try:
@@ -454,26 +445,52 @@ class FunPayClient:
 
         order_referer = f"{FUNPAY_BASE}/orders/{order_id}/"
 
-        async def _do_send() -> httpx.Response:
-            objects = [
-                {
-                    "type": "chat_message",
-                    "id": node,
-                    "tag": _tag(),
-                    "data": {
-                        "node": node,
-                        "last_message": last_message,
-                        "content": text,
+        async def _do_send(
+            include_chat_node: bool = True, request_val: str = "false"
+        ) -> httpx.Response:
+            # Вариант 1: в одном запросе сначала chat_node (открыть чат), затем chat_message.
+            msg_obj = {
+                "type": "chat_message",
+                "id": node,
+                "tag": _tag(),
+                "data": {
+                    "node": node,
+                    "last_message": last_message,
+                    "content": text,
+                },
+            }
+            if include_chat_node:
+                objects = [
+                    {
+                        "type": "chat_node",
+                        "id": node,
+                        "tag": _tag(),
+                        "data": False,
                     },
-                }
-            ]
-            # request=true — явный запрос на отправку (мутация), иначе сервер может не применить
+                    msg_obj,
+                ]
+            else:
+                objects = [msg_obj]
+            logger.debug(f"runner payload: request={request_val}, objects={objects}")
             return await self._post_runner(
-                objects, referer=order_referer, request_value="true"
+                objects, referer=order_referer, request_value=request_val
             )
 
+        def _check_success(resp: httpx.Response) -> bool:
+            if resp.status_code != 200:
+                return False
+            try:
+                data = resp.json()
+                for obj in data.get("objects", []):
+                    if obj.get("type") == "chat_message":
+                        return True
+                return False
+            except Exception:
+                return False
+
         try:
-            resp = await _do_send()
+            # Сначала с chat_node + chat_message в одном запросе
+            resp = await _do_send(include_chat_node=True)
             logger.debug(
                 f"/runner/ HTTP {resp.status_code} | node={node} | "
                 f"ответ: {resp.text[:300]}"
@@ -484,46 +501,50 @@ class FunPayClient:
                     f"Заказ {order_id}: /runner/ HTTP {resp.status_code} | "
                     f"ответ: {resp.text[:500]}"
                 )
-                # Одна повторная попытка после обновления CSRF
                 if resp.status_code in (403, 419) or "csrf" in resp.text.lower():
                     logger.info(f"Заказ {order_id}: обновляем сессию и повторяем отправку")
                     self._last_csrf_refresh = 0
                     await self._init_session()
-                    resp = await _do_send()
+                    resp = await _do_send(include_chat_node=True)
                     if resp.status_code != 200:
                         logger.error(f"Заказ {order_id}: повторный /runner/ HTTP {resp.status_code}")
                         return False
                 else:
                     return False
 
-            if not resp.text.strip():
-                logger.info(f"✅ Сообщение отправлено в {order_id} (пустой ответ = OK)")
+            if _check_success(resp):
+                logger.info(f"✅ Сообщение отправлено в {order_id}")
                 return True
+
+            # Пустой objects — пробуем только chat_message без chat_node, затем с request=true
+            try:
+                data = resp.json()
+                if not data.get("objects") and data.get("response") is False:
+                    for req_val in ("false", "true"):
+                        logger.debug(
+                            f"Заказ {order_id}: повтор — только chat_message, request={req_val}"
+                        )
+                        resp2 = await _do_send(
+                            include_chat_node=False, request_val=req_val
+                        )
+                        if _check_success(resp2):
+                            logger.info(f"✅ Сообщение отправлено в {order_id}")
+                            return True
+            except Exception:
+                pass
 
             try:
                 data = resp.json()
-                if data.get("error"):
-                    logger.warning(f"Заказ {order_id}: ответ runner error={data.get('error')} | {data}")
-                # Успех только если в objects вернулся наш chat_message (эхо от сервера)
-                for obj in data.get("objects", []):
-                    if obj.get("type") == "chat_message":
-                        logger.info(f"✅ Сообщение отправлено в {order_id}")
-                        return True
-
-                # response=false без chat_message в objects — сообщение НЕ отправлено
-                # (в чате не появляется). Не считаем успехом.
                 logger.warning(
                     f"Заказ {order_id}: сообщение не принято сервером. "
                     f"Ответ runner: response={data.get('response')}, error={data.get('error')}, "
                     f"objects={len(data.get('objects', []))} шт. Полный ответ: {data}"
                 )
-                return False
             except Exception:
-                # Не-JSON ответ при 200 — не считаем успехом без явного эхо
                 logger.warning(
                     f"Заказ {order_id}: ответ /runner/ не JSON. Текст: {resp.text[:400]}"
                 )
-                return False
+            return False
 
         except Exception as e:
             logger.error(f"Ошибка send_chat_message {order_id}: {e}")
