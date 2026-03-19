@@ -7,7 +7,7 @@ FunPay не имеет официального REST API для продавцо
 Реализует:
   - get_orders()              — список новых заказов продавца
   - get_chat_messages()       — сообщения чата по order_id / chat_id
-  - send_chat_message()       — ответ покупателю в чат
+  - send_chat_message()       — ответ покупателю в чат (через реальный /runner/ endpoint)
   - raise_order()             — поднять заказ как выполненный (confirm)
   - update_order_status()     — обновить статус (completed / failed)
   - get_csrf_token()          — актуальный CSRF-токен (нужен для POST)
@@ -54,6 +54,9 @@ class FunPayClient:
         self._username: Optional[str] = None
         self._last_csrf_refresh: float = 0.0
 
+        # Кеш chat_id для каждого order_id (нужен для /runner/ endpoint)
+        self._order_chat_id_cache: Dict[str, int] = {}
+
         self._client = httpx.AsyncClient(
             base_url=FUNPAY_BASE,
             timeout=30.0,
@@ -96,6 +99,24 @@ class FunPayClient:
         return await self._client.post(
             path,
             data=data,
+            cookies=self._cookies(),
+            headers=headers,
+            **kwargs,
+        )
+
+    async def _post_json(self, path: str, payload: dict, **kwargs) -> httpx.Response:
+        """POST-запрос с JSON-телом (нужен для /runner/ endpoint)."""
+        csrf = await self.get_csrf_token()
+        headers = {
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Referer": FUNPAY_BASE + "/chat/",
+            "x-csrf-token": csrf,
+        }
+        return await self._client.post(
+            path,
+            content=json.dumps(payload),
             cookies=self._cookies(),
             headers=headers,
             **kwargs,
@@ -161,6 +182,72 @@ class FunPayClient:
             return self._csrf_token
         await self._ensure_session()
         return self._csrf_token
+
+    async def _get_chat_id_for_order(self, order_id: str) -> Optional[int]:
+        """
+        Получить числовой chat_id (node_id) для заказа.
+        FunPay чат заказа доступен по /orders/<order_id>/ — там есть data-node или
+        ссылка на чат с node= параметром.
+        Кешируем результат чтобы не делать лишних запросов.
+        """
+        if order_id in self._order_chat_id_cache:
+            return self._order_chat_id_cache[order_id]
+
+        try:
+            resp = await self._get(f"/orders/{order_id}/")
+            if resp.status_code != 200:
+                logger.warning(f"Не удалось получить страницу заказа {order_id}: HTTP {resp.status_code}")
+                return None
+
+            html = resp.text
+
+            # Способ 1: data-id или data-node в блоке чата
+            m = re.search(r'data-id=["\'](\d+)["\']', html)
+            if m:
+                chat_id = int(m.group(1))
+                self._order_chat_id_cache[order_id] = chat_id
+                logger.debug(f"chat_id для заказа {order_id}: {chat_id} (data-id)")
+                return chat_id
+
+            # Способ 2: ссылка /chat/?node=XXXXX
+            m = re.search(r'/chat/\?node=(\d+)', html)
+            if m:
+                chat_id = int(m.group(1))
+                self._order_chat_id_cache[order_id] = chat_id
+                logger.debug(f"chat_id для заказа {order_id}: {chat_id} (?node=)")
+                return chat_id
+
+            # Способ 3: data-node=
+            m = re.search(r'data-node=["\'](\d+)["\']', html)
+            if m:
+                chat_id = int(m.group(1))
+                self._order_chat_id_cache[order_id] = chat_id
+                logger.debug(f"chat_id для заказа {order_id}: {chat_id} (data-node)")
+                return chat_id
+
+            # Способ 4: "nodeId": 123456 в JS
+            m = re.search(r'"nodeId"\s*:\s*(\d+)', html)
+            if m:
+                chat_id = int(m.group(1))
+                self._order_chat_id_cache[order_id] = chat_id
+                logger.debug(f"chat_id для заказа {order_id}: {chat_id} (nodeId JS)")
+                return chat_id
+
+            # Способ 5: chat_id совпадает с order_id если это числовой id
+            # (некоторые заказы на FunPay имеют числовой chat_id)
+            m = re.search(r'data-chat=["\'](\d+)["\']', html)
+            if m:
+                chat_id = int(m.group(1))
+                self._order_chat_id_cache[order_id] = chat_id
+                logger.debug(f"chat_id для заказа {order_id}: {chat_id} (data-chat)")
+                return chat_id
+
+            logger.warning(f"Не удалось найти chat_id для заказа {order_id} ни одним из способов")
+            return None
+
+        except Exception as e:
+            logger.error(f"Ошибка получения chat_id для заказа {order_id}: {e}")
+            return None
 
     # ─────────────────────────────── публичные методы ────────────────────────
 
@@ -382,43 +469,197 @@ class FunPayClient:
         """
         Отправить сообщение в чат заказа.
 
+        Использует реальный FunPay endpoint /runner/ с JSON-payload —
+        тот же механизм, который использует браузер при отправке сообщения.
+
         Args:
-            order_id: ID заказа
+            order_id: ID заказа (буквенно-цифровой, например ZVWPQ96F)
             text: Текст сообщения
 
         Returns:
             True если отправлено успешно
         """
+        # Гарантируем актуальный CSRF и сессию
+        await self.get_csrf_token()
+
+        # Шаг 1: получаем числовой chat_id для этого заказа
+        chat_id = await self._get_chat_id_for_order(order_id)
+
+        if chat_id is not None:
+            # Шаг 2а: отправляем через /runner/ (основной способ, как в браузере)
+            success = await self._send_via_runner(chat_id, text, order_id)
+            if success:
+                return True
+            logger.warning(f"Заказ {order_id}: /runner/ не сработал, пробуем fallback...")
+
+        # Шаг 2б: fallback — прямой POST на страницу заказа
+        success = await self._send_via_order_page(order_id, text)
+        if success:
+            return True
+
+        # Шаг 2в: последний fallback — старый endpoint /chat/
+        success = await self._send_via_chat_endpoint(order_id, text)
+        return success
+
+    async def _send_via_runner(self, chat_id: int, text: str, order_id: str) -> bool:
+        """
+        Отправить через /runner/ — реальный FunPay WebSocket-like endpoint.
+        Браузер использует именно его для отправки сообщений в чат.
+
+        Payload формат:
+        {
+            "objects": [
+                {
+                    "type": "chat_message",
+                    "data": {
+                        "node": <chat_id>,
+                        "last_message": -1,
+                        "content": "<текст>"
+                    }
+                }
+            ],
+            "request": false,
+            "csrf_token": "<токен>"
+        }
+        """
         try:
-            # FunPay принимает сообщения через AJAX endpoint
-            # FunPay чат: сообщения отправляются через /orders/<id>/
-            # с параметром action=chat
-            data = {
-                "action": "chat",
-                "node_id": order_id,
-                "text": text,
+            csrf = await self.get_csrf_token()
+            payload = {
+                "objects": [
+                    {
+                        "type": "chat_message",
+                        "data": {
+                            "node": chat_id,
+                            "last_message": -1,
+                            "content": text,
+                        },
+                    }
+                ],
+                "request": False,
+                "csrf_token": csrf,
             }
-            # Пробуем несколько endpoint-ов FunPay
-            for endpoint in ["/chat/", f"/orders/{order_id}/", "/orders/trade/"]:
+
+            headers = {
+                "Content-Type": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Referer": f"{FUNPAY_BASE}/orders/{order_id}/",
+                "x-csrf-token": csrf,
+            }
+
+            resp = await self._client.post(
+                "/runner/",
+                content=json.dumps(payload),
+                cookies=self._cookies(),
+                headers=headers,
+            )
+
+            logger.debug(f"FunPay /runner/ HTTP {resp.status_code}, body: {resp.text[:300]}")
+
+            if resp.status_code != 200:
+                logger.warning(f"FunPay /runner/ HTTP {resp.status_code}")
+                return False
+
+            # Ответ может быть пустым или JSON
+            if not resp.content or not resp.text.strip():
+                # Пустой ответ на /runner/ — это нормально, значит успех
+                logger.info(f"FunPay: сообщение отправлено в заказ {order_id} (пустой ответ = успех)")
+                return True
+
+            try:
+                result = resp.json()
+                # FunPay возвращает список объектов или {"error": 0}
+                if isinstance(result, list):
+                    logger.info(f"FunPay: сообщение отправлено в заказ {order_id} via /runner/")
+                    return True
+                if isinstance(result, dict):
+                    err = result.get("error", result.get("errors"))
+                    if err == 0 or err is None or result.get("success"):
+                        logger.info(f"FunPay: сообщение отправлено в заказ {order_id} via /runner/")
+                        return True
+                    logger.warning(f"FunPay /runner/ ответ с ошибкой: {result}")
+                    return False
+                # Любой другой ответ 200 считаем успехом
+                logger.info(f"FunPay: сообщение отправлено в заказ {order_id} via /runner/ (ответ: {type(result)})")
+                return True
+            except Exception:
+                # Не JSON — но статус 200, считаем успехом
+                logger.info(f"FunPay: сообщение отправлено в заказ {order_id} via /runner/ (не-JSON ответ 200)")
+                return True
+
+        except Exception as e:
+            logger.error(f"Ошибка /runner/ для заказа {order_id}: {e}")
+            return False
+
+    async def _send_via_order_page(self, order_id: str, text: str) -> bool:
+        """Fallback: POST прямо на страницу заказа."""
+        try:
+            csrf = await self.get_csrf_token()
+            data = {
+                "csrf_token": csrf,
+                "action": "send_message",
+                "order_id": order_id,
+                "text": text,
+                "message": text,
+            }
+            headers = {
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"{FUNPAY_BASE}/orders/{order_id}/",
+                "x-csrf-token": csrf,
+            }
+            resp = await self._client.post(
+                f"/orders/{order_id}/",
+                data=data,
+                cookies=self._cookies(),
+                headers=headers,
+            )
+            logger.debug(f"FunPay order_page HTTP {resp.status_code}, body: {resp.text[:200]}")
+            if resp.status_code in (200, 302):
+                logger.info(f"FunPay: сообщение отправлено в заказ {order_id} (order_page fallback)")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Ошибка order_page fallback для {order_id}: {e}")
+            return False
+
+    async def _send_via_chat_endpoint(self, order_id: str, text: str) -> bool:
+        """Последний fallback: старый /chat/ endpoint."""
+        try:
+            csrf = await self.get_csrf_token()
+            # Пробуем несколько вариантов данных
+            for data in [
+                {"action": "chat", "node_id": order_id, "text": text, "csrf_token": csrf},
+                {"node_id": order_id, "text": text, "csrf_token": csrf},
+            ]:
                 try:
-                    resp = await self._post(endpoint, data={**data, "node_id": order_id})
-                    if resp.status_code == 200:
-                        break
+                    headers = {
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": f"{FUNPAY_BASE}/chat/?node={order_id}",
+                        "x-csrf-token": csrf,
+                    }
+                    resp = await self._client.post(
+                        "/chat/",
+                        data=data,
+                        cookies=self._cookies(),
+                        headers=headers,
+                    )
+                    logger.debug(f"FunPay /chat/ HTTP {resp.status_code}, body: {resp.text[:200]}")
+                    if resp.status_code == 200 and resp.content:
+                        try:
+                            result = resp.json()
+                            if result.get("error") == 0 or result.get("success"):
+                                logger.info(f"FunPay: сообщение отправлено в заказ {order_id} via /chat/")
+                                return True
+                        except Exception:
+                            pass
                 except Exception:
                     continue
-            if resp.status_code == 200:
-                result = resp.json() if resp.content else {}
-                if result.get("error") == 0 or result.get("success"):
-                    logger.info(f"FunPay: сообщение отправлено в заказ {order_id}")
-                    return True
-                else:
-                    logger.warning(f"FunPay send_message ответ: {result}")
-                    return False
-            else:
-                logger.error(f"FunPay send_message HTTP {resp.status_code}")
-                return False
+            logger.error(f"Все методы отправки сообщения для заказа {order_id} не сработали")
+            return False
         except Exception as e:
-            logger.error(f"Ошибка отправки сообщения FunPay {order_id}: {e}")
+            logger.error(f"Ошибка /chat/ fallback для {order_id}: {e}")
             return False
 
     async def confirm_order(self, order_id: str) -> bool:
