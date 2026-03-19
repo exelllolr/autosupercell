@@ -74,17 +74,22 @@ class FunPayClient:
         return await self._client.get(path, cookies=self._cookies(), **kwargs)
 
     async def _post_runner(
-        self, objects: list, *, referer: Optional[str] = None
+        self,
+        objects: list,
+        *,
+        referer: Optional[str] = None,
+        request_value: str = "false",
     ) -> httpx.Response:
         """
         POST /runner/ — основной транспорт FunPay.
         Content-Type: application/x-www-form-urlencoded
         objects — JSON-строка внутри form-поля.
         referer — при отправке сообщения в чат заказа лучше передать страницу заказа.
+        request_value — "true" для явного запроса (например отправка сообщения), "false" для long-poll.
         """
         payload = {
             "objects": json.dumps(objects, ensure_ascii=False),
-            "request": "false",
+            "request": request_value,
             "csrf_token": self._csrf_token,
         }
         headers = {
@@ -462,7 +467,10 @@ class FunPayClient:
                     },
                 }
             ]
-            return await self._post_runner(objects, referer=order_referer)
+            # request=true — явный запрос на отправку (мутация), иначе сервер может не применить
+            return await self._post_runner(
+                objects, referer=order_referer, request_value="true"
+            )
 
         try:
             resp = await _do_send()
@@ -496,22 +504,26 @@ class FunPayClient:
                 data = resp.json()
                 if data.get("error"):
                     logger.warning(f"Заказ {order_id}: ответ runner error={data.get('error')} | {data}")
-                # Успех: в objects вернулся наш chat_message
+                # Успех только если в objects вернулся наш chat_message (эхо от сервера)
                 for obj in data.get("objects", []):
                     if obj.get("type") == "chat_message":
                         logger.info(f"✅ Сообщение отправлено в {order_id}")
                         return True
-                # response=false без ошибки при пустых objects — тоже успех
-                # (FunPay не возвращает эхо если получатель не онлайн)
-                if not data.get("error") and data.get("response") is False:
-                    logger.info(f"✅ Сообщение отправлено в {order_id} (response=false = OK для оффлайн)")
-                    return True
 
-                logger.warning(f"Заказ {order_id}: неожиданный ответ: {data}")
+                # response=false без chat_message в objects — сообщение НЕ отправлено
+                # (в чате не появляется). Не считаем успехом.
+                logger.warning(
+                    f"Заказ {order_id}: сообщение не принято сервером. "
+                    f"Ответ runner: response={data.get('response')}, error={data.get('error')}, "
+                    f"objects={len(data.get('objects', []))} шт. Полный ответ: {data}"
+                )
                 return False
             except Exception:
-                logger.info(f"✅ Сообщение отправлено в {order_id} (не-JSON 200)")
-                return True
+                # Не-JSON ответ при 200 — не считаем успехом без явного эхо
+                logger.warning(
+                    f"Заказ {order_id}: ответ /runner/ не JSON. Текст: {resp.text[:400]}"
+                )
+                return False
 
         except Exception as e:
             logger.error(f"Ошибка send_chat_message {order_id}: {e}")
