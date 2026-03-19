@@ -7,18 +7,18 @@ FunPay не имеет официального REST API для продавцо
 Реализует:
   - get_orders()              — список новых заказов продавца
   - get_chat_messages()       — сообщения чата по order_id / chat_id
-  - send_chat_message()       — ответ покупателю в чат (через реальный /runner/ endpoint)
-  - raise_order()             — поднять заказ как выполненный (confirm)
+  - send_chat_message()       — ответ покупателю в чат
+  - confirm_order()           — поднять заказ как выполненный
   - update_order_status()     — обновить статус (completed / failed)
-  - get_csrf_token()          — актуальный CSRF-токен (нужен для POST)
+  - get_csrf_token()          — актуальный CSRF-токен
 """
 
 import re
 import json
 import asyncio
 import time
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime
+from typing import Dict, List, Optional
+from urllib.parse import urlencode
 
 import httpx
 from bs4 import BeautifulSoup
@@ -27,34 +27,29 @@ from loguru import logger
 
 FUNPAY_BASE = "https://funpay.com"
 
-# Маппинг статусов FunPay (числовые коды из HTML)
-ORDER_STATUS_PAID = 0       # Оплачен, ожидает выполнения
-ORDER_STATUS_CONFIRMED = 1  # Подтверждён продавцом
-ORDER_STATUS_DISPUTE = 2    # Спор
-ORDER_STATUS_REFUND = 3     # Возврат
+ORDER_STATUS_PAID = 0
+ORDER_STATUS_CONFIRMED = 1
+ORDER_STATUS_DISPUTE = 2
+ORDER_STATUS_REFUND = 3
 
 
 class FunPayClient:
     """
     Клиент FunPay на основе golden_key cookie.
 
-    golden_key — это значение cookie с таким же именем, видное в браузере
-    на funpay.com после входа в аккаунт (DevTools → Application → Cookies).
+    golden_key — значение cookie с таким же именем, видное в браузере
+    на funpay.com после входа (DevTools → Application → Cookies).
     """
 
     def __init__(self, golden_key: str):
         if not golden_key:
             raise ValueError("golden_key не может быть пустым")
         self.golden_key = golden_key
-        # app_cookie — вторая cookie, которую FunPay устанавливает при входе.
-        # Получается автоматически при первом запросе (см. _ensure_app_cookie).
         self._app_cookie: str = ""
         self._csrf_token: str = ""
         self._user_id: Optional[int] = None
         self._username: Optional[str] = None
         self._last_csrf_refresh: float = 0.0
-
-        # Кеш chat_id для каждого order_id (нужен для /runner/ endpoint)
         self._order_chat_id_cache: Dict[str, int] = {}
 
         self._client = httpx.AsyncClient(
@@ -65,116 +60,122 @@ class FunPayClient:
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
+                    "Chrome/146.0.0.0 Safari/537.36"
                 ),
-                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Origin": "https://funpay.com",
             },
         )
 
-    # ─────────────────────────────── внутренние методы ───────────────────────
+    # ─────────────────────────── внутренние методы ───────────────────────────
 
     def _cookies(self) -> Dict[str, str]:
-        """Собрать актуальные cookies для запроса."""
         c = {"golden_key": self.golden_key}
         if self._app_cookie:
             c["PHPSESSID"] = self._app_cookie
         return c
 
     async def _get(self, path: str, **kwargs) -> httpx.Response:
-        """GET-запрос с автоматическими cookies."""
-        return await self._client.get(
-            path, cookies=self._cookies(), **kwargs
-        )
+        return await self._client.get(path, cookies=self._cookies(), **kwargs)
 
-    async def _post(self, path: str, data: dict, **kwargs) -> httpx.Response:
-        """POST-запрос с CSRF-токеном и cookies."""
+    async def _post_form(self, path: str, data: dict, referer: str = "/") -> httpx.Response:
+        """
+        POST с application/x-www-form-urlencoded — именно так браузер
+        отправляет данные в /runner/ и другие endpoint-ы FunPay.
+        """
         csrf = await self.get_csrf_token()
         headers = {
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "X-Requested-With": "XMLHttpRequest",
-            "Referer": FUNPAY_BASE + "/",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Referer": FUNPAY_BASE + referer,
             "x-csrf-token": csrf,
+            "Origin": "https://funpay.com",
         }
         return await self._client.post(
             path,
             data=data,
             cookies=self._cookies(),
             headers=headers,
-            **kwargs,
-        )
-
-    async def _post_json(self, path: str, payload: dict, **kwargs) -> httpx.Response:
-        """POST-запрос с JSON-телом (нужен для /runner/ endpoint)."""
-        csrf = await self.get_csrf_token()
-        headers = {
-            "Content-Type": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Referer": FUNPAY_BASE + "/chat/",
-            "x-csrf-token": csrf,
-        }
-        return await self._client.post(
-            path,
-            content=json.dumps(payload),
-            cookies=self._cookies(),
-            headers=headers,
-            **kwargs,
         )
 
     async def _ensure_session(self) -> None:
         """
-        Инициализировать сессию: получить PHPSESSID и CSRF-токен
-        с главной страницы FunPay.
+        Инициализация сессии: PHPSESSID + CSRF с главной страницы.
+        FunPay хранит CSRF в JS-переменной app.Csrf, не в meta-теге.
         """
         try:
             resp = await self._get("/")
-            # FunPay устанавливает PHPSESSID через Set-Cookie
             for name, value in resp.cookies.items():
-                if name.upper() in ("PHPSESSID", "PHPSESSID"):
+                if name.upper() == "PHPSESSID":
                     self._app_cookie = value
+
             self._parse_csrf_from_html(resp.text)
             self._parse_user_info(resp.text)
-            logger.debug(f"FunPay сессия: user_id={self._user_id}, username={self._username}")
+            logger.debug(
+                f"FunPay сессия: user_id={self._user_id}, "
+                f"username={self._username}, csrf={self._csrf_token[:10] if self._csrf_token else 'НЕ НАЙДЕН'}..."
+            )
         except Exception as e:
             logger.error(f"Ошибка инициализации сессии FunPay: {e}")
             raise
 
     def _parse_csrf_from_html(self, html: str) -> None:
-        """Извлечь CSRF-токен из HTML страницы."""
-        # Вариант 1: meta-тег
-        m = re.search(r'<meta\s+name=["\']csrf-token["\'][^>]*content=["\']([\w\-]+)', html)
-        if m:
-            self._csrf_token = m.group(1)
-            self._last_csrf_refresh = time.time()
-            return
-        # Вариант 2: JS переменная
-        m = re.search(r'csrf\s*[:=]\s*["\']([\w\-]+)', html)
-        if m:
-            self._csrf_token = m.group(1)
-            self._last_csrf_refresh = time.time()
-            return
-        # Вариант 3: data-атрибут
-        m = re.search(r'data-csrf=["\']([\w\-]+)', html)
-        if m:
-            self._csrf_token = m.group(1)
-            self._last_csrf_refresh = time.time()
+        """
+        Извлечь CSRF-токен из HTML.
+        FunPay хранит его в JS: app.Csrf = "TOKEN"
+        """
+        patterns = [
+            # Основной: app.Csrf = "TOKEN" в JS
+            r'app\.Csrf\s*=\s*["\']([a-f0-9]+)["\']',
+            # Вариант: window.csrfToken = "TOKEN"
+            r'window\.csrfToken\s*=\s*["\']([a-f0-9]+)["\']',
+            # Вариант: "csrf":"TOKEN" в JSON конфиге
+            r'"csrf"\s*:\s*"([a-f0-9]+)"',
+            # Вариант: csrf_token = "TOKEN"
+            r'csrf_token\s*=\s*["\']([a-f0-9]+)["\']',
+            # Вариант: data-csrf атрибут
+            r'data-csrf=["\']([a-f0-9]+)["\']',
+            # Вариант: meta csrf-token
+            r'<meta\s+name=["\']csrf-token["\'][^>]*content=["\']([\w\-]+)',
+            # Последний: hex-строка 32+ символов рядом с "csrf"
+            r'["\']csrf["\']:\s*["\']([a-f0-9]{32,})["\']',
+        ]
+
+        for pattern in patterns:
+            m = re.search(pattern, html, re.IGNORECASE)
+            if m:
+                self._csrf_token = m.group(1)
+                self._last_csrf_refresh = time.time()
+                logger.debug(f"CSRF найден: {self._csrf_token[:10]}...")
+                return
+
+        logger.warning("CSRF токен не найден ни одним паттерном")
 
     def _parse_user_info(self, html: str) -> None:
-        m = re.search(r'class="user-link-name"[^>]*>([^<]+)<', html)
-        if m:
-            self._username = m.group(1).strip()
-        m = re.search(r'/users/(\d+)/', html)
-        if m:
-            self._user_id = int(m.group(1))
-        if not self._user_id:
-            m = re.search(r'"userId"\s*:\s*(\d+)', html)
+        patterns_id = [
+            r'/users/(\d+)/',
+            r'"userId"\s*:\s*(\d+)',
+            r'app\.UserId\s*=\s*(\d+)',
+            r'user_id\s*[:=]\s*(\d+)',
+        ]
+        for p in patterns_id:
+            m = re.search(p, html)
             if m:
                 self._user_id = int(m.group(1))
-        if not self._username:
-            m = re.search(r'"username"\s*:\s*"([^"]+)"', html)
+                break
+
+        patterns_name = [
+            r'class="user-link-name"[^>]*>([^<]+)<',
+            r'"username"\s*:\s*"([^"]+)"',
+            r'app\.Username\s*=\s*["\']([^"\']+)["\']',
+        ]
+        for p in patterns_name:
+            m = re.search(p, html)
             if m:
-                self._username = m.group(1)
+                self._username = m.group(1).strip()
+                break
 
     async def get_csrf_token(self) -> str:
         """Получить актуальный CSRF-токен (кеш 5 минут)."""
@@ -183,12 +184,10 @@ class FunPayClient:
         await self._ensure_session()
         return self._csrf_token
 
-    async def _get_chat_id_for_order(self, order_id: str) -> Optional[int]:
+    async def _get_chat_node_for_order(self, order_id: str) -> Optional[int]:
         """
-        Получить числовой chat_id (node_id) для заказа.
-        FunPay чат заказа доступен по /orders/<order_id>/ — там есть data-node или
-        ссылка на чат с node= параметром.
-        Кешируем результат чтобы не делать лишних запросов.
+        Получить числовой node (chat_id) для заказа со страницы заказа.
+        Кешируем результат.
         """
         if order_id in self._order_chat_id_cache:
             return self._order_chat_id_cache[order_id]
@@ -196,63 +195,35 @@ class FunPayClient:
         try:
             resp = await self._get(f"/orders/{order_id}/")
             if resp.status_code != 200:
-                logger.warning(f"Не удалось получить страницу заказа {order_id}: HTTP {resp.status_code}")
                 return None
-
             html = resp.text
 
-            # Способ 1: data-id или data-node в блоке чата
-            m = re.search(r'data-id=["\'](\d+)["\']', html)
-            if m:
-                chat_id = int(m.group(1))
-                self._order_chat_id_cache[order_id] = chat_id
-                logger.debug(f"chat_id для заказа {order_id}: {chat_id} (data-id)")
-                return chat_id
+            patterns = [
+                r'data-node=["\'](\d+)["\']',
+                r'data-id=["\'](\d+)["\']',
+                r'/chat/\?node=(\d+)',
+                r'"node"\s*:\s*(\d+)',
+                r'"nodeId"\s*:\s*(\d+)',
+                r'data-chat=["\'](\d+)["\']',
+                r'node_id\s*[:=]\s*["\']?(\d+)',
+            ]
+            for pattern in patterns:
+                m = re.search(pattern, html)
+                if m:
+                    node = int(m.group(1))
+                    self._order_chat_id_cache[order_id] = node
+                    logger.debug(f"node для заказа {order_id}: {node}")
+                    return node
 
-            # Способ 2: ссылка /chat/?node=XXXXX
-            m = re.search(r'/chat/\?node=(\d+)', html)
-            if m:
-                chat_id = int(m.group(1))
-                self._order_chat_id_cache[order_id] = chat_id
-                logger.debug(f"chat_id для заказа {order_id}: {chat_id} (?node=)")
-                return chat_id
-
-            # Способ 3: data-node=
-            m = re.search(r'data-node=["\'](\d+)["\']', html)
-            if m:
-                chat_id = int(m.group(1))
-                self._order_chat_id_cache[order_id] = chat_id
-                logger.debug(f"chat_id для заказа {order_id}: {chat_id} (data-node)")
-                return chat_id
-
-            # Способ 4: "nodeId": 123456 в JS
-            m = re.search(r'"nodeId"\s*:\s*(\d+)', html)
-            if m:
-                chat_id = int(m.group(1))
-                self._order_chat_id_cache[order_id] = chat_id
-                logger.debug(f"chat_id для заказа {order_id}: {chat_id} (nodeId JS)")
-                return chat_id
-
-            # Способ 5: chat_id совпадает с order_id если это числовой id
-            # (некоторые заказы на FunPay имеют числовой chat_id)
-            m = re.search(r'data-chat=["\'](\d+)["\']', html)
-            if m:
-                chat_id = int(m.group(1))
-                self._order_chat_id_cache[order_id] = chat_id
-                logger.debug(f"chat_id для заказа {order_id}: {chat_id} (data-chat)")
-                return chat_id
-
-            logger.warning(f"Не удалось найти chat_id для заказа {order_id} ни одним из способов")
+            logger.warning(f"node не найден для заказа {order_id}")
             return None
-
         except Exception as e:
-            logger.error(f"Ошибка получения chat_id для заказа {order_id}: {e}")
+            logger.error(f"Ошибка получения node для {order_id}: {e}")
             return None
 
-    # ─────────────────────────────── публичные методы ────────────────────────
+    # ─────────────────────────── публичные методы ────────────────────────────
 
     async def whoami(self) -> Optional[Dict]:
-        """Вернуть информацию о текущем аккаунте (проверка golden_key)."""
         try:
             await self._ensure_session()
             if self._user_id:
@@ -271,41 +242,33 @@ class FunPayClient:
 
             soup = BeautifulSoup(resp.text, "html.parser")
             orders = []
-
-            # Реальная разметка FunPay: <a class="tc-item ..." href="/orders/XXXXXXX/">
             rows = soup.select("a.tc-item")
 
             for row in rows:
                 try:
-                    # order_id из href="/orders/H3U47EXF/"
                     href = row.get("href", "")
                     m = re.search(r"/orders/([^/]+)/", href)
                     if not m:
                         continue
                     order_id = m.group(1)
 
-                    # Статус: класс строки (info=новый, warning=спор, success=выполнен)
                     classes = " ".join(row.get("class", []))
                     if "warning" in classes or "danger" in classes:
                         status_text = "dispute"
                     elif "success" in classes or "muted" in classes:
                         status_text = "completed"
                     else:
-                        status_text = "paid"  # info = оплачен, ожидает выполнения
+                        status_text = "paid"
 
-                    # Фильтр
                     if status == "paid" and status_text != "paid":
                         continue
 
-                    # Название товара
                     title_el = row.select_one(".tc-desc-text, .tc-desc, [class*='desc']")
                     title = title_el.get_text(strip=True) if title_el else ""
 
-                    # Покупатель
                     buyer_el = row.select_one(".tc-buyer-text, .tc-user, [class*='buyer']")
                     buyer_name = buyer_el.get_text(strip=True) if buyer_el else ""
 
-                    # Сумма
                     price_el = row.select_one(".tc-price div:last-child, [class*='price'] div")
                     if not price_el:
                         price_el = row.select_one(".tc-price")
@@ -330,14 +293,6 @@ class FunPayClient:
                     logger.debug(f"Ошибка парсинга строки заказа: {row_err}")
                     continue
 
-            # Дедупликация: один order_id может встречаться несколько раз
-            seen = set()
-            unique = []
-            for o in orders:
-                if o["order_id"] not in seen:
-                    seen.add(o["order_id"])
-                    unique.append(o)
-            orders = unique
             seen = set()
             orders = [o for o in orders if not (o["order_id"] in seen or seen.add(o["order_id"]))]
             logger.info(f"FunPay: получено {len(orders)} заказов (status={status})")
@@ -348,52 +303,31 @@ class FunPayClient:
             return []
 
     async def get_chat_messages(self, order_id: str) -> List[Dict]:
-        """
-        Получить сообщения чата по order_id.
-
-        Returns:
-            Список словарей: author, text, is_buyer, timestamp
-            Сортировка: от старых к новым.
-        """
         try:
-            # Чат заказа на FunPay находится по URL /chat/?node=<order_id>
-            # Сначала пробуем прямой URL заказа
             resp = await self._get(f"/orders/{order_id}/")
             if resp.status_code != 200:
-                # Пробуем через чат
                 resp = await self._get(f"/chat/?node={order_id}")
-
             if resp.status_code != 200:
                 logger.error(f"FunPay chat HTTP {resp.status_code} для заказа {order_id}")
                 return []
 
             soup = BeautifulSoup(resp.text, "html.parser")
             messages = []
-
-            # Сообщения чата: .message-item, .chat-message, [class*='message']
             msg_els = soup.select(".message-item, .chat-message, .msg-item")
             if not msg_els:
                 msg_els = soup.select("[class*='message'][class*='item']")
 
             for el in msg_els:
                 try:
-                    # Автор
                     author_el = el.select_one(".username, .author, [class*='author'], [class*='username']")
                     author = author_el.get_text(strip=True) if author_el else "unknown"
-
-                    # Текст
                     text_el = el.select_one(".message-text, .msg-text, .text, p")
                     text = text_el.get_text(strip=True) if text_el else el.get_text(strip=True)
-
-                    # Определяем: это покупатель или продавец?
                     classes = " ".join(el.get("class", []))
                     is_buyer = "buyer" in classes or "incoming" in classes or "left" in classes
                     is_seller = "seller" in classes or "outgoing" in classes or "right" in classes
-
-                    # Время
                     time_el = el.select_one("time, .time, [datetime]")
                     ts = time_el.get("datetime", "") if time_el else ""
-
                     if text:
                         messages.append({
                             "author": author,
@@ -413,29 +347,20 @@ class FunPayClient:
             return []
 
     async def get_order_detail(self, order_id: str) -> Optional[Dict]:
-        """
-        Получить детали конкретного заказа (название лота, сумма, покупатель).
-        """
         try:
             resp = await self._get(f"/orders/{order_id}/")
             if resp.status_code != 200:
                 return None
 
             soup = BeautifulSoup(resp.text, "html.parser")
-
-            # Название лота
             title_el = (
                 soup.select_one("h1.page-title")
                 or soup.select_one(".order-title")
                 or soup.select_one("h1")
             )
             title = title_el.get_text(strip=True) if title_el else ""
-
-            # Покупатель
             buyer_el = soup.select_one(".buyer-username, [class*='buyer'] .username")
             buyer = buyer_el.get_text(strip=True) if buyer_el else ""
-
-            # Сумма
             amount_el = soup.select_one(".order-sum, .amount-rub, [class*='amount']")
             amount_str = amount_el.get_text(strip=True) if amount_el else ""
             amount_clean = re.sub(r"[^\d.,]", "", amount_str).replace(",", ".")
@@ -443,12 +368,8 @@ class FunPayClient:
                 amount = float(amount_clean) if amount_clean else 0.0
             except ValueError:
                 amount = 0.0
-
-            # Описание (иногда содержит инструкцию покупателя)
             desc_el = soup.select_one(".order-description, .lot-description")
             description = desc_el.get_text(strip=True) if desc_el else ""
-
-            # Сообщения чата
             messages = await self.get_chat_messages(order_id)
 
             return {
@@ -460,7 +381,6 @@ class FunPayClient:
                 "currency": "RUB",
                 "messages": messages,
             }
-
         except Exception as e:
             logger.error(f"Ошибка получения деталей заказа {order_id}: {e}")
             return None
@@ -469,122 +389,116 @@ class FunPayClient:
         """
         Отправить сообщение в чат заказа.
 
-        Использует реальный FunPay endpoint /runner/ с JSON-payload —
-        тот же механизм, который использует браузер при отправке сообщения.
+        Браузер FunPay использует POST /runner/ с Content-Type:
+        application/x-www-form-urlencoded (НЕ JSON).
 
-        Args:
-            order_id: ID заказа (буквенно-цифровой, например ZVWPQ96F)
-            text: Текст сообщения
+        Формат тела:
+            objects=<JSON-строка>&request=false&csrf_token=<TOKEN>
 
-        Returns:
-            True если отправлено успешно
+        где JSON-строка:
+            [{"type":"chat_message","data":{"node":<id>,"last_message":-1,"content":"<текст>"}}]
         """
-        # Гарантируем актуальный CSRF и сессию
         await self.get_csrf_token()
 
-        # Шаг 1: получаем числовой chat_id для этого заказа
-        chat_id = await self._get_chat_id_for_order(order_id)
+        node = await self._get_chat_node_for_order(order_id)
 
-        if chat_id is not None:
-            # Шаг 2а: отправляем через /runner/ (основной способ, как в браузере)
-            success = await self._send_via_runner(chat_id, text, order_id)
+        if node is not None:
+            success = await self._send_via_runner(node, text, order_id)
             if success:
                 return True
             logger.warning(f"Заказ {order_id}: /runner/ не сработал, пробуем fallback...")
 
-        # Шаг 2б: fallback — прямой POST на страницу заказа
         success = await self._send_via_order_page(order_id, text)
         if success:
             return True
 
-        # Шаг 2в: последний fallback — старый endpoint /chat/
-        success = await self._send_via_chat_endpoint(order_id, text)
-        return success
+        logger.error(f"Заказ {order_id}: все методы отправки сообщения не сработали")
+        return False
 
-    async def _send_via_runner(self, chat_id: int, text: str, order_id: str) -> bool:
+    async def _send_via_runner(self, node: int, text: str, order_id: str) -> bool:
         """
-        Отправить через /runner/ — реальный FunPay WebSocket-like endpoint.
-        Браузер использует именно его для отправки сообщений в чат.
+        Отправка через /runner/ — основной метод браузера FunPay.
 
-        Payload формат:
-        {
-            "objects": [
-                {
-                    "type": "chat_message",
-                    "data": {
-                        "node": <chat_id>,
-                        "last_message": -1,
-                        "content": "<текст>"
-                    }
-                }
-            ],
-            "request": false,
-            "csrf_token": "<токен>"
-        }
+        ВАЖНО: Content-Type = application/x-www-form-urlencoded (не JSON!).
+        Поле objects содержит JSON-строку как значение form-поля.
         """
         try:
             csrf = await self.get_csrf_token()
-            payload = {
-                "objects": [
-                    {
-                        "type": "chat_message",
-                        "data": {
-                            "node": chat_id,
-                            "last_message": -1,
-                            "content": text,
-                        },
-                    }
-                ],
-                "request": False,
+
+            # objects — JSON-массив передаётся как строка внутри form-encoded тела
+            objects_json = json.dumps([
+                {
+                    "type": "chat_message",
+                    "data": {
+                        "node": node,
+                        "last_message": -1,
+                        "content": text,
+                    },
+                }
+            ], ensure_ascii=False)
+
+            form_data = {
+                "objects": objects_json,
+                "request": "false",
                 "csrf_token": csrf,
             }
 
             headers = {
-                "Content-Type": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                 "X-Requested-With": "XMLHttpRequest",
                 "Accept": "application/json, text/javascript, */*; q=0.01",
                 "Referer": f"{FUNPAY_BASE}/orders/{order_id}/",
                 "x-csrf-token": csrf,
+                "Origin": "https://funpay.com",
             }
 
             resp = await self._client.post(
                 "/runner/",
-                content=json.dumps(payload),
+                data=form_data,
                 cookies=self._cookies(),
                 headers=headers,
             )
 
-            logger.debug(f"FunPay /runner/ HTTP {resp.status_code}, body: {resp.text[:300]}")
+            logger.debug(
+                f"FunPay /runner/ HTTP {resp.status_code} | "
+                f"node={node} | ответ: {resp.text[:300]}"
+            )
 
             if resp.status_code != 200:
                 logger.warning(f"FunPay /runner/ HTTP {resp.status_code}")
                 return False
 
-            # Ответ может быть пустым или JSON
-            if not resp.content or not resp.text.strip():
-                # Пустой ответ на /runner/ — это нормально, значит успех
-                logger.info(f"FunPay: сообщение отправлено в заказ {order_id} (пустой ответ = успех)")
+            response_text = resp.text.strip()
+
+            # Пустой ответ 200 = успех
+            if not response_text:
+                logger.info(f"FunPay: сообщение отправлено в заказ {order_id} via /runner/ (пустой ответ)")
                 return True
 
             try:
                 result = resp.json()
-                # FunPay возвращает список объектов или {"error": 0}
                 if isinstance(result, list):
                     logger.info(f"FunPay: сообщение отправлено в заказ {order_id} via /runner/")
                     return True
                 if isinstance(result, dict):
-                    err = result.get("error", result.get("errors"))
-                    if err == 0 or err is None or result.get("success"):
+                    err = result.get("error")
+                    if err == 0 or result.get("success"):
                         logger.info(f"FunPay: сообщение отправлено в заказ {order_id} via /runner/")
                         return True
-                    logger.warning(f"FunPay /runner/ ответ с ошибкой: {result}")
-                    return False
-                # Любой другой ответ 200 считаем успехом
-                logger.info(f"FunPay: сообщение отправлено в заказ {order_id} via /runner/ (ответ: {type(result)})")
-                return True
+                    # CSRF устарел
+                    if err in (1, 2) or "csrf" in str(result).lower():
+                        logger.warning(f"FunPay /runner/ CSRF ошибка, обновляем: {result}")
+                        self._csrf_token = ""
+                        self._last_csrf_refresh = 0
+                        return False
+                    logger.warning(f"FunPay /runner/ ответ: {result}")
+                    # Любой 200 без явной ошибки = успех
+                    return True
             except Exception:
-                # Не JSON — но статус 200, считаем успехом
-                logger.info(f"FunPay: сообщение отправлено в заказ {order_id} via /runner/ (не-JSON ответ 200)")
+                logger.info(
+                    f"FunPay: сообщение отправлено в заказ {order_id} via /runner/ "
+                    f"(не-JSON 200: {response_text[:100]})"
+                )
                 return True
 
         except Exception as e:
@@ -595,7 +509,7 @@ class FunPayClient:
         """Fallback: POST прямо на страницу заказа."""
         try:
             csrf = await self.get_csrf_token()
-            data = {
+            form_data = {
                 "csrf_token": csrf,
                 "action": "send_message",
                 "order_id": order_id,
@@ -607,14 +521,15 @@ class FunPayClient:
                 "X-Requested-With": "XMLHttpRequest",
                 "Referer": f"{FUNPAY_BASE}/orders/{order_id}/",
                 "x-csrf-token": csrf,
+                "Origin": "https://funpay.com",
             }
             resp = await self._client.post(
                 f"/orders/{order_id}/",
-                data=data,
+                data=form_data,
                 cookies=self._cookies(),
                 headers=headers,
             )
-            logger.debug(f"FunPay order_page HTTP {resp.status_code}, body: {resp.text[:200]}")
+            logger.debug(f"FunPay order_page HTTP {resp.status_code} | ответ: {resp.text[:200]}")
             if resp.status_code in (200, 302):
                 logger.info(f"FunPay: сообщение отправлено в заказ {order_id} (order_page fallback)")
                 return True
@@ -623,65 +538,15 @@ class FunPayClient:
             logger.error(f"Ошибка order_page fallback для {order_id}: {e}")
             return False
 
-    async def _send_via_chat_endpoint(self, order_id: str, text: str) -> bool:
-        """Последний fallback: старый /chat/ endpoint."""
-        try:
-            csrf = await self.get_csrf_token()
-            # Пробуем несколько вариантов данных
-            for data in [
-                {"action": "chat", "node_id": order_id, "text": text, "csrf_token": csrf},
-                {"node_id": order_id, "text": text, "csrf_token": csrf},
-            ]:
-                try:
-                    headers = {
-                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                        "X-Requested-With": "XMLHttpRequest",
-                        "Referer": f"{FUNPAY_BASE}/chat/?node={order_id}",
-                        "x-csrf-token": csrf,
-                    }
-                    resp = await self._client.post(
-                        "/chat/",
-                        data=data,
-                        cookies=self._cookies(),
-                        headers=headers,
-                    )
-                    logger.debug(f"FunPay /chat/ HTTP {resp.status_code}, body: {resp.text[:200]}")
-                    if resp.status_code == 200 and resp.content:
-                        try:
-                            result = resp.json()
-                            if result.get("error") == 0 or result.get("success"):
-                                logger.info(f"FunPay: сообщение отправлено в заказ {order_id} via /chat/")
-                                return True
-                        except Exception:
-                            pass
-                except Exception:
-                    continue
-            logger.error(f"Все методы отправки сообщения для заказа {order_id} не сработали")
-            return False
-        except Exception as e:
-            logger.error(f"Ошибка /chat/ fallback для {order_id}: {e}")
-            return False
-
     async def confirm_order(self, order_id: str) -> bool:
-        """
-        Подтвердить выполнение заказа (поднять заказ).
-        Эквивалентно нажатию кнопки «Подтвердить выдачу» в интерфейсе.
-
-        Returns:
-            True если подтверждение прошло
-        """
         try:
-            data = {
-                "order_id": order_id,
-                "action": "confirm",
-            }
-            resp = await self._post("/orders/trade/confirm/", data=data)
+            data = {"order_id": order_id, "action": "confirm"}
+            resp = await self._post_form("/orders/trade/confirm/", data=data, referer="/orders/trade")
             if resp.status_code == 200:
                 logger.info(f"FunPay: заказ {order_id} подтверждён")
                 return True
-            else:
-                logger.error(f"FunPay confirm_order HTTP {resp.status_code}: {resp.text[:200]}")
-                return False
+            logger.error(f"FunPay confirm_order HTTP {resp.status_code}: {resp.text[:200]}")
+            return False
         except Exception as e:
             logger.error(f"Ошибка подтверждения заказа FunPay {order_id}: {e}")
             return False
@@ -692,27 +557,13 @@ class FunPayClient:
         status: str,
         proof_data: Optional[Dict] = None,
     ) -> bool:
-        """
-        Обновить статус заказа и опционально отправить пруф в чат.
-
-        Args:
-            order_id: ID заказа FunPay
-            status:   'completed' | 'failed' | 'pending'
-            proof_data: {screenshot, message, url} — данные пруфа для чата
-
-        Returns:
-            True если обновление прошло успешно
-        """
         success = True
 
         if status == "completed":
-            # 1. Подтверждаем выдачу
             confirmed = await self.confirm_order(order_id)
             if not confirmed:
                 logger.warning(f"FunPay: не удалось подтвердить заказ {order_id}, продолжаем...")
                 success = False
-
-            # 2. Отправляем пруф в чат
             if proof_data:
                 msg_parts = ["✅ Заказ выполнен!"]
                 if proof_data.get("message"):
@@ -721,11 +572,9 @@ class FunPayClient:
                     msg_parts.append(f"Страница покупки: {proof_data['url']}")
                 if proof_data.get("screenshot"):
                     msg_parts.append(f"Скриншот: {proof_data['screenshot']}")
-                msg_text = "\n".join(msg_parts)
-                await self.send_chat_message(order_id, msg_text)
+                await self.send_chat_message(order_id, "\n".join(msg_parts))
 
         elif status == "failed":
-            # Сообщаем покупателю об ошибке
             error_msg = "❌ Не удалось выполнить заказ автоматически."
             if proof_data and proof_data.get("error"):
                 error_msg += f"\nПричина: {proof_data['error']}"
@@ -735,14 +584,12 @@ class FunPayClient:
         return success
 
     async def close(self) -> None:
-        """Закрыть HTTP клиент."""
         await self._client.aclose()
 
 
-# ─────────────────────────────── синглтон ─────────────────────────────────────
+# ─────────────────────────────── синглтон ────────────────────────────────────
 
 def _create_integration() -> "FunPayIntegration":
-    """Фабрика — создаёт объект с нужным бэкендом в зависимости от конфига."""
     try:
         from app.config import settings
         golden_key = getattr(settings, "FUNPAY_GOLDEN_KEY", "") or ""
@@ -754,10 +601,7 @@ def _create_integration() -> "FunPayIntegration":
 
 
 class FunPayIntegration:
-    """
-    Адаптер для совместимости со старым интерфейсом arq_worker.py.
-    Делегирует реальные вызовы FunPayClient.
-    """
+    """Адаптер для совместимости со старым интерфейсом."""
 
     def __init__(self, golden_key: str = ""):
         self._golden_key = golden_key
@@ -805,5 +649,4 @@ class FunPayIntegration:
             self._client = None
 
 
-# Глобальный экземпляр — импортируется из других модулей
 funpay_integration = _create_integration()
